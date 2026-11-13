@@ -1,8 +1,8 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 430" role="img" aria-labelledby="vaoFlowTitle vaoFlowDesc">
+<svg xmlns="http://www.w3.org/2000/svg" width="480" height="640" viewBox="0 0 480 640" role="img" aria-labelledby="vaoFlowTitle vaoFlowDesc">
   <title id="vaoFlowTitle">How one task flows through Visible Agent Orchestrator</title>
-  <desc id="vaoFlowDesc">Four stages: the organizer defines and scopes the task; the worker runs it in a bound tmux pane, signals each step and delivers a report with exactly one terminal marker; an independent reviewer compares the change against the contract and returns a verdict; finally the organizer reads the evidence and accepts or assigns repairs. Fencing keeps one owner per task, and a marker alone never proves acceptance.</desc>
+  <desc id="vaoFlowDesc">Task lifecycle stacked vertically: organize defines and scopes the task; work runs in a bound pane and produces a report with one terminal marker; independent review reads the diff against the contract; the organizer accepts or assigns repairs. A marker alone is not acceptance.</desc>
   <defs>
-    <marker id="flowArrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <marker id="flowArrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
       <path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/>
     </marker>
   </defs>
@@ -10,75 +10,50 @@
     .sans { font-family: ui-sans-serif, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif; }
   </style>
 
-  <rect x="1" y="1" width="938" height="428" rx="18" fill="#f8fafc" stroke="#e2e8f0" stroke-width="2"/>
+  <rect x="2" y="2" width="476" height="636" rx="20" fill="#f8fafc" stroke="#e2e8f0" stroke-width="2"/>
 
   <text class="sans" x="48" y="52" font-size="22" font-weight="700" fill="#0f172a">How one task flows</text>
-  <text class="sans" x="48" y="78" font-size="13.5" fill="#475569">organizer → worker → independent reviewer → organizer acceptance</text>
+  <text class="sans" x="48" y="74" font-size="15.5" fill="#475569">organizer → worker</text>
+  <text class="sans" x="48" y="94" font-size="15.5" fill="#475569">→ independent reviewer → organizer acceptance</text>
 
   <!-- Stage 1: Organize -->
-  <rect x="28" y="104" width="192" height="150" rx="14" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
-  <circle cx="54" cy="134" r="13" fill="#4f46e5"/>
-  <text class="sans" x="54" y="138.5" font-size="12.5" font-weight="700" fill="#ffffff" text-anchor="middle">1</text>
-  <text class="sans" x="76" y="139" font-size="14.5" font-weight="700" fill="#0f172a">Organize</text>
-  <rect x="44" y="164" width="6" height="6" rx="1.5" fill="#4f46e5"/>
-  <text class="sans" x="58" y="172" font-size="12.3" fill="#334155">define the task</text>
-  <rect x="44" y="192" width="6" height="6" rx="1.5" fill="#4f46e5"/>
-  <text class="sans" x="58" y="200" font-size="12.3" fill="#334155">scope allowed writes</text>
-  <rect x="44" y="220" width="6" height="6" rx="1.5" fill="#4f46e5"/>
-  <text class="sans" x="58" y="228" font-size="12.3" fill="#334155">choose session action</text>
+  <rect x="24" y="104" width="432" height="86" rx="14" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+  <circle cx="56" cy="142" r="16" fill="#4f46e5"/>
+  <text class="sans" x="56" y="147.5" font-size="16" font-weight="700" fill="#ffffff" text-anchor="middle">1</text>
+  <text class="sans" x="84" y="142" font-size="19" font-weight="700" fill="#0f172a">Organize</text>
+  <text class="sans" x="84" y="166" font-size="15.5" fill="#475569">define and scope the task</text>
+
+  <line x1="240" y1="196" x2="240" y2="220" stroke="#64748b" stroke-width="3" marker-end="url(#flowArrow)"/>
+  <text class="sans" x="256" y="212" font-size="15.5" fill="#475569">dispatch</text>
 
   <!-- Stage 2: Work -->
-  <rect x="258" y="104" width="192" height="150" rx="14" fill="#ecfdf5" stroke="#a7f3d0" stroke-width="1.5"/>
-  <circle cx="284" cy="134" r="13" fill="#059669"/>
-  <text class="sans" x="284" y="138.5" font-size="12.5" font-weight="700" fill="#ffffff" text-anchor="middle">2</text>
-  <text class="sans" x="306" y="139" font-size="14.5" font-weight="700" fill="#0f172a">Work</text>
-  <rect x="274" y="164" width="6" height="6" rx="1.5" fill="#059669"/>
-  <text class="sans" x="288" y="172" font-size="12.3" fill="#334155">runs in a bound pane</text>
-  <rect x="274" y="192" width="6" height="6" rx="1.5" fill="#059669"/>
-  <text class="sans" x="288" y="200" font-size="12.3" fill="#334155">signals each step</text>
-  <rect x="274" y="220" width="6" height="6" rx="1.5" fill="#059669"/>
-  <text class="sans" x="288" y="228" font-size="12.3" fill="#334155">report + one marker</text>
+  <rect x="24" y="226" width="432" height="86" rx="14" fill="#ecfdf5" stroke="#a7f3d0" stroke-width="1.5"/>
+  <circle cx="56" cy="264" r="16" fill="#059669"/>
+  <text class="sans" x="56" y="269.5" font-size="16" font-weight="700" fill="#ffffff" text-anchor="middle">2</text>
+  <text class="sans" x="84" y="264" font-size="19" font-weight="700" fill="#0f172a">Work</text>
+  <text class="sans" x="84" y="288" font-size="15.5" fill="#475569">bound pane · report + one marker</text>
 
-  <!-- Stage 3: Review -->
-  <rect x="488" y="104" width="192" height="150" rx="14" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
-  <circle cx="514" cy="134" r="13" fill="#0284c7"/>
-  <text class="sans" x="514" y="138.5" font-size="12.5" font-weight="700" fill="#ffffff" text-anchor="middle">3</text>
-  <text class="sans" x="536" y="139" font-size="14.5" font-weight="700" fill="#0f172a">Review</text>
-  <rect x="504" y="164" width="6" height="6" rx="1.5" fill="#0284c7"/>
-  <text class="sans" x="518" y="172" font-size="12.3" fill="#334155">reads diff vs contract</text>
-  <rect x="504" y="192" width="6" height="6" rx="1.5" fill="#0284c7"/>
-  <text class="sans" x="518" y="200" font-size="12.3" fill="#334155">PASS or changes</text>
-  <rect x="504" y="220" width="6" height="6" rx="1.5" fill="#0284c7"/>
-  <text class="sans" x="518" y="228" font-size="12.3" fill="#334155">never edits the work</text>
+  <line x1="240" y1="318" x2="240" y2="342" stroke="#64748b" stroke-width="3" marker-end="url(#flowArrow)"/>
+  <text class="sans" x="256" y="334" font-size="15.5" fill="#475569">deliver</text>
+
+  <!-- Stage 3: Independent review -->
+  <rect x="24" y="348" width="432" height="86" rx="14" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+  <circle cx="56" cy="386" r="16" fill="#0284c7"/>
+  <text class="sans" x="56" y="391.5" font-size="16" font-weight="700" fill="#ffffff" text-anchor="middle">3</text>
+  <text class="sans" x="84" y="386" font-size="19" font-weight="700" fill="#0f172a">Independent review</text>
+  <text class="sans" x="84" y="410" font-size="15.5" fill="#475569">reads the diff against the contract</text>
+
+  <line x1="240" y1="440" x2="240" y2="464" stroke="#64748b" stroke-width="3" marker-end="url(#flowArrow)"/>
+  <text class="sans" x="256" y="456" font-size="15.5" fill="#475569">verdict</text>
 
   <!-- Stage 4: Accept -->
-  <rect x="718" y="104" width="192" height="150" rx="14" fill="#eef2ff" stroke="#c7d2fe" stroke-width="1.5"/>
-  <circle cx="744" cy="134" r="13" fill="#7c3aed"/>
-  <text class="sans" x="744" y="138.5" font-size="12.5" font-weight="700" fill="#ffffff" text-anchor="middle">4</text>
-  <text class="sans" x="766" y="139" font-size="14.5" font-weight="700" fill="#0f172a">Accept</text>
-  <rect x="734" y="164" width="6" height="6" rx="1.5" fill="#7c3aed"/>
-  <text class="sans" x="748" y="172" font-size="12.3" fill="#334155">leader reads evidence</text>
-  <rect x="734" y="192" width="6" height="6" rx="1.5" fill="#7c3aed"/>
-  <text class="sans" x="748" y="200" font-size="12.3" fill="#334155">accept or repair</text>
-  <rect x="734" y="220" width="6" height="6" rx="1.5" fill="#7c3aed"/>
-  <text class="sans" x="748" y="228" font-size="12.3" font-weight="700" fill="#3730a3">marker ≠ acceptance</text>
+  <rect x="24" y="470" width="432" height="86" rx="14" fill="#eef2ff" stroke="#c7d2fe" stroke-width="1.5"/>
+  <circle cx="56" cy="508" r="16" fill="#7c3aed"/>
+  <text class="sans" x="56" y="513.5" font-size="16" font-weight="700" fill="#ffffff" text-anchor="middle">4</text>
+  <text class="sans" x="84" y="508" font-size="19" font-weight="700" fill="#0f172a">Accept</text>
+  <text class="sans" x="84" y="532" font-size="15.5" fill="#475569">leader reads evidence, decides</text>
 
-  <!-- Flow arrows -->
-  <line x1="226" y1="179" x2="250" y2="179" stroke="#64748b" stroke-width="2.5" marker-end="url(#flowArrow)"/>
-  <line x1="456" y1="179" x2="480" y2="179" stroke="#64748b" stroke-width="2.5" marker-end="url(#flowArrow)"/>
-  <line x1="686" y1="179" x2="710" y2="179" stroke="#64748b" stroke-width="2.5" marker-end="url(#flowArrow)"/>
-
-  <!-- Fencing note -->
-  <rect x="28" y="286" width="440" height="116" rx="12" fill="#ffffff" stroke="#e2e8f0" stroke-width="1.5"/>
-  <text class="sans" x="48" y="316" font-size="14" font-weight="700" fill="#0f172a">Fencing and locks</text>
-  <text class="sans" x="48" y="342" font-size="12.5" fill="#334155">One owner lock per task and worker; duplicate or stale</text>
-  <text class="sans" x="48" y="362" font-size="12.5" fill="#334155">submissions are refused. A caller timeout is not</text>
-  <text class="sans" x="48" y="382" font-size="12.5" fill="#334155">completion: keep observing the still-locked attempt.</text>
-
-  <!-- Marker note -->
-  <rect x="488" y="286" width="424" height="116" rx="12" fill="#ffffff" stroke="#e2e8f0" stroke-width="1.5"/>
-  <text class="sans" x="508" y="316" font-size="14" font-weight="700" fill="#0f172a">What the marker proves</text>
-  <text class="sans" x="508" y="342" font-size="12.5" fill="#334155">A terminal marker records protocol completion only;</text>
-  <text class="sans" x="508" y="362" font-size="12.5" fill="#334155">the organizer still reads the report and decides.</text>
-  <text class="sans" x="508" y="382" font-size="12.5" fill="#334155">Worker completion never proves the work is correct.</text>
+  <!-- Completion vs acceptance -->
+  <rect x="24" y="580" width="432" height="48" rx="12" fill="#eef2ff" stroke="#c7d2fe" stroke-width="1.5"/>
+  <text class="sans" x="240" y="609" font-size="17" font-weight="700" fill="#3730a3" text-anchor="middle">a marker alone ≠ acceptance</text>
 </svg>

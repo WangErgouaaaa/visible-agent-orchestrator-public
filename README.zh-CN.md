@@ -5,7 +5,7 @@
 
 [English](README.md) | 简体中文
 
-![总览：组织者通过 VAO 控制平面把任务分发给绑定在 tmux 窗格中的工作者](docs/assets/vao-architecture.svg)
+![总览：组织者通过 VAO 控制平面把任务分发给绑定在 tmux 窗格中的工作者，并读回附带唯一终端标记的报告](docs/assets/vao-architecture.svg)
 
 ## 它解决什么问题
 
@@ -30,7 +30,7 @@ Visible Agent Orchestrator（VAO）是一个面向可见 CLI 工作者的 Linux
 一个真实存活的窗格，并把所有权威——授权、分发、证据、验收——保留在
 工作者之外。
 
-![任务生命周期：组织、执行、评审、验收——每个任务唯一属主，且终端标记本身永远不等于验收](docs/assets/vao-task-lifecycle.svg)
+![任务生命周期：组织、执行、独立评审、组织者验收——仅凭终端标记永远不等于验收](docs/assets/vao-task-lifecycle.svg)
 
 用通俗的话说：
 

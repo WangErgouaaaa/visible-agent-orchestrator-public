@@ -6,7 +6,7 @@ worker.**
 
 English | [简体中文](README.zh-CN.md)
 
-![Overview: the organizer dispatches tasks through the VAO control plane to workers bound in tmux panes](docs/assets/vao-architecture.svg)
+![Overview: the organizer dispatches tasks through the VAO control plane to workers bound in tmux panes, and reads back reports with one terminal marker](docs/assets/vao-architecture.svg)
 
 ## The problem it solves
 
@@ -33,7 +33,7 @@ does not wrap, patch or replace your agents: it binds each registered worker to
 one concrete live pane and keeps every authority — authorization, dispatch,
 evidence, acceptance — outside the worker itself.
 
-![Task lifecycle: organize, work, review, accept — one owner per task, and a terminal marker alone never proves acceptance](docs/assets/vao-task-lifecycle.svg)
+![Task lifecycle: organize, work, independent review, then organizer acceptance — a terminal marker alone never proves acceptance](docs/assets/vao-task-lifecycle.svg)
 
 In plain terms:
 
