@@ -1,0 +1,959 @@
+#!/usr/bin/env python3
+"""Safe dispatch wrapper for the existing OMX team API/mailbox protocol.
+
+Default behavior is dry-run. Mock/demo/capability writes are limited to
+.omx/framework/team. Real team state remains under .omx/state/team. Real mode
+is opt-in and only uses `omx team api ... --input <json> --json`; this script
+never sends tmux input.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+_THIS_FILE = Path(__file__).resolve()
+for _candidate in (
+    (_THIS_FILE.parent.parent / "src").resolve(),
+    (_THIS_FILE.parent.parent / "lib").resolve(),
+):
+    if _candidate.exists() and str(_candidate) not in sys.path:
+        sys.path.insert(0, str(_candidate))
+
+from visible_agent_orchestrator.task_protocol_status import task_protocol_status
+from visible_agent_orchestrator.runtime_paths import runtime_root
+
+
+FRAMEWORK_RUNS = {"mock-run", "demo-run", "dispatch-demo"}
+REAL_FORBIDDEN_RUNS = FRAMEWORK_RUNS | {"_framework", "_framework/mock-run", "_framework/demo-run", "_framework/dispatch-demo"}
+CORE_API_OPERATIONS = (
+    "send-message",
+    "claim-task",
+    "transition-task-status",
+    "mailbox-list",
+    "mailbox-mark-delivered",
+)
+
+
+class DispatchError(Exception):
+    """Expected operator-facing failure."""
+
+
+@dataclass
+class CommandResult:
+    argv: list[str]
+    returncode: int
+    stdout: str
+    stderr: str
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def safe_slug(value: str, label: str) -> str:
+    if not value:
+        raise DispatchError(f"{label} is required")
+    if value in {".", ".."} or "/" in value or "\\" in value or "\x00" in value:
+        raise DispatchError(f"{label} must be a simple id, got: {value!r}")
+    return value
+
+
+def rel(path: Path, root: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(root.resolve()))
+    except Exception:
+        return str(path)
+
+
+def read_text(path: Path) -> str:
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+def read_json(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(read_text(path))
+    except Exception as exc:
+        raise DispatchError(f"failed to parse JSON {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise DispatchError(f"expected object JSON in {path}")
+    return data
+
+
+def write_json(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def append_jsonl(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(data, sort_keys=True, ensure_ascii=False) + "\n")
+
+
+def root_path(root_arg: str | None) -> Path:
+    return runtime_root(root_arg)
+
+
+def team_root(root: Path) -> Path:
+    return root / ".omx" / "state" / "team"
+
+
+def framework_dir(root: Path) -> Path:
+    return root / ".omx" / "framework" / "team"
+
+
+def ensure_framework(root: Path) -> Path:
+    path = framework_dir(root)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def capabilities_path(root: Path) -> Path:
+    return framework_dir(root) / "omx_team_capabilities.json"
+
+
+def capabilities_md_path(root: Path) -> Path:
+    return framework_dir(root) / "OMX_TEAM_CAPABILITIES.md"
+
+
+def framework_run_dir(root: Path, run: str) -> Path:
+    run = run.removeprefix("_framework/")
+    safe_slug(run, "run")
+    return framework_dir(root) / run
+
+
+def real_run_dir(root: Path, run: str) -> Path:
+    safe_slug(run, "run")
+    return team_root(root) / run
+
+
+def prepared_task_dir(root: Path, run: str, task: str) -> Path:
+    safe_slug(run.removeprefix("_framework/"), "run")
+    safe_slug(task, "task")
+    return framework_run_dir(root, run) / "tasks" / task
+
+
+def looks_framework_run(root: Path, run: str) -> bool:
+    normalized = run.removeprefix("_framework/")
+    return normalized in FRAMEWORK_RUNS or (framework_dir(root) / normalized).exists()
+
+
+def resolve_task_unit(root: Path, run: str, task: str, *, prefer_framework: bool) -> tuple[Path, bool]:
+    safe_slug(task, "task")
+    if prefer_framework or looks_framework_run(root, run):
+        path = prepared_task_dir(root, run, task)
+        if not path.exists():
+            raise DispatchError(f"prepared task not found: {rel(path, root)}")
+        return path, True
+
+    run_path = real_run_dir(root, run)
+    if not run_path.is_dir():
+        raise DispatchError(f"real team run not found: {rel(run_path, root)}")
+    candidates = [
+        run_path / "tasks" / task,
+        run_path / "tasks" / f"{task}.json",
+    ]
+    if task.startswith("task-"):
+        candidates.append(run_path / "tasks" / f"{task}.json")
+    else:
+        candidates.extend([
+            run_path / "tasks" / f"task-{task}",
+            run_path / "tasks" / f"task-{task}.json",
+        ])
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate, False
+    raise DispatchError(f"task file not found for run={run} task={task}")
+
+
+def marker_path_for_unit(unit_path: Path, marker: str) -> Path:
+    if unit_path.is_dir():
+        return unit_path / f".{marker}"
+    return Path(str(unit_path) + f".{marker}")
+
+
+def delivery_path_for_unit(unit_path: Path) -> Path:
+    if unit_path.is_dir():
+        return unit_path / "delivery.json"
+    return Path(str(unit_path) + ".delivery.json")
+
+
+def dispatch_path_for_unit(unit_path: Path) -> Path:
+    if unit_path.is_dir():
+        return unit_path / "dispatch.json"
+    return Path(str(unit_path) + ".dispatch.json")
+
+
+def prompt_path_for_unit(unit_path: Path) -> Path:
+    if unit_path.is_dir():
+        return unit_path / "prompt.txt"
+    return Path(str(unit_path) + ".prompt.txt")
+
+
+def task_md_path_for_unit(unit_path: Path) -> Path:
+    if unit_path.is_dir():
+        return unit_path / "task.md"
+    return Path(str(unit_path) + ".md")
+
+
+def read_prompt_and_dispatch(unit_path: Path) -> tuple[dict[str, Any], str]:
+    dispatch_file = dispatch_path_for_unit(unit_path)
+    prompt_file = prompt_path_for_unit(unit_path)
+    if not dispatch_file.is_file():
+        raise DispatchError(f"dispatch envelope not found: {dispatch_file}")
+    if not prompt_file.is_file():
+        raise DispatchError(f"prompt not found: {prompt_file}")
+    prompt = read_text(prompt_file)
+    if not prompt.strip():
+        raise DispatchError(f"prompt is empty: {prompt_file}")
+    return read_json(dispatch_file), prompt
+
+
+def run_shell(command: str, timeout: int = 15) -> CommandResult:
+    proc = subprocess.run(
+        ["bash", "-lc", command],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+        check=False,
+    )
+    return CommandResult(["bash", "-lc", command], proc.returncode, proc.stdout, proc.stderr)
+
+
+def run_argv(argv: list[str], timeout: int = 30) -> CommandResult:
+    proc = subprocess.run(
+        argv,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+        check=False,
+    )
+    return CommandResult(argv, proc.returncode, proc.stdout, proc.stderr)
+
+
+def command_exists(command: str) -> bool:
+    return shutil.which(command) is not None
+
+
+def parse_required_fields(output: str) -> list[str]:
+    fields: list[str] = []
+    capture = False
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if line.startswith("Required input fields:"):
+            capture = True
+            continue
+        if capture:
+            if line.startswith("- "):
+                fields.append(line[2:].strip())
+            elif line and not line.startswith("- "):
+                break
+    return fields
+
+
+def parse_optional_fields(output: str) -> list[str]:
+    fields: list[str] = []
+    capture = False
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if line.startswith("Optional input fields:"):
+            capture = True
+            continue
+        if capture:
+            if line.startswith("- "):
+                fields.append(line[2:].strip())
+            elif line and not line.startswith("- "):
+                break
+    return fields
+
+
+def usage_line(output: str) -> str:
+    for line in output.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Usage:"):
+            return stripped.removeprefix("Usage:").strip()
+    return ""
+
+
+def probe_capabilities(root: Path) -> dict[str, Any]:
+    ensure_framework(root)
+    omx_path = shutil.which("omx") or ""
+    data: dict[str, Any] = {
+        "schema_version": 1,
+        "generated_at": utc_now(),
+        "omx": {"available": bool(omx_path), "path": omx_path},
+        "probes": {},
+        "team_api": {},
+        "agent_title_commands": {},
+    }
+
+    base_probes = {
+        "omx": "omx --help || true",
+        "omx team": "omx team --help || true",
+        "omx team api": "omx team api --help || true",
+        "omx team status": "omx team status --help || true",
+        "omx team await": "omx team await --help || true",
+        "omx team resume": "omx team resume --help || true",
+    }
+    for name, cmd in base_probes.items():
+        result = run_shell(cmd)
+        combined = result.stdout + result.stderr
+        help_supported = "Usage:" in combined
+        available = result.returncode == 0 and (help_supported or "No team state found" in combined or "No resumable team found" in combined)
+        item: dict[str, Any] = {
+            "available": available,
+            "help_supported": help_supported,
+            "returncode": result.returncode,
+        }
+        if not help_supported and name.startswith("omx team "):
+            item["notes"] = "Current build appears to treat --help as a team name when no run exists."
+        data["probes"][name] = item
+
+    for op in CORE_API_OPERATIONS:
+        result = run_shell(f"omx team api {op} --help || true")
+        combined = result.stdout + result.stderr
+        required = parse_required_fields(combined)
+        optional = parse_optional_fields(combined)
+        available = result.returncode == 0 and "Usage:" in combined and bool(required)
+        item = {
+            "available": available,
+            "help_supported": "Usage:" in combined,
+            "returncode": result.returncode,
+            "usage": usage_line(combined),
+            "required_fields": required,
+            "optional_fields": optional,
+            "real_template_determinable": available,
+        }
+        if op == "send-message" and set(required) >= {"team_name", "from_worker", "to_worker", "body"}:
+            item["real_template"] = [
+                "omx",
+                "team",
+                "api",
+                "send-message",
+                "--input",
+                '{"team_name":"<run>","from_worker":"leader-fixed","to_worker":"<worker>","body":"<prompt>"}',
+                "--json",
+            ]
+        data["team_api"][op] = item
+
+    for name in ("agent_task", "agent_step", "agent_done", "agent_fail"):
+        result = run_shell(f"command -v {name} || true")
+        data["agent_title_commands"][name] = {
+            "available": bool(result.stdout.strip()),
+            "help_supported": False,
+            "notes": "Resolved by command -v; --help is not relied on because these helpers update terminal title text.",
+        }
+
+    write_json(capabilities_path(root), data)
+    write_capabilities_md(root, data)
+    return data
+
+
+def write_capabilities_md(root: Path, data: dict[str, Any]) -> None:
+    lines = [
+        "# OMX Team Capabilities",
+        "",
+        f"Generated at: `{data.get('generated_at', '')}`",
+        "",
+        "## Discovery Summary",
+        "",
+        f"- `omx` available: `{str(data.get('omx', {}).get('available', False)).lower()}`",
+        f"- `omx` path: `{data.get('omx', {}).get('path', '') or 'not found'}`",
+        "- Real state-changing dispatch remains disabled unless `--mode real --allow-real` is passed.",
+        "",
+        "## API Operation Availability",
+        "",
+        "| Operation | Available | Help | Required fields | Template determinable |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    for op in CORE_API_OPERATIONS:
+        item = data.get("team_api", {}).get(op, {})
+        lines.append(
+            f"| `{op}` | `{str(item.get('available', False)).lower()}` | "
+            f"`{str(item.get('help_supported', False)).lower()}` | "
+            f"`{', '.join(item.get('required_fields', []))}` | "
+            f"`{str(item.get('real_template_determinable', False)).lower()}` |"
+        )
+    send = data.get("team_api", {}).get("send-message", {})
+    lines.extend([
+        "",
+        "## Real Dispatch Template",
+        "",
+    ])
+    if send.get("real_template"):
+        lines.extend([
+            "```bash",
+            " ".join(send["real_template"]),
+            "```",
+        ])
+    else:
+        lines.append("No safe real dispatch template could be determined from local help.")
+    lines.extend([
+        "",
+        "## Notes",
+        "",
+        "- `status`, `await`, and `resume` may not expose conventional subcommand help in this OMX build.",
+        "- Mailbox delivered state must not be treated as worker received state unless a future protocol explicitly defines that equivalence.",
+        "- No tmux input is used by this wrapper.",
+    ])
+    capabilities_md_path(root).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def load_capabilities(root: Path, refresh: bool = False) -> dict[str, Any]:
+    path = capabilities_path(root)
+    if refresh or not path.is_file():
+        return probe_capabilities(root)
+    return read_json(path)
+
+
+def send_message_template_available(caps: dict[str, Any]) -> bool:
+    send = caps.get("team_api", {}).get("send-message", {})
+    required = set(send.get("required_fields", []))
+    return bool(send.get("available")) and required >= {"team_name", "from_worker", "to_worker", "body"}
+
+
+def command_capabilities(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    caps = load_capabilities(root, refresh=args.refresh)
+    print(f"root: {root}")
+    print(f"capabilities: {rel(capabilities_path(root), root)}")
+    print(f"omx: {'available' if caps.get('omx', {}).get('available') else 'unavailable'} {caps.get('omx', {}).get('path', '')}")
+    print("")
+    print("Team API:")
+    for op in CORE_API_OPERATIONS:
+        item = caps.get("team_api", {}).get(op, {})
+        state = "available" if item.get("available") else "unavailable"
+        template = "template=yes" if item.get("real_template_determinable") else "template=no"
+        print(f"  - {op}: {state} {template} required={','.join(item.get('required_fields', []))}")
+    print("")
+    print("Agent title helpers:")
+    for name, item in sorted(caps.get("agent_title_commands", {}).items()):
+        state = "available" if item.get("available") else "unavailable"
+        print(f"  - {name}: {state}")
+    return 0
+
+
+def build_prompt(run: str, task: str, owner: str, title: str, task_md: Path, task_dir: Path) -> str:
+    return "\n".join([
+        f"OMX_RUN_ID={run}",
+        f"OMX_TASK_ID={task}",
+        f"OMX_WORKER_ID={owner}",
+        "",
+        f"Task file: {task_md}",
+        "",
+        "Read the task file and complete only that assigned scope.",
+        "",
+        "Completion criteria:",
+        f"- Write {task_dir / 'report.md'}",
+        f"- On success, touch {task_dir / '.done'}",
+        f"- On failure, touch {task_dir / '.fail'}",
+        f"- If blocked, touch {task_dir / '.blocked'}",
+        "- Do not only say the work is complete verbally.",
+        "- Do not use terminal silence, old scrollback, or idle appearance as completion evidence.",
+        "",
+        f"Title: {title}",
+    ]) + "\n"
+
+
+def prepare_task(root: Path, run: str, task: str, owner: str, backend: str, title: str, body: str) -> Path:
+    run = safe_slug(run.removeprefix("_framework/"), "run")
+    task = safe_slug(task, "task")
+    owner = safe_slug(owner, "owner")
+    if not backend:
+        raise DispatchError("backend is required")
+    task_dir = prepared_task_dir(root, run, task)
+    task_dir.mkdir(parents=True, exist_ok=True)
+    run_dir = framework_run_dir(root, run)
+    (run_dir / "tasks").mkdir(parents=True, exist_ok=True)
+    (run_dir / "workers" / owner).mkdir(parents=True, exist_ok=True)
+
+    config_path = run_dir / "config.json"
+    if not config_path.exists():
+        write_json(config_path, {
+            "schema_version": 1,
+            "framework_fixture": True,
+            "run_id": run,
+            "created_at": utc_now(),
+            "tool": "omx_team_dispatch",
+        })
+
+    write_json(run_dir / "workers" / owner / "identity.json", {
+        "schema_version": 1,
+        "worker": owner,
+        "backend": backend,
+        "run_id": run,
+        "framework_fixture": True,
+    })
+
+    task_md = task_dir / "task.md"
+    task_md.write_text(f"# {title}\n\n{body.strip()}\n", encoding="utf-8")
+    task_json = {
+        "schema_version": 1,
+        "id": task,
+        "task_id": task,
+        "run_id": run,
+        "owner": owner,
+        "backend": backend,
+        "title": title,
+        "body": body,
+        "status": "created",
+        "created_at": utc_now(),
+        "framework_fixture": True,
+    }
+    write_json(task_dir / "task.json", task_json)
+
+    prompt = build_prompt(run, task, owner, title, task_md.resolve(), task_dir.resolve())
+    (task_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
+    dispatch = {
+        "schema_version": 1,
+        "run_id": run,
+        "task_id": task,
+        "worker": owner,
+        "backend": backend,
+        "title": title,
+        "prompt_path": str((task_dir / "prompt.txt").resolve()),
+        "task_path": str(task_md.resolve()),
+        "status": "prepared",
+        "created_at": utc_now(),
+        "allowed_modes": ["dry-run", "mock", "real-with-explicit-allow"],
+    }
+    write_json(task_dir / "dispatch.json", dispatch)
+    return task_dir
+
+
+def command_prepare(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    ensure_framework(root)
+    task_dir = prepare_task(root, args.run, args.task, args.owner, args.backend, args.title, args.body)
+    print(f"prepared: {rel(task_dir, root)}")
+    print(f"wrote: {rel(task_dir / 'task.md', root)}")
+    print(f"wrote: {rel(task_dir / 'task.json', root)}")
+    print(f"wrote: {rel(task_dir / 'dispatch.json', root)}")
+    print(f"wrote: {rel(task_dir / 'prompt.txt', root)}")
+    return 0
+
+
+def render_send_message_plan(run: str, worker: str, prompt: str) -> dict[str, Any]:
+    payload = {
+        "team_name": run,
+        "from_worker": "leader-fixed",
+        "to_worker": worker,
+        "body": prompt,
+    }
+    return {
+        "argv": ["omx", "team", "api", "send-message", "--input", json.dumps(payload, ensure_ascii=False), "--json"],
+        "payload_preview": {
+            "team_name": run,
+            "from_worker": "leader-fixed",
+            "to_worker": worker,
+            "body_bytes": len(prompt.encode("utf-8")),
+        },
+    }
+
+
+def write_dry_run(unit_path: Path, root: Path, run: str, task: str, worker: str, plan: dict[str, Any], caps: dict[str, Any]) -> Path:
+    path = unit_path / "dry_run_submit.json" if unit_path.is_dir() else Path(str(unit_path) + ".dry_run_submit.json")
+    write_json(path, {
+        "schema_version": 1,
+        "generated_at": utc_now(),
+        "mode": "dry-run",
+        "run_id": run,
+        "task_id": task,
+        "worker": worker,
+        "template_available": send_message_template_available(caps),
+        "plan": plan,
+        "note": "Dry-run only; omx was not called.",
+    })
+    return path
+
+
+def submit_dry_run(args: argparse.Namespace, root: Path) -> int:
+    unit_path, _ = resolve_task_unit(root, args.run, args.task, prefer_framework=looks_framework_run(root, args.run))
+    _dispatch, prompt = read_prompt_and_dispatch(unit_path)
+    caps = load_capabilities(root)
+    plan = render_send_message_plan(args.run, args.worker, prompt)
+    out = write_dry_run(unit_path, root, args.run, args.task, args.worker, plan, caps)
+    print("mode: dry-run")
+    print(f"task: {rel(unit_path, root)}")
+    print(f"template_available: {str(send_message_template_available(caps)).lower()}")
+    print("planned command:")
+    print("  " + " ".join(plan["argv"][:5]) + " '<json-payload>' " + " ".join(plan["argv"][6:]))
+    print(f"payload: {json.dumps(plan['payload_preview'], ensure_ascii=False, sort_keys=True)}")
+    print(f"wrote: {rel(out, root)}")
+    print("omx_called: false")
+    return 0
+
+
+def submit_mock(args: argparse.Namespace, root: Path) -> int:
+    if not looks_framework_run(root, args.run):
+        raise DispatchError("mock mode writes only .omx/framework/team runs; use a framework run such as mock-run or dispatch-demo")
+    unit_path, _ = resolve_task_unit(root, args.run, args.task, prefer_framework=True)
+    _dispatch, prompt = read_prompt_and_dispatch(unit_path)
+    plan = render_send_message_plan(args.run, args.worker, prompt)
+    submitted = marker_path_for_unit(unit_path, "submitted")
+    submitted.write_text(utc_now() + "\n", encoding="utf-8")
+    delivery = {
+        "schema_version": 1,
+        "mode": "mock",
+        "run_id": args.run,
+        "task_id": args.task,
+        "worker": args.worker,
+        "submitted_at": utc_now(),
+        "delivery_state": "submitted",
+        "received": False,
+        "note": "Mock submit records submitted only; it does not prove worker receipt.",
+        "plan": plan,
+    }
+    write_json(delivery_path_for_unit(unit_path), delivery)
+    append_jsonl(framework_run_dir(root, args.run) / "events.jsonl", {
+        "timestamp": utc_now(),
+        "event": "mock_submit",
+        "run_id": args.run,
+        "task_id": args.task,
+        "worker": args.worker,
+        "state": "submitted",
+    })
+    print("mode: mock")
+    print(f"submitted: {rel(submitted, root)}")
+    print(f"delivery: {rel(delivery_path_for_unit(unit_path), root)}")
+    print("received_written: false")
+    return 0
+
+
+def parse_json_maybe(text: str) -> Any:
+    try:
+        return json.loads(text)
+    except Exception:
+        return None
+
+
+def real_log_path(root: Path, run: str, task: str, worker: str) -> Path:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    safe = f"{stamp}-{run}-{task}-{worker}.json".replace("/", "_")
+    return framework_dir(root) / "dispatch-real-logs" / safe
+
+
+def submit_real(args: argparse.Namespace, root: Path) -> int:
+    if not args.allow_real:
+        raise DispatchError("real mode requires --allow-real")
+    if args.run in REAL_FORBIDDEN_RUNS or args.run.removeprefix("_framework/") in FRAMEWORK_RUNS:
+        raise DispatchError(f"refusing real dispatch to framework/demo run: {args.run}")
+    run_dir = real_run_dir(root, args.run)
+    if not run_dir.is_dir():
+        raise DispatchError(f"real run does not exist: {rel(run_dir, root)}")
+    unit_path, _ = resolve_task_unit(root, args.run, args.task, prefer_framework=False)
+    _dispatch, prompt = read_prompt_and_dispatch(unit_path)
+    caps = load_capabilities(root)
+    if not send_message_template_available(caps):
+        plan = render_send_message_plan(args.run, args.worker, prompt)
+        print("ERROR: real dispatch template is not confirmed by local help.", file=sys.stderr)
+        print("Needed template:", file=sys.stderr)
+        print(" ".join(plan["argv"][:5]) + " '<json-payload>' --json", file=sys.stderr)
+        return 2
+
+    plan = render_send_message_plan(args.run, args.worker, prompt)
+    result = run_argv(plan["argv"], timeout=60)
+    parsed_stdout = parse_json_maybe(result.stdout.strip())
+    ok_by_json = isinstance(parsed_stdout, dict) and parsed_stdout.get("ok") is True
+    ok = result.returncode == 0 and (ok_by_json or parsed_stdout is None)
+    record = {
+        "schema_version": 1,
+        "mode": "real",
+        "run_id": args.run,
+        "task_id": args.task,
+        "worker": args.worker,
+        "attempted_at": utc_now(),
+        "argv_redacted": ["omx", "team", "api", "send-message", "--input", "<json>", "--json"],
+        "payload_preview": plan["payload_preview"],
+        "returncode": result.returncode,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+        "parsed_stdout": parsed_stdout,
+        "ok": ok,
+    }
+    log_path = real_log_path(root, args.run, args.task, args.worker)
+    write_json(log_path, record)
+    if not ok:
+        print(f"real dispatch failed; log: {rel(log_path, root)}", file=sys.stderr)
+        return 1
+
+    submitted = marker_path_for_unit(unit_path, "submitted")
+    submitted.write_text(utc_now() + "\n", encoding="utf-8")
+    delivery = {
+        "schema_version": 1,
+        "mode": "real",
+        "run_id": args.run,
+        "task_id": args.task,
+        "worker": args.worker,
+        "submitted_at": utc_now(),
+        "delivery_state": "submitted",
+        "received": False,
+        "real_log": rel(log_path, root),
+        "note": "Real API call succeeded. .received is intentionally not written by dispatch.",
+    }
+    write_json(delivery_path_for_unit(unit_path), delivery)
+    print(f"real dispatch submitted: {rel(submitted, root)}")
+    print(f"delivery: {rel(delivery_path_for_unit(unit_path), root)}")
+    print(f"log: {rel(log_path, root)}")
+    print("received_written: false")
+    return 0
+
+
+def command_submit(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    safe_slug(args.worker, "worker")
+    if args.mode == "dry-run":
+        return submit_dry_run(args, root)
+    if args.mode == "mock":
+        return submit_mock(args, root)
+    if args.mode == "real":
+        return submit_real(args, root)
+    raise DispatchError(f"unknown mode: {args.mode}")
+
+
+def command_wait_receipt(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    prefer_framework = looks_framework_run(root, args.run)
+    unit_path, _ = resolve_task_unit(root, args.run, args.task, prefer_framework=prefer_framework)
+    received = marker_path_for_unit(unit_path, "received")
+    submitted = marker_path_for_unit(unit_path, "submitted")
+    deadline = time.monotonic() + max(0, args.timeout)
+    while True:
+        if received.is_file():
+            print("receipt: received")
+            print(f"marker: {rel(received, root)}")
+            return 0
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+
+    if submitted.is_file():
+        print("receipt: delivery_uncertain")
+        print(f"submitted: {rel(submitted, root)}")
+        print(".received not found before timeout")
+        return 1
+    print("receipt: not_submitted")
+    print(".submitted and .received are both absent")
+    return 1
+
+
+TASK_MARKERS = ("done", "blocked", "fail", "received", "submitted")
+
+
+def scan_run_tasks(root: Path, run: str) -> list[dict[str, Any]]:
+    """Scan one run's task directories with the shared task protocol reader.
+
+    Framework runs live under .omx/framework/team; existing state/team runs
+    keep working through the same marker/report protocol classification.
+    """
+    run_dir = framework_run_dir(root, run)
+    if not (run_dir / "tasks").is_dir():
+        state_run_dir = real_run_dir(root, run)
+        if (state_run_dir / "tasks").is_dir():
+            run_dir = state_run_dir
+    tasks_root = run_dir / "tasks"
+    tasks: list[dict[str, Any]] = []
+    if not tasks_root.is_dir():
+        return tasks
+    for task_dir in sorted(p for p in tasks_root.iterdir() if p.is_dir()):
+        task_json_path = task_dir / "task.json"
+        task_data = read_json(task_json_path) if task_json_path.is_file() else {}
+        status = str(task_protocol_status(task_dir).get("status") or "prepared")
+        if status == "prepared":
+            status = str(task_data.get("status") or "prepared")
+        signals = [marker for marker in TASK_MARKERS if (task_dir / f".{marker}").exists()]
+        tasks.append({
+            "id": str(task_data.get("id") or task_dir.name),
+            "run": run,
+            "owner": str(task_data.get("owner") or ""),
+            "backend": str(task_data.get("backend") or ""),
+            "status": status,
+            "signals": signals,
+            "path": rel(task_dir, root),
+        })
+    return tasks
+
+
+def format_tasks(tasks: list[dict[str, Any]]) -> str:
+    if not tasks:
+        return "No recognizable tasks for this run."
+    headers = ["status", "task", "owner", "backend", "signals", "path"]
+    rows = []
+    for task in tasks:
+        rows.append([
+            task.get("status", ""),
+            task.get("id", ""),
+            task.get("owner", ""),
+            task.get("backend", ""),
+            ",".join(task.get("signals", [])),
+            task.get("path", ""),
+        ])
+    widths: list[int] = []
+    for idx, header in enumerate(headers):
+        widths.append(min(max(len(str(row[idx])) for row in rows + [headers]), 44 if header == "path" else 28))
+
+    def cell(value: str, width: int) -> str:
+        text = str(value)
+        if len(text) > width:
+            text = text[: max(0, width - 1)] + "~"
+        return text.ljust(width)
+
+    lines = [
+        " | ".join(cell(header, widths[idx]) for idx, header in enumerate(headers)),
+        "-+-".join("-" * width for width in widths),
+    ]
+    for row in rows:
+        lines.append(" | ".join(cell(row[idx], widths[idx]) for idx in range(len(headers))))
+    return "\n".join(lines)
+
+
+def command_status(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    wanted = args.run.removeprefix("_framework/")
+    tasks = scan_run_tasks(root, wanted)
+    summary: dict[str, int] = {}
+    for task in tasks:
+        status = str(task.get("status", ""))
+        summary[status] = summary.get(status, 0) + 1
+    if args.json:
+        print(json.dumps({
+            "schema_version": 1,
+            "generated_at": utc_now(),
+            "run": wanted,
+            "tasks": tasks,
+            "summary": dict(sorted(summary.items())),
+        }, indent=2, sort_keys=True, ensure_ascii=False))
+        return 0
+    print(f"run: {wanted}")
+    print("Summary:")
+    if summary:
+        for status, count in sorted(summary.items()):
+            print(f"  {status}: {count}")
+    else:
+        print("  tasks: 0")
+    print("")
+    print(format_tasks(tasks))
+    return 0
+
+
+def write_report_and_marker(task_dir: Path, report: str, marker: str) -> None:
+    (task_dir / "report.md").write_text(report.strip() + "\n", encoding="utf-8")
+    (task_dir / f".{marker}").write_text(utc_now() + "\n", encoding="utf-8")
+
+
+def command_demo(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    ensure_framework(root)
+    run = "dispatch-demo"
+    tasks = [
+        ("task-001", "w1", "opencode_tui", "Dispatch demo completed task", "Mock task for opencode_tui."),
+        ("task-002", "w2", "claude_code", "Dispatch demo blocked task", "Mock task for claude_code."),
+        ("task-003", "w3", "cursor_agent", "Dispatch demo uncertain delivery", "Mock task for cursor_agent."),
+    ]
+    for task, worker, backend, title, body in tasks:
+        prepare_task(root, run, task, worker, backend, title, body)
+        submit_args = argparse.Namespace(root=str(root), run=run, task=task, worker=worker, mode="mock", allow_real=False)
+        submit_mock(submit_args, root)
+
+    run_dir = framework_run_dir(root, run)
+    write_report_and_marker(run_dir / "tasks" / "task-001", "# Report\n\nCompleted mock task-001.", "done")
+    write_report_and_marker(run_dir / "tasks" / "task-002", "# Report\n\nBlocked mock task-002 on an explicit dependency.", "blocked")
+
+    write_json(run_dir / "dispatch-demo-results.json", {
+        "schema_version": 1,
+        "generated_at": utc_now(),
+        "run_id": run,
+        "tasks": scan_run_tasks(root, run),
+    })
+    print(f"demo_run: {rel(run_dir, root)}")
+    print("tasks:")
+    print("  - task-001: mock submitted, then completed with report.md + .done")
+    print("  - task-002: mock submitted, then blocked with report.md + .blocked")
+    print("  - task-003: mock submitted only; expected delivery_uncertain")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="omx_team_dispatch",
+        description="Safe dispatch wrapper for existing OMX team API/mailbox state.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("capabilities", help="show or refresh discovered OMX team API capabilities")
+    p.add_argument("--root", default=".")
+    p.add_argument("--refresh", action="store_true", help="rerun help probes and rewrite .omx/framework/team capabilities files")
+    p.set_defaults(func=command_capabilities)
+
+    p = sub.add_parser("prepare", help="prepare a framework-only task envelope")
+    p.add_argument("--root", default=".")
+    p.add_argument("--run", required=True)
+    p.add_argument("--task", required=True)
+    p.add_argument("--owner", required=True)
+    p.add_argument("--backend", required=True)
+    p.add_argument("--title", required=True)
+    p.add_argument("--body", required=True)
+    p.set_defaults(func=command_prepare)
+
+    p = sub.add_parser("submit", help="submit a prepared task in dry-run, mock, or explicitly allowed real mode")
+    p.add_argument("--root", default=".")
+    p.add_argument("--run", required=True)
+    p.add_argument("--task", required=True)
+    p.add_argument("--worker", required=True)
+    p.add_argument("--mode", choices=["dry-run", "mock", "real"], default="dry-run")
+    p.add_argument("--allow-real", action="store_true", help="required with --mode real")
+    p.set_defaults(func=command_submit)
+
+    p = sub.add_parser("wait-receipt", help="wait for a .received marker without creating one")
+    p.add_argument("--root", default=".")
+    p.add_argument("--run", required=True)
+    p.add_argument("--task", required=True)
+    p.add_argument("--timeout", type=float, default=10.0)
+    p.set_defaults(func=command_wait_receipt)
+
+    p = sub.add_parser("status", help="show dispatch/task status for one framework run")
+    p.add_argument("--root", default=".")
+    p.add_argument("--run", required=True)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=command_status)
+
+    p = sub.add_parser("demo", help="create framework-only dispatch demo data")
+    p.add_argument("--root", default=".")
+    p.set_defaults(func=command_demo)
+
+    for command_parser in sub.choices.values():
+        command_parser.set_defaults(root=None)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return int(args.func(args))
+    except DispatchError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("ERROR: interrupted", file=sys.stderr)
+        return 2
+    except Exception as exc:
+        print(f"ERROR: unexpected failure: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Business Scoped-Write Approval",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "approval_kind",
+    "approval_id",
+    "approved_by",
+    "profile_id",
+    "writer",
+    "reviewer",
+    "contract_path",
+    "allowed_files",
+    "live_write_approved",
+    "allow_registry_writes",
+    "allow_state_team_writes",
+    "allow_git_index_changes",
+    "raw_tmux_allowed",
+    "direct_tui_allowed",
+    "direct_adapter_allowed",
+    "rmux_allowed",
+    "expires_at"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "approval_kind": { "const": "business-scoped-write-approval" },
+    "approval_id": { "type": "string", "minLength": 1 },
+    "approved_by": { "type": "string", "minLength": 1 },
+    "profile_id": { "const": "business-scoped-write-v1" },
+    "writer": { "type": "string", "minLength": 1 },
+    "reviewer": { "type": "string", "minLength": 1 },
+    "contract_path": { "type": "string", "minLength": 1 },
+    "allowed_files": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true
+    },
+    "live_write_approved": { "const": true },
+    "allow_registry_writes": { "const": false },
+    "allow_state_team_writes": { "const": false },
+    "allow_git_index_changes": { "const": false },
+    "raw_tmux_allowed": { "const": false },
+    "direct_tui_allowed": { "const": false },
+    "direct_adapter_allowed": { "const": false },
+    "rmux_allowed": { "const": false },
+    "expires_at": { "type": "string", "minLength": 1 },
+    "notes": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  },
+  "additionalProperties": false
+}

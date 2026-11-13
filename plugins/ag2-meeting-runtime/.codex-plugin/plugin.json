@@ -1,0 +1,31 @@
+{
+  "name": "ag2-meeting-runtime",
+  "version": "0.1.0",
+  "description": "Global plugin wrapper for safe AG2-style meeting runtime triggers.",
+  "author": {
+    "name": "visible-agent-orchestrator"
+  },
+  "skills": "./skills/",
+  "keywords": [
+    "ag2",
+    "meeting",
+    "multi-agent",
+    "orchestrator"
+  ],
+  "interface": {
+    "displayName": "AG2 Meeting Runtime",
+    "shortDescription": "Run an AG2-style meeting through safe installed CLIs.",
+    "longDescription": "AG2-style group meetings with proposer, skeptic, synthesizer, and orchestrator-style turn control through installed visible-agent-orchestrator CLIs. The plugin wrapper defaults to mock/no-live; any lower-level live smoke path requires explicit host-local approval.",
+    "developerName": "visible-agent-orchestrator",
+    "category": "Productivity",
+    "capabilities": [
+      "Workflow",
+      "Local CLI"
+    ],
+    "defaultPrompt": [
+      "Review this idea with an AG2-style meeting.",
+      "Run a mock AG2 meeting for this task.",
+      "Run a mock AG2 meeting for an implementation design."
+    ]
+  }
+}

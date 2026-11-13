@@ -1,0 +1,559 @@
+#!/usr/bin/env python3
+"""Read-only RuntimeAdapter utility and worker evidence CLI."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+_THIS_FILE = Path(__file__).resolve()
+_CANDIDATE_IMPORT_ROOTS = []
+
+_env_lib = os.environ.get("OMX_VISIBLE_AGENT_ORCHESTRATOR_LIB")
+if _env_lib:
+    _CANDIDATE_IMPORT_ROOTS.append(Path(_env_lib).expanduser().resolve())
+
+_CANDIDATE_IMPORT_ROOTS.append((_THIS_FILE.parent.parent / "src").resolve())
+_CANDIDATE_IMPORT_ROOTS.append((_THIS_FILE.parent.parent / "lib").resolve())
+
+for _p in _CANDIDATE_IMPORT_ROOTS:
+    if _p.exists() and str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
+
+from visible_agent_orchestrator.runtime.errors import RuntimeAdapterError
+from visible_agent_orchestrator.runtime.adapter import RuntimeAdapter
+from visible_agent_orchestrator.runtime.backends import (
+    available_backends,
+    default_backend_name,
+    get_backend,
+    is_backend_live_enabled,
+)
+from visible_agent_orchestrator.runtime.health import build_runtime_health_summary
+from visible_agent_orchestrator.runtime.rebind import build_rebind_check_summary
+from visible_agent_orchestrator.runtime.status import build_worker_status_summary
+from visible_agent_orchestrator.runtime.tmux_capabilities import command_support_report
+
+
+INTERFACE_DOC = Path("runtime-substrates/runtime-adapter-interface.md")
+SMOKE_MATRIX_DOC = Path("runtime-substrates/backend-smoke-matrix.md")
+
+PATTERNS = [
+    "tmux",
+    "pane_id",
+    "pane_pid",
+    "list-panes",
+    "send-keys",
+    "paste-buffer",
+    "kill-pane",
+    "split-window",
+    "new-window",
+    "ss",
+    "lsof",
+    "opencode_visible_workers",
+    "port binding",
+]
+
+CONTROL_SURFACES = {
+    "omx_runtime_adapter",
+    "omx_visible_dispatch",
+    "omx_visible_health",
+    "omx_visible_watcher",
+    "omx_visible_rebind",
+    "omx_task_signal",
+}
+
+PROTOCOL_HINTS = (
+    "task_signal",
+    "task_state",
+    "TASK_SIGNAL_PROTOCOL",
+    "VISIBLE_CONTROL_PROTOCOL",
+    "VISIBLE_CONTROL_HARD_RULES",
+)
+
+SUBSTRATE_HINTS = (
+    "tmux",
+    "rmux",
+    "opencode_tui",
+    "opencode_worker",
+    "OPEN_CODE_VISIBLE_BINDING",
+    "OPENCODE_FIXED_PORT_WORKERS",
+)
+
+
+@dataclass(frozen=True)
+class Hit:
+    path: Path
+    pattern: str
+    count: int
+
+
+def repo_root(value: str) -> Path:
+    root = Path(value).resolve()
+    if not root.exists():
+        raise argparse.ArgumentTypeError(f"root does not exist: {root}")
+    source_repo_shape = (root / "README.md").exists()
+    live_runtime_shape = (root / "AGENTS.md").exists() and (root / "bin").is_dir() and (root / ".omx").is_dir()
+    installed_package_shape = (root / "bin").is_dir() and (root / "lib" / "visible_agent_orchestrator").is_dir()
+    if not source_repo_shape and not live_runtime_shape and not installed_package_shape:
+        raise argparse.ArgumentTypeError(f"root does not look like this repo: {root}")
+    return root
+
+
+def read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return path.read_text(encoding="utf-8", errors="replace")
+
+
+def markdown_summary(root: Path, relative: Path) -> str:
+    path = root / relative
+    if not path.exists():
+        return f"missing: {relative}"
+    text = read_text(path)
+    headings = [line.strip() for line in text.splitlines() if line.startswith("#")]
+    bullets = [line.strip() for line in text.splitlines() if line.startswith("- ")]
+    out = [f"{relative}", ""]
+    out.extend(headings[:12])
+    if bullets:
+        out.append("")
+        out.extend(bullets[:16])
+    return "\n".join(out)
+
+
+def iter_text_files(root: Path) -> list[Path]:
+    candidates: list[Path] = []
+    for base in ("bin", "docs", "runtime-substrates"):
+        directory = root / base
+        if not directory.exists():
+            continue
+        for path in directory.rglob("*"):
+            if path.is_file() and "__pycache__" not in path.parts:
+                candidates.append(path)
+    return sorted(candidates)
+
+
+def classify_files(root: Path) -> tuple[list[Path], list[Path], list[Path]]:
+    protocol: list[Path] = []
+    control: list[Path] = []
+    substrate: list[Path] = []
+    for path in iter_text_files(root):
+        rel = path.relative_to(root)
+        name = rel.name
+        rel_text = rel.as_posix()
+        if rel.parts[0] == "bin" and name in CONTROL_SURFACES:
+            control.append(rel)
+        if any(hint in rel_text for hint in PROTOCOL_HINTS):
+            protocol.append(rel)
+        if rel.parts[0] == "runtime-substrates" or any(hint in rel_text for hint in SUBSTRATE_HINTS):
+            substrate.append(rel)
+    return sorted(set(protocol)), sorted(set(control)), sorted(set(substrate))
+
+
+def scan_hits(root: Path) -> list[Hit]:
+    hits: list[Hit] = []
+    for path in iter_text_files(root):
+        rel = path.relative_to(root)
+        if rel.as_posix() == "bin/omx_runtime_adapter":
+            continue
+        text = read_text(path)
+        for pattern in PATTERNS:
+            if pattern == "ss":
+                count = len(re.findall(r"(?<![A-Za-z0-9_])ss(?![A-Za-z0-9_])", text))
+            else:
+                count = text.count(pattern)
+            if count:
+                hits.append(Hit(rel, pattern, count))
+    return hits
+
+
+def likely_boundary_violations(root: Path, hits: list[Hit]) -> list[Hit]:
+    protocol, control, substrate = classify_files(root)
+    substrate_set = set(substrate)
+    allowed_control = set(control)
+    violations: list[Hit] = []
+    for hit in hits:
+        if hit.path in substrate_set:
+            continue
+        if hit.path in allowed_control and hit.pattern not in {"send-keys", "paste-buffer", "kill-pane"}:
+            continue
+        if hit.path in set(protocol):
+            violations.append(hit)
+        elif hit.pattern in {"send-keys", "paste-buffer", "kill-pane", "split-window", "new-window"}:
+            violations.append(hit)
+        elif hit.pattern in {"tmux", "pane_id", "pane_pid", "list-panes", "opencode_visible_workers", "port binding"}:
+            violations.append(hit)
+    return violations
+
+
+def print_path_list(title: str, paths: list[Path]) -> None:
+    print(title)
+    if not paths:
+        print("  - none")
+        return
+    for path in paths:
+        print(f"  - {path.as_posix()}")
+
+
+def cmd_list_backends(args: argparse.Namespace) -> int:
+    for backend in available_backends():
+        print(f"{backend['name']}: {backend['status']}")
+    print(f"default backend: {default_backend_name()}")
+    print(f"rmux default: {str(default_backend_name().startswith('rmux')).lower()}")
+    support = command_support_report()
+    print(f"tmux live baseline: {support['tmux_live_baseline']}")
+    print(f"active runtime substrate: {support['active_runtime_substrate']}")
+    print(f"blocked post-baseline features: {', '.join(str(item) for item in support['blocked_post_baseline_features'])}")
+    return 0
+
+
+def cmd_interface(args: argparse.Namespace) -> int:
+    print(markdown_summary(args.root, INTERFACE_DOC))
+    return 0
+
+
+def cmd_smoke_matrix(args: argparse.Namespace) -> int:
+    print(markdown_summary(args.root, SMOKE_MATRIX_DOC))
+    return 0
+
+
+def current_runtime_substrate() -> str:
+    if os.environ.get("RMUX"):
+        return "rmux"
+    if os.environ.get("TMUX"):
+        return "tmux"
+    return ""
+
+
+def rmux_list_commands() -> list[str]:
+    import subprocess
+
+    result = subprocess.run(
+        ["rmux", "list-commands"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        return []
+    commands: list[str] = []
+    for line in result.stdout.splitlines():
+        name = line.strip().split(" ", 1)[0]
+        if name:
+            commands.append(name)
+    return commands
+
+
+def web_share_capability_payload(args: argparse.Namespace) -> dict:
+    backend = getattr(args, "backend", default_backend_name())
+    backend_type = "rmux" if str(backend).startswith("rmux") else "tmux"
+    runtime_substrate = current_runtime_substrate()
+    commands = rmux_list_commands() if backend_type == "rmux" and shutil.which("rmux") else []
+    supports_start_server = "start-server" in commands
+    supports_web_interface = bool(supports_start_server and runtime_substrate == "rmux")
+    return {
+        **backend_payload(args),
+        "runtime_substrate": runtime_substrate,
+        "supports_start_server": supports_start_server,
+        "supports_web_interface": supports_web_interface,
+        "recommended_web_port": 8787,
+        "notes": [
+            "web-share capability is read-only here; no server is started",
+            "use the plan surface before any live rmux start-server execution",
+        ],
+    }
+
+
+def cmd_web_share_capability(args: argparse.Namespace) -> int:
+    payload = web_share_capability_payload(args)
+    emit_payload(payload, json_output=args.json)
+    return 0 if payload.get("supports_web_interface") else 1
+
+
+def cmd_web_share_plan(args: argparse.Namespace) -> int:
+    payload = web_share_capability_payload(args)
+    web_port = int(getattr(args, "web_port", 8787) or 8787)
+    frontend_url = str(getattr(args, "frontend_url", "") or "").strip()
+    command = ["rmux", "start-server", "--web-port", str(web_port)]
+    if frontend_url:
+        command.extend(["--frontend-url", frontend_url])
+    report = {
+        **payload,
+        "web_port": web_port,
+        "frontend_url": frontend_url,
+        "launch_command": " ".join(command),
+        "ready_to_execute": bool(payload.get("supports_web_interface")),
+    }
+    emit_payload(report, json_output=args.json)
+    return 0 if report.get("ready_to_execute") else 1
+
+
+def cmd_check_boundary(args: argparse.Namespace) -> int:
+    protocol, control, substrate = classify_files(args.root)
+    hits = scan_hits(args.root)
+    violations = likely_boundary_violations(args.root, hits)
+
+    print_path_list("protocol layer files:", protocol)
+    print_path_list("control surface files:", control)
+    print_path_list("substrate-specific files:", substrate)
+
+    print("tmux-shaped assumptions:")
+    if not hits:
+        print("  - none")
+    else:
+        for hit in hits:
+            print(f"  - {hit.path.as_posix()}: {hit.pattern} ({hit.count})")
+
+    print("likely boundary violations:")
+    if not violations:
+        print("  - none")
+    else:
+        for hit in violations:
+            print(f"  - {hit.path.as_posix()}: {hit.pattern} ({hit.count})")
+
+    return 0
+
+
+def adapter_from_args(args: argparse.Namespace) -> RuntimeAdapter:
+    backend = getattr(args, "backend", default_backend_name())
+    fixture = getattr(args, "fixture", None)
+    fixture_dir = Path(fixture).resolve() if fixture else None
+    if backend == "rmux-spike" and fixture_dir is None:
+        raise RuntimeAdapterError("rmux-spike fixture required; live rmux disabled in spike-1")
+    return get_backend(backend, fixture_dir=fixture_dir)
+
+
+def backend_payload(args: argparse.Namespace) -> dict:
+    backend = getattr(args, "backend", default_backend_name())
+    fixture = getattr(args, "fixture", None)
+    backend_type = "rmux" if str(backend).startswith("rmux") else "tmux"
+    rmux_default = str(default_backend_name()).startswith("rmux")
+    return {
+        "backend": backend,
+        "backend_type": backend_type,
+        "default_backend": default_backend_name(),
+        "rmux_default": rmux_default,
+        "live_enabled": is_backend_live_enabled(backend),
+        "fixture_mode": bool(fixture),
+        **command_support_report(),
+    }
+
+
+def emit_payload(payload: dict, *, json_output: bool) -> None:
+    if json_output:
+        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
+        return
+    rmux_notice = payload.get("backend") == "rmux-spike"
+    if "workers" in payload:
+        print(f"backend: {payload.get('backend')}")
+        if rmux_notice:
+            print("rmux-spike is fixture-only")
+            print("no live rmux session was created")
+            print("submit unsupported")
+        print(f"backend_type: {payload.get('backend_type')}")
+        print(f"default_backend: {payload.get('default_backend')}")
+        print(f"rmux_default: {str(bool(payload.get('rmux_default'))).lower()}")
+        print(f"live_enabled: {str(bool(payload.get('live_enabled'))).lower()}")
+        print(f"fixture_mode: {str(bool(payload.get('fixture_mode'))).lower()}")
+        print(f"tmux_live_baseline: {payload.get('tmux_live_baseline')}")
+        print(f"active_runtime_substrate: {payload.get('active_runtime_substrate')}")
+        for worker in payload["workers"]:
+            print("")
+            print(f"worker_id: {worker.get('worker_id')}")
+            print(f"role: {worker.get('role')}")
+            print(f"allow_auto_submit: {str(bool(worker.get('allow_auto_submit'))).lower()}")
+            print(f"default_for_new_tasks: {str(bool(worker.get('default_for_new_tasks'))).lower()}")
+            print(f"pane: {worker.get('pane_id') or worker.get('pane') or '-'}")
+            print(f"port: {worker.get('port') if worker.get('port') is not None else '-'}")
+            print(f"binding_confidence: {worker.get('binding_confidence') or '-'}")
+            print(f"dispatch_allowed: {str(bool(worker.get('dispatch_allowed'))).lower()}")
+            for warning in worker.get("warnings", []):
+                print(f"warning: {warning}")
+            for error in worker.get("errors", []):
+                print(f"error: {error}")
+        return
+    if "worker" in payload and isinstance(payload["worker"], dict):
+        worker = payload["worker"]
+        binding = payload.get("binding") or {}
+        print(f"backend: {payload.get('backend')}")
+        if rmux_notice:
+            print("rmux-spike is fixture-only")
+            print("no live rmux session was created")
+            print("submit unsupported")
+        print(f"backend_type: {payload.get('backend_type')}")
+        print(f"tmux_live_baseline: {payload.get('tmux_live_baseline')}")
+        print(f"active_runtime_substrate: {payload.get('active_runtime_substrate')}")
+        print(f"worker_id: {worker.get('worker_id')}")
+        print(f"role: {worker.get('role')}")
+        print(f"allow_auto_submit: {str(bool(worker.get('allow_auto_submit'))).lower()}")
+        print(f"default_for_new_tasks: {str(bool(worker.get('default_for_new_tasks'))).lower()}")
+        print(f"pane: {binding.get('pane_id') or worker.get('pane_id') or '-'}")
+        print(f"port: {binding.get('port') if binding.get('port') is not None else worker.get('port')}")
+        print(f"binding_confidence: {binding.get('binding_confidence') or worker.get('binding_confidence') or '-'}")
+        print(f"dispatch_allowed: {str(bool(payload.get('dispatch_allowed'))).lower()}")
+    else:
+        if rmux_notice:
+            print("rmux-spike is fixture-only")
+            print("no live rmux session was created")
+            print("submit unsupported")
+        for key, value in payload.items():
+            if isinstance(value, (dict, list)):
+                print(f"{key}: {json.dumps(value, sort_keys=True, ensure_ascii=False)}")
+            else:
+                print(f"{key}: {value}")
+    for warning in payload.get("warnings", []):
+        print(f"warning: {warning}")
+    for error in payload.get("errors", []):
+        print(f"error: {error}")
+
+
+def cmd_workers(args: argparse.Namespace) -> int:
+    adapter = adapter_from_args(args)
+    workers = [worker.to_dict() for worker in adapter.discover_workers(args.root)]
+    payload = {
+        **backend_payload(args),
+        "workers": workers,
+    }
+    emit_payload(payload, json_output=args.json)
+    return 0
+
+
+def cmd_resolve(args: argparse.Namespace) -> int:
+    adapter = adapter_from_args(args)
+    result = adapter.resolve_worker(args.root, args.worker)
+    payload = {**backend_payload(args), **result.to_dict()}
+    emit_payload(payload, json_output=args.json)
+    if getattr(args, "backend", default_backend_name()) == "rmux-spike":
+        return 0
+    return 0 if result.dispatch_allowed else 1
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    adapter = adapter_from_args(args)
+    result = adapter.verify_binding(args.root, args.worker)
+    payload = {**backend_payload(args), **result.to_dict()}
+    emit_payload(payload, json_output=args.json)
+    return 0 if result.ok else 1
+
+
+def cmd_readiness(args: argparse.Namespace) -> int:
+    adapter = adapter_from_args(args)
+    result = adapter.fetch_readiness(args.root, args.worker)
+    payload = {**backend_payload(args), **result.to_dict(), "dispatch_allowed": None}
+    emit_payload(payload, json_output=args.json)
+    return 0
+
+
+def cmd_health(args: argparse.Namespace) -> int:
+    payload = build_runtime_health_summary(
+        args.root,
+        worker_id=args.worker,
+        backend=args.backend,
+        fixture_dir=Path(args.fixture).resolve() if args.fixture else None,
+    )
+    emit_payload(payload, json_output=args.json)
+    return 0 if payload.get("ok") else 1
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    payload = build_worker_status_summary(
+        args.root,
+        worker_id=args.worker,
+        backend=args.backend,
+        fixture_dir=Path(args.fixture).resolve() if args.fixture else None,
+    )
+    emit_payload(payload, json_output=args.json)
+    return 0 if payload.get("ok") else 1
+
+
+def cmd_rebind_check(args: argparse.Namespace) -> int:
+    payload = build_rebind_check_summary(
+        args.root,
+        args.worker,
+        backend=args.backend,
+        fixture_dir=Path(args.fixture).resolve() if args.fixture else None,
+    )
+    emit_payload(payload, json_output=args.json)
+    if args.backend == "rmux-spike":
+        return 0 if payload.get("status") == "candidate_fixture_only" else 1
+    return 0 if payload.get("status") == "current_binding_ok" else 1
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="omx_runtime_adapter",
+        description=(
+            "Read-only RuntimeAdapter utility. It does not submit tasks, call "
+            "rmux, call OpenCode, or mutate repository state."
+        ),
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    for name, handler, help_text in (
+        ("list-backends", cmd_list_backends, "show current and planned runtime backends"),
+        ("interface", cmd_interface, "summarize the RuntimeAdapter interface"),
+        ("smoke-matrix", cmd_smoke_matrix, "summarize backend smoke requirements"),
+        ("check-boundary", cmd_check_boundary, "scan repo text for substrate-shaped assumptions"),
+        ("web-share-capability", cmd_web_share_capability, "report whether rmux browser supervision is available"),
+        ("web-share-plan", cmd_web_share_plan, "print a read-only rmux web-share launch plan"),
+    ):
+        sub = subparsers.add_parser(name, help=help_text)
+        sub.add_argument("--root", type=repo_root, default=Path(".").resolve(), help="repository root")
+        if name in {"web-share-capability", "web-share-plan"}:
+            sub.add_argument(
+                "--backend",
+                default=default_backend_name(),
+                choices=[backend["name"] for backend in available_backends()],
+                help="runtime backend",
+            )
+            sub.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+            if name == "web-share-plan":
+                sub.add_argument("--web-port", type=int, default=8787)
+                sub.add_argument("--frontend-url", default="")
+        sub.set_defaults(func=handler)
+
+    for name, handler, help_text in (
+        ("workers", cmd_workers, "list registry-backed workers through the RuntimeAdapter"),
+        ("resolve", cmd_resolve, "resolve one worker through the RuntimeAdapter"),
+        ("verify", cmd_verify, "verify one worker binding through the RuntimeAdapter"),
+        ("readiness", cmd_readiness, "fetch read-only readiness telemetry for one worker"),
+        ("health", cmd_health, "build protocol/substrate/runtime health summary for one worker"),
+        ("status", cmd_status, "build RuntimeAdapter status summary for one worker"),
+        ("rebind-check", cmd_rebind_check, "build read-only RuntimeAdapter rebind check summary"),
+    ):
+        sub = subparsers.add_parser(name, help=help_text)
+        sub.add_argument("--root", type=repo_root, default=Path(".").resolve(), help="repository root")
+        sub.add_argument(
+            "--backend",
+            default=default_backend_name(),
+            choices=[backend["name"] for backend in available_backends()],
+            help="runtime backend",
+        )
+        sub.add_argument("--fixture", help="fixture directory containing opencode_visible_workers.json")
+        sub.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+        if name != "workers":
+            sub.add_argument("--worker", required=True, help="worker id")
+        sub.set_defaults(func=handler)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return args.func(args)
+    except RuntimeAdapterError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

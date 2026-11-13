@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+"""Validate and publish native Git Lore trailer messages."""
+
+from __future__ import annotations
+
+import argparse
+import subprocess
+import sys
+from pathlib import Path
+
+
+LORE_KEYS = frozenset(
+    {
+        "Constraint",
+        "Rejected",
+        "Confidence",
+        "Scope-risk",
+        "Directive",
+        "Tested",
+        "Not-tested",
+    }
+)
+
+
+class LoreMessageError(ValueError):
+    pass
+
+
+def _lore_rows(text: str) -> list[tuple[str, str]]:
+    rows: list[tuple[str, str]] = []
+    for line in text.splitlines():
+        key, separator, value = line.partition(":")
+        key = key.strip()
+        if separator and key in LORE_KEYS:
+            rows.append((key, value.strip()))
+    return rows
+
+
+def validate_message_file(path: Path) -> list[tuple[str, str]]:
+    message = path.read_text(encoding="utf-8")
+    if "\\n" in message:
+        raise LoreMessageError("literal escaped newlines are not supported")
+    authored = _lore_rows(message)
+    result = subprocess.run(
+        ["git", "interpret-trailers", "--parse", str(path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode:
+        raise LoreMessageError(result.stderr.strip() or "git trailer parsing failed")
+    parsed = _lore_rows(result.stdout)
+    if not authored or authored != parsed:
+        raise LoreMessageError("authored Lore rows do not match native Git trailers")
+    return parsed
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Validate native Lore trailers before commit or PR merge.",
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+    for name in ("validate", "commit"):
+        command = commands.add_parser(name)
+        command.add_argument("--message-file", type=Path, required=True)
+    merge = commands.add_parser("merge")
+    merge.add_argument("pull_request")
+    merge.add_argument("--message-file", type=Path, required=True)
+    merge.add_argument("--repo")
+    merge.add_argument(
+        "--method",
+        choices=("merge", "squash", "rebase"),
+        default="merge",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    try:
+        rows = validate_message_file(args.message_file)
+        if args.command == "validate":
+            for key, value in rows:
+                print(f"{key}: {value}")
+            return 0
+        if args.command == "commit":
+            command = ["git", "commit", "-F", str(args.message_file)]
+        else:
+            subject, separator, body = args.message_file.read_text(
+                encoding="utf-8"
+            ).partition("\n")
+            if not separator or not subject.strip():
+                raise LoreMessageError("merge message requires a subject and body")
+            command = ["gh", "pr", "merge", args.pull_request]
+            if args.repo:
+                command.extend(["--repo", args.repo])
+            command.extend(
+                [
+                    f"--{args.method}",
+                    "--subject",
+                    subject,
+                    "--body",
+                    body,
+                ]
+            )
+        return subprocess.run(command, check=False).returncode
+    except (LoreMessageError, OSError, UnicodeError) as error:
+        print(f"omx_lore_message: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

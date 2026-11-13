@@ -1,0 +1,3376 @@
+#!/usr/bin/env python3
+"""Read-only worker agent backend utility.
+
+This separates agent-family backends from runtime substrate backends. It does
+not contact Claude Code, Cursor Agent, OpenCode, tmux, or rmux.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+_THIS_FILE = Path(__file__).resolve()
+_CANDIDATE_IMPORT_ROOTS = []
+
+_env_lib = os.environ.get("OMX_VISIBLE_AGENT_ORCHESTRATOR_LIB")
+if _env_lib:
+    _CANDIDATE_IMPORT_ROOTS.append(Path(_env_lib).expanduser().resolve())
+
+_CANDIDATE_IMPORT_ROOTS.append((_THIS_FILE.parent.parent / "src").resolve())
+_CANDIDATE_IMPORT_ROOTS.append((_THIS_FILE.parent.parent / "lib").resolve())
+
+for _p in _CANDIDATE_IMPORT_ROOTS:
+    if _p.exists() and str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
+
+from visible_agent_orchestrator.runtime.errors import RuntimeAdapterError
+from visible_agent_orchestrator.runtime_paths import runtime_root
+from visible_agent_orchestrator.worker.authorization import validate_authorization_record_file
+from visible_agent_orchestrator.worker.authorization_profiles import (
+    AuthorizationProfileRequest,
+    default_authorization_profile,
+    execute_with_authorization_profile,
+    list_authorization_profiles,
+    plan_default_authorization_profile,
+    plan_with_authorization_profile,
+    prepare_business_scoped_rollback_smoke,
+    prepare_business_scoped_write_smoke,
+    profile_summary,
+    rehearse_business_scoped_write,
+    short_prompt_template,
+    validate_authorization_profile_file,
+    validate_business_baseline_delta_file,
+    validate_business_scoped_rollback_approval_file,
+    validate_business_scoped_rollback_prep_file,
+    validate_business_scoped_write_approval_file,
+    validate_business_scoped_write_smoke_prep_file,
+    validate_business_write_scope_file,
+)
+from visible_agent_orchestrator.worker.business_readonly_review import (
+    validate_business_readonly_review_result_file,
+)
+from visible_agent_orchestrator.worker.role_task_package import (
+    RoleTaskPackageRequest,
+    build_sandbox_role_live_smoke_package,
+    build_sandbox_role_run_spec_from_dispatch_metadata,
+    closeout_sandbox_role_run_from_dispatch_metadata,
+    closeout_sandbox_role_run_from_run_artifact,
+    evaluate_sandbox_role_harness,
+    evaluate_sandbox_role_run,
+    execute_sandbox_role_live_smoke_runner,
+    plan_role_task_package,
+    validate_role_task_cycle_ready,
+    validate_role_task_package,
+)
+from visible_agent_orchestrator.worker.backends import available_backends, get_backend, is_backend_live_enabled
+from visible_agent_orchestrator.worker.claude_live import (
+    ClaudeLiveSubmitRequest,
+    build_claude_live_submit_plan,
+    build_claude_live_submit_result,
+)
+from visible_agent_orchestrator.worker.claude_mixed_readiness import (
+    build_claude_mixed_readiness_check_from_files,
+    build_claude_mixed_readiness_fixture_check,
+)
+from visible_agent_orchestrator.worker.config_paths import discover_config_paths, resolve_live_enable_config
+from visible_agent_orchestrator.worker.live_enable import (
+    backend_live_submit_adapter_available,
+    backend_supports_live_submit,
+    evaluate_live_enable,
+)
+from visible_agent_orchestrator.worker.mixed_plan import (
+    build_mixed_worker_fixture_plan,
+    build_mixed_worker_plan_from_files,
+    normalize_backend_name,
+)
+from visible_agent_orchestrator.worker.mixed_noop_contract import (
+    build_mixed_noop_contract_plan_from_files,
+    build_mixed_noop_fixture_plan,
+    validate_mixed_noop_contract_file,
+    validate_mixed_noop_result_files,
+)
+from visible_agent_orchestrator.worker.mixed_noop_live_runner import (
+    MixedNoopLiveRequest,
+    build_mixed_noop_live_plan,
+    execute_mixed_noop_live,
+    validate_mixed_noop_live_result_file,
+)
+from visible_agent_orchestrator.worker.mixed_business_readiness import (
+    build_mixed_business_readiness_fixture_plan,
+    build_mixed_business_readiness_plan_from_files,
+    validate_mixed_business_readiness_plan_file,
+)
+from visible_agent_orchestrator.worker.opencode_mixed_readiness import (
+    build_opencode_mixed_readiness_check_from_files,
+    build_opencode_mixed_readiness_fixture_check,
+)
+from visible_agent_orchestrator.worker.opencode_mixed_readiness_evidence import (
+    build_opencode_mixed_readiness_evidence_fixture_plan,
+    build_opencode_mixed_readiness_evidence_plan_from_files,
+    validate_opencode_mixed_readiness_evidence_file,
+)
+from visible_agent_orchestrator.worker.opencode_mixed_readiness_evidence_execution import (
+    build_opencode_mixed_readiness_evidence_execution_fixture_plan,
+    build_opencode_mixed_readiness_evidence_execution_plan_from_files,
+    validate_opencode_mixed_readiness_evidence_execution_plan_file,
+)
+from visible_agent_orchestrator.worker.opencode_evidence_authorization import (
+    OpenCodeEvidenceAuthorizationRequest,
+    build_opencode_evidence_authorization_fixture_plan,
+    build_opencode_evidence_authorization_plan_from_files,
+    validate_opencode_evidence_authorization_package_file,
+    write_opencode_evidence_authorization_package,
+)
+from visible_agent_orchestrator.worker.opencode_evidence_runner import (
+    OpenCodeEvidenceRunnerExecutionRequest,
+    build_opencode_evidence_runner_fixture_plan,
+    build_opencode_evidence_runner_plan_from_package,
+    execute_opencode_evidence_runner_package,
+    validate_opencode_evidence_runner_plan_file,
+)
+from visible_agent_orchestrator.worker.opencode_worker_identity import (
+    diagnose_opencode_worker_identity_fixture,
+    diagnose_opencode_worker_identity_from_files,
+)
+from visible_agent_orchestrator.worker.opencode_visible_binding_update import (
+    OpenCodeVisibleBindingUpdateRequest,
+    build_opencode_visible_binding_update_plan,
+    validate_opencode_visible_binding_update_record,
+    write_opencode_visible_binding_update,
+)
+from visible_agent_orchestrator.worker.opencode_visible_worker_disable import (
+    OpenCodeVisibleWorkerDisableRequest,
+    build_opencode_visible_worker_disable_plan,
+    validate_opencode_visible_worker_disable_record,
+    write_opencode_visible_worker_disable,
+)
+from visible_agent_orchestrator.worker.opencode_visible_worker_enable import (
+    OpenCodeVisibleWorkerEnableRequest,
+    build_opencode_visible_worker_enable_plan,
+    validate_opencode_visible_worker_enable_record,
+    write_opencode_visible_worker_enable,
+)
+from visible_agent_orchestrator.worker.opencode_mixed_status import (
+    build_opencode_mixed_status_fixture,
+    format_opencode_mixed_status_human,
+    source_opencode_mixed_status_summary,
+)
+from visible_agent_orchestrator.worker.opencode_mixed_ready_update import (
+    OpenCodeMixedReadyUpdateRequest,
+    build_opencode_mixed_ready_update_plan,
+    validate_opencode_mixed_ready_update_record,
+    write_opencode_mixed_ready_update,
+)
+from visible_agent_orchestrator.worker.mixed_ready_update import (
+    MixedReadyUpdateRequest,
+    build_mixed_ready_update_plan,
+    validate_mixed_ready_update_record,
+    write_mixed_ready_update,
+)
+from visible_agent_orchestrator.worker.obsidian_policy import validate_obsidian_logging_request
+from visible_agent_orchestrator.worker.preflight import (
+    DryRunPreflightRequest,
+    collect_preflight_evidence_from_fixture,
+    collect_preflight_evidence_from_payload,
+)
+from visible_agent_orchestrator.worker.registration import (
+    DryRunRegistrationRequest,
+    build_dry_run_registration_plan,
+)
+from visible_agent_orchestrator.worker.registration_evidence import (
+    RegistrationEvidencePackageRequest,
+    build_registration_evidence_package,
+    build_registration_evidence_package_from_fixture,
+    validate_registration_evidence_package_file,
+)
+from visible_agent_orchestrator.worker.registered_worker import (
+    build_registered_worker_record,
+    plan_registered_claude_worker,
+    validate_registered_worker_record_file,
+    write_record_under_root,
+)
+from visible_agent_orchestrator.worker.registered_registry import (
+    build_registered_worker_authorization_update_plan,
+    build_registered_worker_register_plan,
+    registry_status,
+    validate_registered_worker_registry_file,
+    write_registered_worker_authorization_update,
+    write_registered_worker_record,
+)
+from visible_agent_orchestrator.worker.registered_status import (
+    build_registered_worker_health_snapshot,
+    build_registered_worker_status_snapshot,
+)
+
+
+INTERFACE_DOC = Path("worker-backends/worker-backend-interface.md")
+CONTRACT_SCHEMA = Path("worker-backends/worker-backend-contract.schema.json")
+LIVE_ENABLE_DEFAULT_CONFIG = Path("worker-backends/live-enable.default.disabled.json")
+BACKEND_ALIASES = {
+    "opencode_tui": "opencode-tui",
+    "opencode-tui": "opencode-tui",
+    "claude_code": "claude-code-fixture",
+    "claude-code-fixture": "claude-code-fixture",
+    "cursor_agent": "cursor-agent-fixture",
+    "cursor-agent-fixture": "cursor-agent-fixture",
+}
+PUBLIC_BACKEND_NAMES = ("opencode_tui", "claude_code", "cursor_agent")
+
+
+def repo_root(value: str) -> Path:
+    root = Path(value).resolve()
+    if not root.exists():
+        raise argparse.ArgumentTypeError(f"root does not exist: {root}")
+    source_repo_shape = (root / "README.md").exists()
+    live_runtime_shape = (root / "AGENTS.md").exists() and (root / "bin").is_dir() and (root / ".omx").is_dir()
+    installed_package_shape = (root / "bin").is_dir() and (root / "lib" / "visible_agent_orchestrator").is_dir()
+    if not source_repo_shape and not live_runtime_shape and not installed_package_shape:
+        raise argparse.ArgumentTypeError(f"root does not look like this repo: {root}")
+    return root
+
+
+def read_text(path: Path) -> str:
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+def read_json(path: Path) -> dict:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise RuntimeAdapterError(f"JSON file missing: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise RuntimeAdapterError(f"invalid JSON file: {path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeAdapterError(f"JSON file must contain an object: {path}")
+    return payload
+
+
+def source_root() -> Path:
+    return _THIS_FILE.parent.parent.resolve()
+
+
+def resolve_config_for_args(args: argparse.Namespace, backend: str):
+    config_path = getattr(args, "config", None)
+    explicit = Path(config_path).resolve() if config_path else None
+    return resolve_live_enable_config(
+        backend,
+        explicit_config=explicit,
+        root=getattr(args, "root", source_root()),
+        source_root=source_root(),
+    )
+
+
+def canonical_backend(name: str) -> str:
+    try:
+        return BACKEND_ALIASES[name]
+    except KeyError as exc:
+        raise RuntimeAdapterError(f"worker backend is not available: {name}") from exc
+
+
+def public_backend_name(name: str) -> str:
+    canonical = canonical_backend(name)
+    for public, mapped in BACKEND_ALIASES.items():
+        if public in PUBLIC_BACKEND_NAMES and mapped == canonical:
+            return public
+    return canonical
+
+
+def backend_metadata(name: str) -> dict:
+    canonical = canonical_backend(name)
+    for item in available_backends():
+        if item["name"] == canonical:
+            return item
+    raise RuntimeAdapterError(f"worker backend is not available: {name}")
+
+
+def backend_payload(args: argparse.Namespace) -> dict:
+    requested_backend = getattr(args, "backend", "")
+    backend = canonical_backend(requested_backend) if requested_backend else ""
+    fixture = getattr(args, "fixture", None)
+    metadata = next((item for item in available_backends() if item["name"] == backend), {})
+    return {
+        "backend": backend,
+        "requested_backend": requested_backend,
+        "public_backend": public_backend_name(backend) if backend else "",
+        "agent_kind": metadata.get("agent_kind", ""),
+        "default_worker_backend": "opencode-tui",
+        "live_enabled": is_backend_live_enabled(backend),
+        "fixture_mode": bool(fixture),
+        "fixture_only": bool(metadata.get("fixture_only", False)),
+        "runtime_backend": metadata.get("runtime_backend", ""),
+        "dispatch_adapter": metadata.get("dispatch_adapter", ""),
+    }
+
+
+def emit(payload: dict, *, json_output: bool) -> None:
+    if json_output:
+        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
+        return
+    if "backends" in payload:
+        for item in payload["backends"]:
+            print(f"{item['name']}: {item['status']}")
+            print(f"  agent_kind: {item['agent_kind']}")
+            print(f"  fixture_only: {str(bool(item['fixture_only'])).lower()}")
+            print(f"  live_enabled: {str(bool(item['live_enabled'])).lower()}")
+        print("default worker backend: opencode-tui")
+        return
+    for key, value in payload.items():
+        if isinstance(value, (dict, list)):
+            print(f"{key}: {json.dumps(value, sort_keys=True, ensure_ascii=False)}")
+        else:
+            print(f"{key}: {value}")
+    for warning in payload.get("warnings", []):
+        print(f"warning: {warning}")
+    for error in payload.get("errors", []):
+        print(f"error: {error}")
+
+
+def adapter_from_args(args: argparse.Namespace):
+    fixture = getattr(args, "fixture", None)
+    fixture_dir = Path(fixture).resolve() if fixture else None
+    return get_backend(canonical_backend(args.backend), fixture_dir=fixture_dir)
+
+
+def cmd_list_backends(args: argparse.Namespace) -> int:
+    payload = {"backends": available_backends(), "default_worker_backend": "opencode-tui"}
+    emit(payload, json_output=args.json)
+    return 0
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    items = []
+    for public in PUBLIC_BACKEND_NAMES:
+        metadata = backend_metadata(public)
+        items.append(
+            {
+                **metadata,
+                "backend": public,
+                "canonical_backend": metadata["name"],
+                "live_submit_requires_visible_dispatch_wrapper": metadata["name"] == "opencode-tui",
+                "direct_submit_allowed": False,
+                "live_submit_adapter_available": bool(metadata.get("live_submit_adapter_available", False)),
+                "live_submit_runtime_enabled": bool(metadata.get("live_submit_runtime_enabled", False)),
+            }
+        )
+    payload = {
+        "schema_version": 1,
+        "backends": items,
+        "default_worker_backend": "opencode_tui",
+        "notes": [
+            "This CLI is fixture-only for Claude Code and Cursor Agent.",
+            "OpenCode live submit remains delegated to omx_visible_dispatch; direct submit is not supported here.",
+        ],
+    }
+    emit(payload, json_output=args.json)
+    return 0
+
+
+def cmd_interface(args: argparse.Namespace) -> int:
+    path = args.root / INTERFACE_DOC
+    if not path.is_file():
+        raise RuntimeAdapterError(f"worker backend interface doc missing: {INTERFACE_DOC}")
+    print(read_text(path))
+    return 0
+
+
+def cmd_schema(args: argparse.Namespace) -> int:
+    path = args.root / CONTRACT_SCHEMA
+    if not path.is_file():
+        raise RuntimeAdapterError(f"worker backend contract schema missing: {CONTRACT_SCHEMA}")
+    print(read_text(path))
+    return 0
+
+
+def cmd_config_paths(args: argparse.Namespace) -> int:
+    backend = public_backend_name(canonical_backend(args.backend))
+    explicit = Path(args.config).resolve() if args.config else None
+    _, evidence = resolve_live_enable_config(
+        backend,
+        explicit_config=explicit,
+        root=args.root,
+        source_root=source_root(),
+    )
+    payload = {
+        "schema_version": 1,
+        "backend": backend,
+        "root": str(args.root),
+        "source_root": str(source_root()),
+        "candidates": [candidate.to_dict() for candidate in discover_config_paths(
+            explicit_config=explicit,
+            root=args.root,
+            source_root=source_root(),
+        )],
+        "selected": evidence.to_dict(),
+    }
+    emit(payload, json_output=args.json)
+    return 0
+
+
+def cmd_obsidian_logging_check(args: argparse.Namespace) -> int:
+    result = validate_obsidian_logging_request(
+        allow_obsidian_log=args.allow_obsidian_log,
+        target_note=args.target_note,
+        target_vault_path=args.target_vault_path,
+        purpose=args.purpose,
+        allowed_content_scope=args.allowed_content_scope,
+        append_only=args.append_only,
+        rollback_allowed=args.rollback_allowed,
+    )
+    emit({"schema_version": 1, **result.to_dict()}, json_output=args.json)
+    return 0
+
+
+def cmd_capabilities(args: argparse.Namespace) -> int:
+    metadata = backend_metadata(args.backend)
+    canonical = metadata["name"]
+    supports_live_submit = backend_supports_live_submit(public_backend_name(canonical))
+    adapter_available = backend_live_submit_adapter_available(public_backend_name(canonical))
+    payload = {
+        "schema_version": 1,
+        "backend": public_backend_name(canonical),
+        "canonical_backend": canonical,
+        "agent_kind": metadata.get("agent_kind", ""),
+        "fixture_only": bool(metadata.get("fixture_only", False)),
+        "live_enabled": bool(metadata.get("live_enabled", False)),
+        "supports_live_submit": supports_live_submit,
+        "supports_live_submit_capability": supports_live_submit,
+        "live_submit_adapter_available": adapter_available,
+        "live_submit_runtime_enabled": bool(metadata.get("live_submit_runtime_enabled", False)),
+        "direct_submit_allowed": False,
+        "live_submit_requires_visible_dispatch_wrapper": canonical == "opencode-tui",
+        "dispatch_adapter": metadata.get("dispatch_adapter", ""),
+        "runtime_backend": metadata.get("runtime_backend", ""),
+        "capabilities": [
+            {
+                "name": "fixture_plan",
+                "supported": canonical != "opencode-tui",
+                "detail": "fixture-only contract planning for candidate Claude/Cursor worker backends",
+            },
+            {
+                "name": "validate_result",
+                "supported": canonical != "opencode-tui",
+                "detail": "validates fixture report marker and write-scope evidence without live process contact",
+            },
+            {
+                "name": "live_submit",
+                "supported": supports_live_submit,
+                "detail": (
+                    "OpenCode live submit requires omx_visible_dispatch wrapper"
+                    if canonical == "opencode-tui"
+                    else "live submit disabled for fixture-only backend"
+                ),
+            },
+            {
+                "name": "claude_visible_pane_live_plan",
+                "supported": canonical == "claude-code-fixture" and adapter_available,
+                "detail": (
+                    "source-only Claude visible-pane live submit planning surface; disabled until separate live enable"
+                    if canonical == "claude-code-fixture"
+                    else "not a Claude Code backend"
+                ),
+            },
+        ],
+        "warnings": (
+            []
+            if canonical == "opencode-tui"
+            else [
+                f"{public_backend_name(canonical)} live_enabled=false",
+                "technical adapter availability is not live enable" if adapter_available else "live adapter unavailable",
+            ]
+        ),
+    }
+    emit(payload, json_output=args.json)
+    return 0
+
+
+def cmd_check_live_eligibility(args: argparse.Namespace) -> int:
+    metadata = backend_metadata(args.backend)
+    canonical = metadata["name"]
+    config, config_evidence = resolve_config_for_args(args, public_backend_name(canonical))
+    config_source = config_evidence.config_path or config_evidence.config_source
+    decision = evaluate_live_enable(
+        backend_kind=public_backend_name(canonical),
+        config=config,
+        config_source=config_source,
+    )
+    eligible = decision.eligible
+    payload = {
+        "schema_version": 1,
+        "backend": public_backend_name(canonical),
+        "canonical_backend": canonical,
+        "eligible": eligible,
+        "live_enabled": decision.live_enabled,
+        "fixture_only": bool(metadata.get("fixture_only", False)),
+        "supports_live_submit": decision.capability_supports_live_submit,
+        "supports_live_submit_capability": decision.capability_supports_live_submit,
+        "live_submit_adapter_available": decision.live_submit_adapter_available,
+        "live_submit_runtime_enabled": False,
+        "direct_submit_allowed": False,
+        "live_submit_requires_visible_dispatch_wrapper": canonical == "opencode-tui",
+        "config_source": config_source,
+        "config_path": config_source,
+        "config_found": config_evidence.config_found,
+        "config_missing": config_evidence.config_missing,
+        "fallback_used": config_evidence.fallback_used,
+        "fail_closed_due_to_missing_config": config_evidence.fail_closed_due_to_missing_config,
+        "config_path_evidence": config_evidence.to_dict(),
+        "blocked_reasons": decision.blocked_reasons,
+        "warnings": decision.warnings + config_evidence.warnings,
+        "reason": (
+            "OpenCode is live-capable only through omx_visible_dispatch wrapper; this CLI does not direct submit"
+            if canonical == "opencode-tui" and eligible
+            else (
+                "technical adapter exists, but disabled by live-enable config and authorization/preflight gates"
+                if public_backend_name(canonical) == "claude_code" and decision.live_submit_adapter_available
+                else f"{public_backend_name(canonical)} is fixture-only and live submit is disabled"
+            )
+        ),
+        "forbidden_actions": [
+            "direct adapter submit",
+            "direct /tui/*",
+            "tmux send-keys",
+            "live claude-code/cursor-agent command invocation",
+        ],
+    }
+    emit(payload, json_output=args.json)
+    return 0
+
+
+def cmd_live_enable_status(args: argparse.Namespace) -> int:
+    metadata = backend_metadata(args.backend)
+    canonical = metadata["name"]
+    config, config_evidence = resolve_config_for_args(args, public_backend_name(canonical))
+    config_source = config_evidence.config_path or config_evidence.config_source
+    decision = evaluate_live_enable(
+        backend_kind=public_backend_name(canonical),
+        config=config,
+        config_source=config_source,
+    )
+    payload = {
+        "schema_version": 1,
+        "backend": public_backend_name(canonical),
+        "canonical_backend": canonical,
+        "config_path": config_source,
+        "config_source": config_source,
+        "config_found": config_evidence.config_found,
+        "config_missing": config_evidence.config_missing,
+        "fallback_used": config_evidence.fallback_used,
+        "fail_closed_due_to_missing_config": config_evidence.fail_closed_due_to_missing_config,
+        "config_path_evidence": config_evidence.to_dict(),
+        "live_enabled": decision.live_enabled,
+        "supports_live_submit": decision.capability_supports_live_submit,
+        "supports_live_submit_capability": decision.capability_supports_live_submit,
+        "live_submit_adapter_available": decision.live_submit_adapter_available,
+        "live_submit_runtime_enabled": False,
+        "eligible": decision.eligible,
+        "direct_submit_allowed": False,
+        "live_submit_requires_visible_dispatch_wrapper": canonical == "opencode-tui",
+        "blocked_reasons": decision.blocked_reasons,
+        "warnings": decision.warnings + config_evidence.warnings,
+        "decision": decision.to_dict(),
+    }
+    emit(payload, json_output=args.json)
+    return 0
+
+
+def cmd_live_enable_check(args: argparse.Namespace) -> int:
+    metadata = backend_metadata(args.backend)
+    canonical = metadata["name"]
+    config, config_evidence = resolve_config_for_args(args, public_backend_name(canonical))
+    config_source = config_evidence.config_path or config_evidence.config_source
+    decision = evaluate_live_enable(
+        backend_kind=public_backend_name(canonical),
+        config=config,
+        workspace_root=args.workspace_root,
+        worker_id=args.worker_id,
+        runtime_backend=args.runtime_backend,
+        user_owned_pane=args.user_owned_pane,
+        config_source=config_source,
+    )
+    payload = {
+        "schema_version": 1,
+        "backend": public_backend_name(canonical),
+        "canonical_backend": canonical,
+        "config_path": config_source,
+        "config_source": config_source,
+        "config_found": config_evidence.config_found,
+        "config_missing": config_evidence.config_missing,
+        "fallback_used": config_evidence.fallback_used,
+        "fail_closed_due_to_missing_config": config_evidence.fail_closed_due_to_missing_config,
+        "config_path_evidence": config_evidence.to_dict(),
+        "eligible": decision.eligible,
+        "live_enabled": decision.live_enabled,
+        "supports_live_submit": decision.capability_supports_live_submit,
+        "supports_live_submit_capability": decision.capability_supports_live_submit,
+        "live_submit_adapter_available": decision.live_submit_adapter_available,
+        "live_submit_runtime_enabled": False,
+        "direct_submit_allowed": False,
+        "live_submit_requires_visible_dispatch_wrapper": canonical == "opencode-tui",
+        "blocked_reasons": decision.blocked_reasons,
+        "warnings": decision.warnings + config_evidence.warnings,
+        "decision": decision.to_dict(),
+    }
+    emit(payload, json_output=args.json)
+    return 0
+
+
+def _claude_live_request_from_args(args: argparse.Namespace) -> ClaudeLiveSubmitRequest:
+    active_lock_count, active_lock_evidence_source = _active_owner_lock_count(args.root)
+    return ClaudeLiveSubmitRequest(
+        backend_kind="claude_code",
+        worker_id=args.worker_id,
+        workspace_root=args.workspace_root,
+        runtime_backend=args.runtime_backend,
+        runtime_binding_kind=args.runtime_binding_kind,
+        pane_id=args.pane_id,
+        pane_pid=args.pane_pid,
+        process_id=args.process_id,
+        command=args.command,
+        user_owned_pane=args.user_owned_pane,
+        task_dir=args.task_dir,
+        task_id=args.task_id,
+        prompt_text=args.prompt_text,
+        prompt_file=args.prompt_file,
+        authorization_record_path=args.authorization_record,
+        live_enable_config_path=args.config,
+        allowed_write_roots=list(args.allowed_write_root or []),
+        forbidden_paths=list(args.forbidden_path or []),
+        expected_outputs=list(args.expected_output or []),
+        report_path=args.report_path,
+        terminal_markers=list(args.terminal_marker or []),
+        allow_real=args.allow_real,
+        allow_tmux_input=args.allow_tmux_input,
+        allow_user_owned_pane=args.allow_user_owned_pane,
+        require_report_marker_protocol=not args.no_report_marker_protocol,
+        active_lock_count=active_lock_count,
+        active_lock_evidence_source=active_lock_evidence_source,
+        dry_run=args.dry_run,
+        notes=list(args.note or []),
+    )
+
+
+def _active_owner_lock_count(root: Path) -> tuple[int, str]:
+    lock_dir = root / ".omx" / "framework" / "team" / "visible-runs" / "_locks"
+    if not lock_dir.exists():
+        return 0, str(lock_dir)
+    count = 0
+    for path in lock_dir.glob("*.lock.json"):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            count += 1
+            continue
+        if not (payload.get("released_at") or payload.get("released")):
+            count += 1
+    return count, str(lock_dir)
+
+
+def cmd_claude_live_plan(args: argparse.Namespace) -> int:
+    plan = build_claude_live_submit_plan(_claude_live_request_from_args(args))
+    emit({"schema_version": 1, **plan.to_dict()}, json_output=args.json)
+    return 0
+
+
+def cmd_claude_live_submit(args: argparse.Namespace) -> int:
+    result = build_claude_live_submit_result(_claude_live_request_from_args(args))
+    emit({"schema_version": 1, **result.to_dict()}, json_output=args.json)
+    return 0
+
+
+def cmd_dry_run_register(args: argparse.Namespace) -> int:
+    metadata = backend_metadata(args.backend)
+    canonical = metadata["name"]
+    config, config_evidence = resolve_config_for_args(args, public_backend_name(canonical))
+    config_source = config_evidence.config_path or config_evidence.config_source
+    request = DryRunRegistrationRequest(
+        backend_kind=public_backend_name(canonical),
+        worker_id=args.worker_id,
+        workspace_root=args.workspace_root,
+        runtime_backend=args.runtime_backend,
+        runtime_binding_kind=args.runtime_binding_kind,
+        pane_id=args.pane_id,
+        process_id=args.process_id,
+        port=args.port,
+        user_owned_pane=args.user_owned_pane,
+        user_authorization_record=args.user_authorization_record,
+        allowed_write_roots=list(args.allowed_write_root or []),
+        allowed_read_roots=list(args.allowed_read_root or []),
+        task_profile=args.task_profile,
+        notes=list(args.note or []),
+    )
+    plan = build_dry_run_registration_plan(request, config=config, config_source=config_source)
+    payload = {
+        "schema_version": 1,
+        "backend": public_backend_name(canonical),
+        "canonical_backend": canonical,
+        "config_path": config_source,
+        "config_source": config_source,
+        "config_found": config_evidence.config_found,
+        "config_missing": config_evidence.config_missing,
+        "fallback_used": config_evidence.fallback_used,
+        "fail_closed_due_to_missing_config": config_evidence.fail_closed_due_to_missing_config,
+        "config_path_evidence": config_evidence.to_dict(),
+        **plan.to_dict(),
+    }
+    emit(payload, json_output=args.json)
+    return 0
+
+
+def cmd_preflight_evidence(args: argparse.Namespace) -> int:
+    requested = public_backend_name(canonical_backend(args.backend))
+    authorization_record_path = Path(args.authorization_record).resolve() if args.authorization_record else None
+    if args.request:
+        evidence = collect_preflight_evidence_from_fixture(
+            Path(args.request).resolve(),
+            authorization_record_path=authorization_record_path,
+        )
+        if evidence.backend_kind != requested:
+            raise RuntimeAdapterError(f"request backend mismatch: {evidence.backend_kind} != {requested}")
+        emit({"schema_version": 1, **evidence.to_dict()}, json_output=args.json)
+        return 0
+    if not args.allow_read_live:
+        raise RuntimeAdapterError("preflight-evidence without --request requires explicit --allow-read-live")
+
+    config_payload = {}
+    if args.config:
+        config_payload = read_json(Path(args.config).resolve())
+    payload = {
+        "backend_kind": requested,
+        "worker_id": args.worker_id,
+        "workspace_root": args.workspace_root,
+        "runtime_backend": args.runtime_backend,
+        "runtime_binding_kind": args.runtime_binding_kind,
+        "pane_id": args.pane_id,
+        "process_id": args.process_id,
+        "port": args.port,
+        "user_owned_pane": args.user_owned_pane,
+        "user_authorization_record": args.user_authorization_record,
+        "authorization_record_path": str(authorization_record_path) if authorization_record_path else "",
+        "expected_business_index_files": list(args.expected_business_index or []),
+        "allowed_workspace_roots": list(args.allowed_workspace_root or []),
+        "allowed_read_roots": list(args.allowed_read_root or []),
+        "allowed_write_roots": list(args.allowed_write_root or []),
+        "notes": list(args.note or []),
+        "runtime_health_evidence": {
+            "health_ok": False,
+            "policy_ok": False,
+            "doctor_ok": False,
+            "reason": "live-readonly command collection is intentionally conservative; no live command was called",
+        },
+    }
+    if config_payload:
+        payload["live_enable_config"] = config_payload
+    request = DryRunPreflightRequest.from_dict(payload)
+    evidence = collect_preflight_evidence_from_payload(request.to_dict() | payload, evidence_source="live-readonly")
+    emit({"schema_version": 1, **evidence.to_dict()}, json_output=args.json)
+    return 0
+
+
+def cmd_validate_authorization_record(args: argparse.Namespace) -> int:
+    result = validate_authorization_record_file(Path(args.record).resolve())
+    emit({"schema_version": 1, **result.to_dict()}, json_output=args.json)
+    return 0
+
+
+def cmd_build_registration_evidence_package(args: argparse.Namespace) -> int:
+    requested = public_backend_name(canonical_backend(args.backend))
+    if args.request:
+        package = build_registration_evidence_package_from_fixture(Path(args.request).resolve())
+    else:
+        payload = _registration_evidence_request_payload_from_args(args, requested)
+        package = build_registration_evidence_package(
+            RegistrationEvidencePackageRequest.from_dict(payload),
+            payload=payload,
+            config_base=args.root,
+        )
+    if package.backend_kind != requested:
+        raise RuntimeAdapterError(f"request backend mismatch: {package.backend_kind} != {requested}")
+    payload = package.to_dict()
+    if args.output:
+        _write_json_under_root(args.root, Path(args.output), payload)
+    emit(payload, json_output=args.json)
+    return 0
+
+
+def cmd_validate_registration_evidence_package(args: argparse.Namespace) -> int:
+    result = validate_registration_evidence_package_file(Path(args.package).resolve())
+    payload = result.to_dict()
+    emit(payload, json_output=args.json)
+    return 0 if result.ok else 1
+
+
+def cmd_build_registered_worker_record(args: argparse.Namespace) -> int:
+    record = build_registered_worker_record(
+        backend_kind=public_backend_name(canonical_backend(args.backend)),
+        worker_id=args.worker_id,
+        workspace_root=args.workspace_root,
+        runtime_backend=args.runtime_backend,
+        runtime_binding_kind=args.runtime_binding_kind,
+        pane_id=args.pane_id,
+        pane_pid=args.pane_pid,
+        process_id=args.process_id,
+        command=args.command,
+        port=args.port,
+        user_owned_pane=args.user_owned_pane,
+        registration_status=args.registration_status,
+        live_enabled=args.live_enabled,
+        allow_business_repo_writes=args.allow_business_repo_writes,
+        allow_mixed_worker=args.allow_mixed_worker,
+        authorization_record=args.authorization_record,
+        live_enable_config=args.config or args.live_enable_config,
+        smoke_evidence_path=args.last_smoke_artifact or args.smoke_evidence_path,
+        notes=list(args.note or []),
+    )
+    validation = plan_registered_claude_worker(
+        record,
+        registry_path=args.registry_path,
+        base_path=args.root,
+        allow_register=args.allow_register,
+    ).validation_result
+    if args.output:
+        if not args.allow_build_record_output:
+            raise RuntimeAdapterError("--output requires --allow-build-record-output")
+        write_record_under_root(args.root, Path(args.output), record)
+    payload = {
+        "schema_version": 1,
+        "would_register": bool(args.allow_build_record_output),
+        "would_write_registry": False,
+        "would_write_state": False,
+        "registry_record": record.to_dict(),
+        "validation_result": validation,
+        "warnings": [
+            "build-registered-worker-record is dry-run/source-output only",
+            "it does not write live registry or runtime state",
+        ],
+        "forbidden_next_actions": [
+            "write live registry",
+            "write runtime state",
+            "touch Claude Code pane",
+            "invoke claude or claude-code",
+            "submit OpenCode live",
+            "business repo writes",
+            "mixed OpenCode plus Claude execution",
+        ],
+    }
+    emit(payload, json_output=args.json)
+    return 0
+
+
+def cmd_validate_registered_worker_record(args: argparse.Namespace) -> int:
+    result = validate_registered_worker_record_file(Path(args.record).resolve())
+    emit({"schema_version": 1, **result.to_dict()}, json_output=args.json)
+    return 0 if result.ok else 1
+
+
+def cmd_registered_worker_plan(args: argparse.Namespace) -> int:
+    if args.record:
+        payload = read_json(Path(args.record).resolve())
+        base_path = Path(args.record).resolve().parent
+    else:
+        payload = build_registered_worker_record(
+            backend_kind=public_backend_name(canonical_backend(args.backend)),
+            worker_id=args.worker_id,
+            workspace_root=args.workspace_root,
+            runtime_backend=args.runtime_backend,
+            runtime_binding_kind=args.runtime_binding_kind,
+            pane_id=args.pane_id,
+            pane_pid=args.pane_pid,
+            process_id=args.process_id,
+            command=args.command,
+            user_owned_pane=args.user_owned_pane,
+            authorization_record=args.authorization_record,
+            live_enable_config=args.config or args.live_enable_config,
+            smoke_evidence_path=args.last_smoke_artifact or args.smoke_evidence_path,
+        ).to_dict()
+        base_path = args.root
+    plan = plan_registered_claude_worker(
+        payload,
+        registry_path=args.registry_path,
+        base_path=base_path,
+        allow_register=args.allow_register,
+    )
+    emit({"schema_version": 1, **plan.to_dict()}, json_output=args.json)
+    return 0
+
+
+def _registered_registry_allowed_roots(args: argparse.Namespace) -> list[Path]:
+    root = getattr(args, "root", source_root())
+    roots = [
+        Path(root).resolve() / "tests",
+        Path(tempfile.gettempdir()).resolve(),
+    ]
+    if getattr(args, "allow_framework_registry", False):
+        roots.append(Path(root).resolve() / ".omx" / "framework" / "team" / "registered-workers")
+    return roots
+
+
+def cmd_registered_worker_register_plan(args: argparse.Namespace) -> int:
+    plan = build_registered_worker_register_plan(
+        record_path=Path(args.record).resolve(),
+        registry_path=Path(args.registry).resolve(),
+        allow_register=False,
+        replace_existing=args.replace_existing,
+        allowed_registry_roots=_registered_registry_allowed_roots(args),
+    )
+    emit({"schema_version": 1, **plan.to_dict()}, json_output=args.json)
+    return 0
+
+
+def cmd_registered_worker_register(args: argparse.Namespace) -> int:
+    result = write_registered_worker_record(
+        record_path=Path(args.record).resolve(),
+        registry_path=Path(args.registry).resolve(),
+        allow_register=args.allow_register,
+        replace_existing=args.replace_existing,
+        allowed_registry_roots=_registered_registry_allowed_roots(args),
+    )
+    emit({"schema_version": 1, **result.to_dict()}, json_output=args.json)
+    return 0 if result.wrote_registry else 1
+
+
+def cmd_registered_worker_authorization_update_plan(args: argparse.Namespace) -> int:
+    plan = build_registered_worker_authorization_update_plan(
+        root=args.root,
+        registry_path=Path(args.registered_worker_registry).resolve(),
+        worker_id=args.worker_id,
+        authorization_record_path=Path(args.authorization_record).resolve(),
+    )
+    emit({"schema_version": 1, **plan.to_dict()}, json_output=args.json)
+    return 0 if plan.ok else 1
+
+
+def cmd_registered_worker_authorization_update(args: argparse.Namespace) -> int:
+    result = write_registered_worker_authorization_update(
+        root=args.root,
+        registry_path=Path(args.registered_worker_registry).resolve(),
+        worker_id=args.worker_id,
+        authorization_record_path=Path(args.authorization_record).resolve(),
+        allow_framework_registry=args.allow_framework_registry,
+        allow_authorization_update=args.allow_authorization_update,
+    )
+    emit({"schema_version": 1, **result.to_dict()}, json_output=args.json)
+    return 0 if result.wrote_registry else 1
+
+
+def cmd_validate_registered_worker_registry(args: argparse.Namespace) -> int:
+    result = validate_registered_worker_registry_file(Path(args.registry).resolve())
+    emit({"schema_version": 1, **result.to_dict()}, json_output=args.json)
+    return 0 if result.ok else 1
+
+
+def cmd_registered_worker_registry_status(args: argparse.Namespace) -> int:
+    payload = registry_status(Path(args.registry).resolve())
+    emit({"schema_version": 1, **payload}, json_output=args.json)
+    return 0 if payload.get("ok") else 1
+
+
+def cmd_registered_worker_status(args: argparse.Namespace) -> int:
+    snapshot = build_registered_worker_status_snapshot(
+        Path(args.registry).resolve(),
+        allow_read_live=args.allow_read_live,
+    )
+    emit({"schema_version": 1, **snapshot.to_dict()}, json_output=args.json)
+    return 0 if snapshot.ok else 1
+
+
+def cmd_registered_worker_health(args: argparse.Namespace) -> int:
+    payload = build_registered_worker_health_snapshot(
+        Path(args.registry).resolve(),
+        allow_read_live=args.allow_read_live,
+    )
+    emit(payload, json_output=args.json)
+    return 0 if payload.get("ok") else 1
+
+
+def cmd_mixed_worker_plan(args: argparse.Namespace) -> int:
+    runtime_telemetry = read_json(Path(args.runtime_telemetry).resolve()) if args.runtime_telemetry else None
+    plan = build_mixed_worker_plan_from_files(
+        root=args.root,
+        registered_worker_registry_path=args.registered_worker_registry,
+        opencode_visible_registry_path=args.opencode_visible_registry,
+        include_backends=[normalize_backend_name(item) for item in (args.include_backend or ["opencode_tui", "claude_code"])],
+        execution_mode=args.execution_mode,
+        business_repo_writes_requested=args.business_repo_writes_requested,
+        runtime_telemetry=runtime_telemetry,
+    )
+    emit({"schema_version": 1, **plan.to_dict()}, json_output=args.json)
+    return 0
+
+
+def cmd_mixed_worker_fixture_plan(args: argparse.Namespace) -> int:
+    plan = build_mixed_worker_fixture_plan(Path(args.fixture).resolve())
+    emit({"schema_version": 1, **plan.to_dict()}, json_output=args.json)
+    return 0
+
+
+def cmd_mixed_noop_contract_plan(args: argparse.Namespace) -> int:
+    runtime_telemetry = read_json(Path(args.runtime_telemetry).resolve()) if args.runtime_telemetry else None
+    plan = build_mixed_noop_contract_plan_from_files(
+        root=args.root,
+        registered_worker_registry_path=args.registered_worker_registry,
+        opencode_visible_registry_path=args.opencode_visible_registry,
+        include_workers=list(args.include_worker or []),
+        execution_mode=args.execution_mode,
+        runtime_telemetry=runtime_telemetry,
+        business_repo_writes_requested=args.business_repo_writes_requested,
+    )
+    emit(plan.to_dict(), json_output=args.json)
+    return 0
+
+
+def cmd_mixed_noop_fixture_plan(args: argparse.Namespace) -> int:
+    plan = build_mixed_noop_fixture_plan(Path(args.fixture).resolve())
+    emit(plan.to_dict(), json_output=args.json)
+    return 0
+
+
+def cmd_validate_mixed_noop_contract(args: argparse.Namespace) -> int:
+    result = validate_mixed_noop_contract_file(Path(args.contract).resolve())
+    emit({"schema_version": 1, **result.to_dict()}, json_output=args.json)
+    return 0 if result.ok else 1
+
+
+def cmd_validate_mixed_noop_result(args: argparse.Namespace) -> int:
+    result = validate_mixed_noop_result_files(Path(args.contract).resolve(), Path(args.result).resolve())
+    emit({"schema_version": 1, **result.to_dict()}, json_output=args.json)
+    return 0 if result.ok else 1
+
+
+def _mixed_noop_live_request_from_args(args: argparse.Namespace) -> MixedNoopLiveRequest:
+    return MixedNoopLiveRequest(
+        root=str(Path(args.root).resolve()),
+        registered_worker_registry_path=str(Path(args.registered_worker_registry).resolve()),
+        opencode_visible_registry_path=str(Path(args.opencode_visible_registry).resolve()),
+        include_workers=list(args.include_worker or []),
+        execution_mode=args.execution_mode,
+        allow_mixed_noop_live=getattr(args, "allow_mixed_noop_live", False),
+        timeout_seconds=int(getattr(args, "timeout", 240)),
+        run_id=str(getattr(args, "run_id", "") or ""),
+        dispatch_bin=str(getattr(args, "dispatch_bin", "") or ""),
+        worker_backend_bin=str(getattr(args, "worker_backend_bin", "") or ""),
+        watcher_bin=str(getattr(args, "watcher_bin", "") or ""),
+        live_enable_config_path=str(getattr(args, "live_enable_config", "") or ""),
+    )
+
+
+def cmd_mixed_noop_live_plan(args: argparse.Namespace) -> int:
+    plan = build_mixed_noop_live_plan(_mixed_noop_live_request_from_args(args))
+    emit(plan, json_output=args.json)
+    return 0 if plan.get("ok") else 1
+
+
+def cmd_execute_mixed_noop_live(args: argparse.Namespace) -> int:
+    result = execute_mixed_noop_live(_mixed_noop_live_request_from_args(args))
+    emit(result, json_output=args.json)
+    return 0 if result.get("ok") else 1
+
+
+def cmd_validate_mixed_noop_live_result(args: argparse.Namespace) -> int:
+    result = validate_mixed_noop_live_result_file(Path(args.result).resolve())
+    emit(result, json_output=args.json)
+    return 0 if result.get("ok") else 1
+
+
+def _authorization_profile_request_from_args(args: argparse.Namespace) -> AuthorizationProfileRequest:
+    return AuthorizationProfileRequest(
+        root=str(Path(args.root).resolve()),
+        profile_path=str(Path(args.profile).resolve()),
+        registered_worker_registry_path=str(Path(args.registered_worker_registry).resolve()),
+        opencode_visible_registry_path=str(Path(args.opencode_visible_registry).resolve()),
+        execution_mode=str(getattr(args, "execution_mode", "no-live") or "no-live"),
+        allow_profile_live=bool(getattr(args, "allow_profile_live", False)),
+        timeout_seconds=int(getattr(args, "timeout", 240)),
+        run_id=str(getattr(args, "run_id", "") or ""),
+        dispatch_bin=str(getattr(args, "dispatch_bin", "") or ""),
+        worker_backend_bin=str(getattr(args, "worker_backend_bin", "") or ""),
+        watcher_bin=str(getattr(args, "watcher_bin", "") or ""),
+        live_enable_config_path=str(getattr(args, "live_enable_config", "") or ""),
+        worker_id=str(getattr(args, "worker_id", "") or ""),
+        business_repo_path=str(getattr(args, "business_repo", "") or ""),
+    )
+
+
+def cmd_list_authorization_profiles(args: argparse.Namespace) -> int:
+    payload = list_authorization_profiles(args.root)
+    emit(payload, json_output=args.json)
+    return 0 if payload.get("ok") else 1
+
+
+def cmd_validate_authorization_profile(args: argparse.Namespace) -> int:
+    result = validate_authorization_profile_file(Path(args.profile).resolve())
+    emit(result, json_output=args.json)
+    return 0 if result.get("ok") else 1
+
+
+def cmd_default_authorization_profile(args: argparse.Namespace) -> int:
+    result = default_authorization_profile(args.root, kind=args.kind)
+    emit(result, json_output=args.json)
+    return 0 if result.get("ok") else 1
+
+
+def cmd_profile_summary(args: argparse.Namespace) -> int:
+    result = profile_summary(Path(args.profile).resolve())
+    emit(result, json_output=args.json)
+    return 0 if result.get("ok") else 1
+
+
+def cmd_plan_default_profile(args: argparse.Namespace) -> int:
+    request = AuthorizationProfileRequest(
+        root=str(Path(args.root).resolve()),
+        profile_path="",
+        registered_worker_registry_path=str(Path(args.registered_worker_registry).resolve()),
+        opencode_visible_registry_path=str(Path(args.opencode_visible_registry).resolve()),
+        execution_mode=str(getattr(args, "execution_mode", "no-live") or "no-live"),
+        allow_profile_live=False,
+        timeout_seconds=int(getattr(args, "timeout", 240)),
+        run_id=str(getattr(args, "run_id", "") or ""),
+        dispatch_bin=str(getattr(args, "dispatch_bin", "") or ""),
+        worker_backend_bin=str(getattr(args, "worker_backend_bin", "") or ""),
+        watcher_bin=str(getattr(args, "watcher_bin", "") or ""),
+        live_enable_config_path=str(getattr(args, "live_enable_config", "") or ""),
+    )
+    result = plan_default_authorization_profile(request, kind=args.kind)
+    emit(result, json_output=args.json)
+    return 0 if result.get("ok") else 1
+
+
+def cmd_short_prompt_template(args: argparse.Namespace) -> int:
+    result = short_prompt_template(args.root, profile_kind=args.profile_kind)
+    emit(result, json_output=args.json)
+    return 0 if result.get("ok") else 1
+
+
+def cmd_validate_business_write_scope(args: argparse.Namespace) -> int:
+    result = validate_business_write_scope_file(
+        Path(args.profile).resolve(),
+        Path(args.contract).resolve(),
+        changed_files=[str(item) for item in getattr(args, "changed_file", [])],
+    )
+    emit(result, json_output=args.json)
+    return 0 if result.get("ok") else 1
+
+
+def cmd_prepare_business_scoped_write_smoke(args: argparse.Namespace) -> int:
+    result = prepare_business_scoped_write_smoke(
+        Path(args.profile).resolve(),
+        Path(args.contract).resolve(),
+        writer=str(args.writer),
+        reviewer=str(args.reviewer),
+        output_dir=str(getattr(args, "output_dir", "") or ""),
+    )
+    emit(result, json_output=args.json)
+    return 0 if result.get("ok") else 1
+
+
+def cmd_validate_business_scoped_write_smoke_prep(args: argparse.Namespace) -> int:
+    result = validate_business_scoped_write_smoke_prep_file(Path(args.package).resolve())
+    emit(result, json_output=args.json)
+    return 0 if result.get("ok") else 1
+
+
+def cmd_prepare_business_scoped_rollback_smoke(args: argparse.Namespace) -> int:
+    result = prepare_business_scoped_rollback_smoke(
+        Path(args.profile).resolve(),
+        target_file=str(args.target_file),
+        expected_status=str(args.expected_status),
+        expected_sha256=str(args.expected_sha256),
+        rollback_worker=str(args.rollback_worker),
+        reviewer=str(args.reviewer),
+        output_dir=str(getattr(args, "output_dir", "") or ""),
+    )
+    emit(result, json_output=args.json)
+    return 0 if result.get("ok") else 1
+
+
+def cmd_validate_business_scoped_rollback_prep(args: argparse.Namespace) -> int:
+    result = validate_business_scoped_rollback_prep_file(Path(args.package).resolve())
+    emit(result, json_output=args.json)
+    return 0 if result.get("ok") else 1
+
+
+def cmd_validate_business_scoped_rollback_approval(args: argparse.Namespace) -> int:
+    result = validate_business_scoped_rollback_approval_file(
+        Path(args.approval).resolve(),
+        Path(args.prep_package).resolve(),
+    )
+    emit(result, json_output=args.json)
+    return 0 if result.get("ok") else 1
+
+
+def cmd_validate_business_scoped_write_approval(args: argparse.Namespace) -> int:
+    result = validate_business_scoped_write_approval_file(
+        Path(args.approval).resolve(),
+        Path(args.prep_package).resolve(),
+    )
+    emit(result, json_output=args.json)
+    return 0 if result.get("ok") else 1
+
+
+def cmd_rehearse_business_scoped_write(args: argparse.Namespace) -> int:
+    result = rehearse_business_scoped_write(
+        Path(args.profile).resolve(),
+        Path(args.contract).resolve(),
+        Path(args.prep_package).resolve(),
+        Path(args.approval).resolve(),
+        changed_files=[str(item) for item in getattr(args, "changed_file", [])],
+        output_path=str(getattr(args, "output", "") or ""),
+    )
+    emit(result, json_output=args.json)
+    return 0 if result.get("ok") else 1
+
+
+def cmd_validate_business_baseline_delta(args: argparse.Namespace) -> int:
+    result = validate_business_baseline_delta_file(
+        Path(args.baseline_status).resolve(),
+        Path(args.current_status).resolve(),
+        expected_added_files=[str(item) for item in getattr(args, "expected_added_file", [])],
+        expected_baseline_sha256=str(getattr(args, "expected_baseline_sha256", "") or ""),
+    )
+    emit(result, json_output=args.json)
+    return 0 if result.get("ok") else 1
+
+
+def cmd_validate_business_readonly_review_result(args: argparse.Namespace) -> int:
+    result = validate_business_readonly_review_result_file(Path(args.result).resolve())
+    emit(result, json_output=args.json)
+    return 0 if result.get("ok") else 1
+
+
+def cmd_plan_role_task_package(args: argparse.Namespace) -> int:
+    result = plan_role_task_package(
+        RoleTaskPackageRequest(
+            profile_path=str(Path(args.profile).resolve()),
+            contract_path=str(Path(args.contract).resolve()),
+            coder_worker_id=str(args.coder),
+            reviewer_worker_id=str(args.reviewer),
+            output_dir=str(getattr(args, "output_dir", "") or ""),
+        )
+    )
+    emit(result, json_output=args.json)
+    return 0 if result.get("ok") else 1
+
+
+def cmd_validate_role_task_package(args: argparse.Namespace) -> int:
+    result = validate_role_task_package(Path(args.package_dir).resolve())
+    emit(result, json_output=args.json)
+    return 0 if result.get("ok") else 1
+
+
+def cmd_validate_role_task_cycle_ready(args: argparse.Namespace) -> int:
+    result = validate_role_task_cycle_ready(Path(args.package_dir).resolve())
+    emit(result, json_output=args.json)
+    return 0 if result.get("ok") else 1
+
+
+def cmd_evaluate_sandbox_role_harness(args: argparse.Namespace) -> int:
+    result = evaluate_sandbox_role_harness(read_json(Path(args.evidence).resolve()))
+    emit(result, json_output=args.json)
+    return 0 if result.get("ok") else 1
+
+
+def cmd_evaluate_sandbox_role_run(args: argparse.Namespace) -> int:
+    result = evaluate_sandbox_role_run(read_json(Path(args.spec).resolve()))
+    emit(result, json_output=args.json)
+    return 0 if result.get("ok") else 1
+
+
+def cmd_build_sandbox_role_run_spec(args: argparse.Namespace) -> int:
+    result = build_sandbox_role_run_spec_from_dispatch_metadata(read_json(Path(args.metadata).resolve()))
+    emit(result, json_output=args.json)
+    return 0 if result.get("ok") else 1
+
+
+def cmd_closeout_sandbox_role_run(args: argparse.Namespace) -> int:
+    result = closeout_sandbox_role_run_from_dispatch_metadata(read_json(Path(args.metadata).resolve()))
+    emit(result, json_output=args.json)
+    return 0 if result.get("ok") else 1
+
+
+def cmd_closeout_sandbox_role_run_artifact(args: argparse.Namespace) -> int:
+    result = closeout_sandbox_role_run_from_run_artifact(read_json(Path(args.artifact).resolve()))
+    emit(result, json_output=args.json)
+    return 0 if result.get("ok") else 1
+
+
+def cmd_build_sandbox_role_live_smoke_package(args: argparse.Namespace) -> int:
+    request = read_json(Path(args.request).resolve())
+    if args.output_dir:
+        request["output_dir"] = str(Path(args.output_dir).resolve())
+    result = build_sandbox_role_live_smoke_package(request)
+    emit(result, json_output=args.json)
+    return 0 if result.get("ok") else 1
+
+
+def cmd_run_sandbox_role_live_smoke_package(args: argparse.Namespace) -> int:
+    result = execute_sandbox_role_live_smoke_runner(
+        {
+            "package_dir": str(Path(args.package_dir).resolve()),
+            "output_dir": str(Path(args.output_dir).resolve()) if args.output_dir else "",
+            "allow_real": bool(args.allow_real),
+            "timeout_seconds": int(getattr(args, "timeout", 240)),
+            "dispatch_bin": str(Path(args.dispatch_bin).resolve()) if getattr(args, "dispatch_bin", "") else "",
+        }
+    )
+    if getattr(args, "result_output", ""):
+        result_output = Path(args.result_output).resolve()
+        result["result_output_path"] = str(result_output)
+        result_output.parent.mkdir(parents=True, exist_ok=True)
+        result_output.write_text(
+            json.dumps(result, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+    emit(result, json_output=args.json)
+    return 0 if result.get("ok") else 1
+
+
+def cmd_plan_with_profile(args: argparse.Namespace) -> int:
+    plan = plan_with_authorization_profile(_authorization_profile_request_from_args(args))
+    emit(plan, json_output=args.json)
+    return 0 if plan.get("ok") else 1
+
+
+def cmd_execute_with_profile(args: argparse.Namespace) -> int:
+    result = execute_with_authorization_profile(_authorization_profile_request_from_args(args))
+    emit(result, json_output=args.json)
+    return 0 if result.get("ok") else 1
+
+
+def cmd_mixed_business_readiness_plan(args: argparse.Namespace) -> int:
+    plan = build_mixed_business_readiness_plan_from_files(
+        root=args.root,
+        registered_worker_registry_path=args.registered_worker_registry,
+        opencode_visible_registry_path=args.opencode_visible_registry,
+        mixed_result_path=args.mixed_result,
+        include_workers=list(args.include_worker or []),
+        execution_mode=args.execution_mode,
+        business_readiness_requested=args.business_readiness_requested,
+        business_repo_writes_requested=args.business_repo_writes_requested,
+        registry_write_requested=args.registry_write_requested,
+        business_task_live_requested=args.business_task_live_requested,
+        raw_tmux_requested=args.raw_tmux_requested,
+        direct_tui_requested=args.direct_tui_requested,
+        direct_adapter_submit_requested=args.direct_adapter_submit_requested,
+        rmux_requested=args.rmux_requested,
+        business_write_scope_contract_present=args.business_write_scope_contract_present,
+        opencode_allowed_write_roots=list(args.opencode_allowed_write_root or []),
+        claude_allowed_write_roots=list(args.claude_allowed_write_root or []),
+        forbidden_business_paths=list(args.forbidden_business_path or []),
+        test_command_plan=list(args.test_command or []),
+        dry_run_fixture_task_present=args.dry_run_fixture_task_present,
+        tiny_sandbox_smoke_planned=args.tiny_sandbox_smoke_planned,
+    )
+    emit(plan, json_output=args.json)
+    return 0 if plan.get("ok") else 1
+
+
+def cmd_mixed_business_readiness_fixture_plan(args: argparse.Namespace) -> int:
+    plan = build_mixed_business_readiness_fixture_plan(Path(args.fixture).resolve())
+    emit(plan, json_output=args.json)
+    return 0 if plan.get("ok") else 1
+
+
+def cmd_validate_mixed_business_readiness_plan(args: argparse.Namespace) -> int:
+    result = validate_mixed_business_readiness_plan_file(Path(args.plan).resolve())
+    emit(result, json_output=args.json)
+    return 0 if result.get("ok") else 1
+
+
+def cmd_claude_mixed_readiness_check(args: argparse.Namespace) -> int:
+    runtime_telemetry = read_json(Path(args.runtime_telemetry).resolve()) if args.runtime_telemetry else None
+    gate = build_claude_mixed_readiness_check_from_files(
+        root=args.root,
+        worker_id=args.worker_id,
+        registered_worker_registry_path=args.registered_worker_registry,
+        opencode_visible_registry_path=args.opencode_visible_registry,
+        done_smoke_path=args.done_smoke,
+        blocked_smoke_path=args.blocked_smoke,
+        fail_smoke_path=args.fail_smoke,
+        execution_mode=args.execution_mode,
+        runtime_telemetry=runtime_telemetry,
+        claude_allowed_write_roots=list(args.claude_allowed_write_root or []),
+        opencode_allowed_write_roots=list(args.opencode_allowed_write_root or []),
+        business_repo_writes_requested=args.business_repo_writes_requested,
+        cursor_requested=args.cursor_requested,
+        fixture_only=args.fixture_only,
+        fixture_path=Path(args.registered_worker_registry).resolve().parent if args.fixture_only else None,
+    )
+    emit({"schema_version": 1, **gate.to_dict()}, json_output=args.json)
+    return 0
+
+
+def cmd_claude_mixed_readiness_fixture_check(args: argparse.Namespace) -> int:
+    gate = build_claude_mixed_readiness_fixture_check(Path(args.fixture).resolve())
+    emit({"schema_version": 1, **gate.to_dict()}, json_output=args.json)
+    return 0
+
+
+def cmd_opencode_mixed_readiness_check(args: argparse.Namespace) -> int:
+    runtime_telemetry = read_json(Path(args.runtime_telemetry).resolve()) if args.runtime_telemetry else None
+    gate = build_opencode_mixed_readiness_check_from_files(
+        root=args.root,
+        worker_id=args.worker_id,
+        opencode_visible_registry_path=args.opencode_visible_registry,
+        registered_worker_registry_path=args.registered_worker_registry,
+        done_smoke_path=args.done_smoke,
+        blocked_smoke_path=args.blocked_smoke,
+        fail_smoke_path=args.fail_smoke,
+        lock_evidence_path=args.lock_evidence,
+        settle_evidence_path=args.settle_evidence,
+        execution_mode=args.execution_mode,
+        runtime_telemetry=runtime_telemetry,
+        opencode_allowed_write_roots=list(args.opencode_allowed_write_root or []),
+        claude_allowed_write_roots=list(args.claude_allowed_write_root or []),
+        business_repo_writes_requested=args.business_repo_writes_requested,
+        cursor_requested=args.cursor_requested,
+        fixture_only=args.fixture_only,
+        fixture_path=Path(args.opencode_visible_registry).resolve().parent if args.fixture_only else None,
+    )
+    emit({"schema_version": 1, **gate.to_dict()}, json_output=args.json)
+    return 0
+
+
+def cmd_opencode_mixed_readiness_fixture_check(args: argparse.Namespace) -> int:
+    gate = build_opencode_mixed_readiness_fixture_check(Path(args.fixture).resolve())
+    emit({"schema_version": 1, **gate.to_dict()}, json_output=args.json)
+    return 0
+
+
+def cmd_opencode_mixed_status(args: argparse.Namespace) -> int:
+    root = Path(args.root_arg).resolve() if getattr(args, "root_arg", None) else args.root
+    summary = source_opencode_mixed_status_summary(
+        root,
+        worker_id=args.worker_id or None,
+        include_all=args.all_workers,
+        execution_mode=args.execution_mode,
+        opencode_visible_registry=args.opencode_visible_registry or None,
+        registered_worker_registry=args.registered_worker_registry or None,
+    )
+    if args.json:
+        print(json.dumps(summary, indent=2, sort_keys=True, ensure_ascii=False))
+    else:
+        print("\n".join(format_opencode_mixed_status_human(summary)))
+    return 0 if summary.get("ok") else 1
+
+
+def cmd_opencode_mixed_status_fixture(args: argparse.Namespace) -> int:
+    fixture = args.fixture_path or args.fixture
+    summary = build_opencode_mixed_status_fixture(fixture)
+    if args.json:
+        print(json.dumps(summary, indent=2, sort_keys=True, ensure_ascii=False))
+    else:
+        print("\n".join(format_opencode_mixed_status_human(summary)))
+    return 0 if summary.get("ok") else 1
+
+
+def cmd_opencode_mixed_readiness_evidence_plan(args: argparse.Namespace) -> int:
+    plan = build_opencode_mixed_readiness_evidence_plan_from_files(
+        root=args.root,
+        worker_id=args.worker_id,
+        opencode_visible_registry=args.opencode_visible_registry,
+        registered_worker_registry=args.registered_worker_registry,
+        execution_mode=args.execution_mode,
+    )
+    emit(plan, json_output=args.json)
+    return 0
+
+
+def cmd_opencode_mixed_readiness_evidence_fixture_plan(args: argparse.Namespace) -> int:
+    plan = build_opencode_mixed_readiness_evidence_fixture_plan(Path(args.fixture).resolve())
+    emit(plan, json_output=args.json)
+    return 0
+
+
+def cmd_validate_opencode_mixed_readiness_evidence(args: argparse.Namespace) -> int:
+    result = validate_opencode_mixed_readiness_evidence_file(Path(args.evidence).resolve())
+    emit({"schema_version": 1, **result.to_dict()}, json_output=args.json)
+    return 0 if result.ok else 1
+
+
+def cmd_opencode_mixed_readiness_evidence_execution_plan(args: argparse.Namespace) -> int:
+    plan = build_opencode_mixed_readiness_evidence_execution_plan_from_files(
+        root=args.root,
+        worker_id=args.worker_id,
+        opencode_visible_registry=args.opencode_visible_registry,
+        registered_worker_registry=args.registered_worker_registry,
+        execution_mode=args.execution_mode,
+    )
+    emit(plan, json_output=args.json)
+    return 0
+
+
+def cmd_opencode_mixed_readiness_evidence_execution_fixture_plan(args: argparse.Namespace) -> int:
+    plan = build_opencode_mixed_readiness_evidence_execution_fixture_plan(Path(args.fixture).resolve())
+    emit(plan, json_output=args.json)
+    return 0
+
+
+def cmd_validate_opencode_mixed_readiness_evidence_execution_plan(args: argparse.Namespace) -> int:
+    result = validate_opencode_mixed_readiness_evidence_execution_plan_file(Path(args.plan).resolve())
+    emit({"schema_version": 1, **result.to_dict()}, json_output=args.json)
+    return 0 if result.ok else 1
+
+
+def cmd_opencode_evidence_authorization_plan(args: argparse.Namespace) -> int:
+    package = build_opencode_evidence_authorization_plan_from_files(
+        root=args.root,
+        worker_id=args.worker_id,
+        opencode_visible_registry=args.opencode_visible_registry,
+        registered_worker_registry=args.registered_worker_registry,
+        execution_mode=args.execution_mode,
+    )
+    emit(package, json_output=args.json)
+    return 0 if package.get("result", {}).get("ok") else 1
+
+
+def cmd_build_opencode_evidence_authorization_package(args: argparse.Namespace) -> int:
+    request = OpenCodeEvidenceAuthorizationRequest(
+        root=str(args.root),
+        worker_id=args.worker_id,
+        opencode_visible_registry=str(Path(args.opencode_visible_registry).resolve()),
+        registered_worker_registry=str(Path(args.registered_worker_registry).resolve()),
+        execution_mode=args.execution_mode,
+    )
+    package = write_opencode_evidence_authorization_package(request, output_dir=args.output_dir)
+    emit(package, json_output=args.json)
+    return 0 if package.get("result", {}).get("ok") else 1
+
+
+def cmd_validate_opencode_evidence_authorization_package(args: argparse.Namespace) -> int:
+    result = validate_opencode_evidence_authorization_package_file(Path(args.package).resolve())
+    emit({"schema_version": 1, **result.to_dict()}, json_output=args.json)
+    return 0 if result.ok else 1
+
+
+def cmd_opencode_evidence_authorization_fixture_plan(args: argparse.Namespace) -> int:
+    package = build_opencode_evidence_authorization_fixture_plan(Path(args.fixture).resolve())
+    emit(package, json_output=args.json)
+    return 0 if package.get("result", {}).get("ok") else 1
+
+
+def cmd_opencode_evidence_runner_plan(args: argparse.Namespace) -> int:
+    plan = build_opencode_evidence_runner_plan_from_package(
+        Path(args.package).resolve(),
+        execution_mode=args.execution_mode,
+        target_worker_id=args.target_worker_id,
+        root=str(Path(args.root).resolve()) if getattr(args, "root", "") else "",
+    )
+    emit(plan, json_output=args.json)
+    return 0 if plan.get("result", {}).get("ok") else 1
+
+
+def cmd_opencode_evidence_runner_fixture_plan(args: argparse.Namespace) -> int:
+    plan = build_opencode_evidence_runner_fixture_plan(Path(args.fixture).resolve())
+    emit(plan, json_output=args.json)
+    return 0 if plan.get("result", {}).get("ok") else 1
+
+
+def cmd_validate_opencode_evidence_runner_plan(args: argparse.Namespace) -> int:
+    result = validate_opencode_evidence_runner_plan_file(Path(args.plan).resolve())
+    emit({"schema_version": 1, **result.to_dict()}, json_output=args.json)
+    return 0 if result.ok else 1
+
+
+def cmd_execute_opencode_evidence_runner_package(args: argparse.Namespace) -> int:
+    request = OpenCodeEvidenceRunnerExecutionRequest(
+        package_path=str(Path(args.package).resolve()),
+        root=str(Path(args.root).resolve()),
+        target_worker_id=args.target_worker_id,
+        allow_live_evidence=bool(args.allow_live_evidence),
+        timeout_seconds=int(args.timeout),
+        dispatch_bin=args.dispatch_bin,
+        adapter_bin=args.adapter_bin,
+        watcher_bin=args.watcher_bin,
+    )
+    result = execute_opencode_evidence_runner_package(request)
+    emit(result, json_output=args.json)
+    return 0 if result.get("ok") else 1
+
+
+def cmd_opencode_worker_identity_diagnose(args: argparse.Namespace) -> int:
+    result = diagnose_opencode_worker_identity_from_files(
+        root=args.root,
+        worker_id=args.worker_id,
+        opencode_visible_registry=args.opencode_visible_registry,
+    )
+    emit(result, json_output=args.json)
+    return 0 if result.get("safe_for_live_submit") else 1
+
+
+def cmd_opencode_worker_identity_fixture_diagnose(args: argparse.Namespace) -> int:
+    result = diagnose_opencode_worker_identity_fixture(Path(args.fixture).resolve())
+    emit(result, json_output=args.json)
+    return 0 if result.get("safe_for_live_submit") else 1
+
+
+def _opencode_visible_binding_update_request_from_args(args: argparse.Namespace) -> OpenCodeVisibleBindingUpdateRequest:
+    overrides = {}
+    if getattr(args, "propose_default_for_new_tasks", False):
+        overrides["default_for_new_tasks"] = True
+    if getattr(args, "propose_mixed_ready", False):
+        overrides["mixed_ready"] = True
+    return OpenCodeVisibleBindingUpdateRequest(
+        root=str(Path(args.root).resolve()),
+        worker_id=args.worker_id,
+        opencode_visible_registry_path=str(Path(args.opencode_visible_registry).resolve()),
+        target_pane=args.target_pane,
+        target_port=int(args.target_port),
+        allow_framework_registry=getattr(args, "allow_framework_registry", False),
+        allow_binding_update=getattr(args, "allow_binding_update", False),
+        fixture_path=str(Path(args.fixture).resolve()) if getattr(args, "fixture", None) else "",
+        proposed_overrides=overrides,
+    )
+
+
+def cmd_opencode_visible_binding_update_plan(args: argparse.Namespace) -> int:
+    plan = build_opencode_visible_binding_update_plan(_opencode_visible_binding_update_request_from_args(args))
+    emit(plan, json_output=args.json)
+    return 0 if plan.get("ok") else 1
+
+
+def cmd_opencode_visible_binding_update(args: argparse.Namespace) -> int:
+    result = write_opencode_visible_binding_update(_opencode_visible_binding_update_request_from_args(args))
+    emit(result, json_output=args.json)
+    return 0 if result.get("ok") else 1
+
+
+def cmd_validate_opencode_visible_binding_update(args: argparse.Namespace) -> int:
+    result = validate_opencode_visible_binding_update_record(read_json(Path(args.update).resolve()))
+    emit(result, json_output=args.json)
+    return 0 if result.get("ok") else 1
+
+
+def _opencode_visible_worker_disable_request_from_args(args: argparse.Namespace) -> tuple[OpenCodeVisibleWorkerDisableRequest, dict[str, Any] | None]:
+    request = OpenCodeVisibleWorkerDisableRequest(
+        root=str(Path(args.root).resolve()),
+        worker_id=args.worker_id,
+        opencode_visible_registry_path=str(Path(args.opencode_visible_registry).resolve()),
+        allow_framework_registry=getattr(args, "allow_framework_registry", False),
+        allow_worker_disable=getattr(args, "allow_worker_disable", False),
+        proposed_status=str(getattr(args, "proposed_status", "stale_binding_disabled") or "stale_binding_disabled"),
+    )
+    rebind_payload = read_json(Path(args.rebind_check).resolve()) if getattr(args, "rebind_check", None) else None
+    return request, rebind_payload
+
+
+def cmd_opencode_visible_worker_disable_plan(args: argparse.Namespace) -> int:
+    request, rebind_payload = _opencode_visible_worker_disable_request_from_args(args)
+    plan = build_opencode_visible_worker_disable_plan(request, rebind_check=rebind_payload)
+    emit(plan, json_output=args.json)
+    return 0 if plan.get("ok") else 1
+
+
+def cmd_opencode_visible_worker_disable(args: argparse.Namespace) -> int:
+    request, rebind_payload = _opencode_visible_worker_disable_request_from_args(args)
+    result = write_opencode_visible_worker_disable(request, rebind_check=rebind_payload)
+    emit(result, json_output=args.json)
+    return 0 if result.get("ok") else 1
+
+
+def cmd_validate_opencode_visible_worker_disable(args: argparse.Namespace) -> int:
+    result = validate_opencode_visible_worker_disable_record(read_json(Path(args.update).resolve()))
+    emit(result, json_output=args.json)
+    return 0 if result.get("ok") else 1
+
+
+def _opencode_visible_worker_enable_request_from_args(args: argparse.Namespace) -> tuple[OpenCodeVisibleWorkerEnableRequest, dict[str, Any] | None]:
+    request = OpenCodeVisibleWorkerEnableRequest(
+        root=str(Path(args.root).resolve()),
+        worker_id=args.worker_id,
+        opencode_visible_registry_path=str(Path(args.opencode_visible_registry).resolve()),
+        allow_framework_registry=getattr(args, "allow_framework_registry", False),
+        allow_worker_enable=getattr(args, "allow_worker_enable", False),
+        proposed_status=str(getattr(args, "proposed_status", "ok") or "ok"),
+    )
+    rebind_payload = read_json(Path(args.rebind_check).resolve()) if getattr(args, "rebind_check", None) else None
+    return request, rebind_payload
+
+
+def cmd_opencode_visible_worker_enable_plan(args: argparse.Namespace) -> int:
+    request, rebind_payload = _opencode_visible_worker_enable_request_from_args(args)
+    plan = build_opencode_visible_worker_enable_plan(request, rebind_check=rebind_payload)
+    emit(plan, json_output=args.json)
+    return 0 if plan.get("ok") else 1
+
+
+def cmd_opencode_visible_worker_enable(args: argparse.Namespace) -> int:
+    request, rebind_payload = _opencode_visible_worker_enable_request_from_args(args)
+    result = write_opencode_visible_worker_enable(request, rebind_check=rebind_payload)
+    emit(result, json_output=args.json)
+    return 0 if result.get("ok") else 1
+
+
+def cmd_validate_opencode_visible_worker_enable(args: argparse.Namespace) -> int:
+    result = validate_opencode_visible_worker_enable_record(read_json(Path(args.update).resolve()))
+    emit(result, json_output=args.json)
+    return 0 if result.get("ok") else 1
+
+
+def _opencode_mixed_ready_update_request_from_args(args: argparse.Namespace) -> OpenCodeMixedReadyUpdateRequest:
+    overrides = {}
+    if getattr(args, "propose_business_ready", False):
+        overrides["business_ready"] = True
+    if getattr(args, "propose_allow_business_repo_writes", False):
+        overrides["allow_business_repo_writes"] = True
+    if getattr(args, "propose_binding_change", False):
+        overrides["pane_id"] = "%999"
+    if getattr(args, "propose_default_for_new_tasks", False):
+        overrides["default_for_new_tasks"] = True
+    return OpenCodeMixedReadyUpdateRequest(
+        root=str(Path(args.root).resolve()),
+        worker_id=args.worker_id,
+        opencode_visible_registry_path=str(Path(args.opencode_visible_registry).resolve()),
+        evidence_path=str(Path(args.evidence).resolve()),
+        allow_framework_registry=getattr(args, "allow_framework_registry", False),
+        allow_opencode_mixed_ready_update=getattr(args, "allow_opencode_mixed_ready_update", False),
+        proposed_overrides=overrides,
+    )
+
+
+def cmd_opencode_mixed_ready_update_plan(args: argparse.Namespace) -> int:
+    plan = build_opencode_mixed_ready_update_plan(_opencode_mixed_ready_update_request_from_args(args))
+    emit(plan, json_output=args.json)
+    return 0 if plan.get("ok") else 1
+
+
+def cmd_opencode_mixed_ready_update(args: argparse.Namespace) -> int:
+    result = write_opencode_mixed_ready_update(_opencode_mixed_ready_update_request_from_args(args))
+    emit(result, json_output=args.json)
+    return 0 if result.get("ok") else 1
+
+
+def cmd_validate_opencode_mixed_ready_registry_update(args: argparse.Namespace) -> int:
+    result = validate_opencode_mixed_ready_update_record(read_json(Path(args.update_result).resolve()))
+    emit(result, json_output=args.json)
+    return 0 if result.get("ok") else 1
+
+
+def _mixed_ready_update_request_from_args(args: argparse.Namespace) -> MixedReadyUpdateRequest:
+    fixture = getattr(args, "fixture", None)
+    if fixture:
+        return _mixed_ready_update_request_from_fixture(Path(fixture).resolve(), args)
+    runtime_telemetry = read_json(Path(args.runtime_telemetry).resolve()) if args.runtime_telemetry else None
+    return MixedReadyUpdateRequest(
+        root=str(args.root),
+        worker_id=args.worker_id,
+        registered_worker_registry_path=str(Path(args.registered_worker_registry).resolve()),
+        opencode_visible_registry_path=str(Path(args.opencode_visible_registry).resolve()),
+        done_smoke_path=str(Path(args.done_smoke).resolve()),
+        blocked_smoke_path=str(Path(args.blocked_smoke).resolve()),
+        fail_smoke_path=str(Path(args.fail_smoke).resolve()),
+        execution_mode=args.execution_mode,
+        runtime_telemetry=runtime_telemetry or {},
+        claude_allowed_write_roots=list(args.claude_allowed_write_root or []),
+        opencode_allowed_write_roots=list(args.opencode_allowed_write_root or []),
+        business_repo_writes_requested=args.business_repo_writes_requested,
+        cursor_requested=args.cursor_requested,
+        fixture_only=args.fixture_only,
+        allow_framework_registry=args.allow_framework_registry,
+        allow_mixed_ready_update=getattr(args, "allow_mixed_ready_update", False),
+        propose_business_ready=args.propose_business_ready,
+        propose_allow_business_repo_writes=args.propose_allow_business_repo_writes,
+    )
+
+
+def _fixture_path(value: str, base: Path) -> str:
+    path = Path(value)
+    if not path.is_absolute():
+        path = base / path
+    return str(path.resolve())
+
+
+def _mixed_ready_update_request_from_fixture(fixture: Path, args: argparse.Namespace) -> MixedReadyUpdateRequest:
+    payload = read_json(fixture / "request.json") if (fixture / "request.json").is_file() else {}
+    source_fixture = str(payload.get("source_mixed_readiness_fixture", ""))
+    base = fixture
+    if source_fixture:
+        base = (fixture.parent.parent / "mixed-readiness" / source_fixture).resolve()
+    root = Path(str(payload.get("root", fixture))).resolve()
+    registered = str(
+        payload.get(
+            "registered_worker_registry_path",
+            payload.get("registered_worker_registry", ".omx/framework/team/registered-workers/registered-workers.json"),
+        )
+    )
+    opencode = str(payload.get("opencode_visible_registry_path", payload.get("opencode_visible_registry", ".omx/framework/team/opencode_visible_workers.json")))
+    done = str(payload.get("done_smoke_path", payload.get("done_smoke", "smokes/done/task-001")))
+    blocked = str(payload.get("blocked_smoke_path", payload.get("blocked_smoke", "smokes/blocked/task-001")))
+    fail = str(payload.get("fail_smoke_path", payload.get("fail_smoke", "smokes/fail/task-001")))
+    runtime_path = Path(_fixture_path(str(payload.get("runtime_telemetry_path", "runtime-telemetry.json")), base))
+    runtime_telemetry = read_json(runtime_path) if runtime_path.is_file() else {}
+    return MixedReadyUpdateRequest(
+        root=str(root),
+        worker_id=str(payload.get("worker_id", getattr(args, "worker_id", "") or "vc-fixture-claude")),
+        registered_worker_registry_path=_fixture_path(registered, base),
+        opencode_visible_registry_path=_fixture_path(opencode, base),
+        done_smoke_path=_fixture_path(done, base),
+        blocked_smoke_path=_fixture_path(blocked, base),
+        fail_smoke_path=_fixture_path(fail, base),
+        execution_mode=str(payload.get("execution_mode", "no-live")),
+        runtime_telemetry=runtime_telemetry,
+        claude_allowed_write_roots=list(payload.get("claude_allowed_write_roots", [])),
+        opencode_allowed_write_roots=list(payload.get("opencode_allowed_write_roots", [])),
+        business_repo_writes_requested=bool(payload.get("business_repo_writes_requested", False)),
+        cursor_requested=bool(payload.get("cursor_requested", False)),
+        fixture_only=True,
+        allow_framework_registry=bool(payload.get("allow_framework_registry", False)),
+        allow_mixed_ready_update=bool(payload.get("allow_mixed_ready_update", False)),
+        propose_business_ready=bool(payload.get("propose_business_ready", False)),
+        propose_allow_business_repo_writes=bool(payload.get("propose_allow_business_repo_writes", False)),
+        readiness_gate_overrides=dict(payload.get("readiness_gate_overrides", {})),
+    )
+
+
+def cmd_claude_mixed_ready_update_plan(args: argparse.Namespace) -> int:
+    request = _mixed_ready_update_request_from_args(args)
+    plan = build_mixed_ready_update_plan(request)
+    emit(plan.to_dict(), json_output=args.json)
+    return 0
+
+
+def cmd_claude_mixed_ready_update(args: argparse.Namespace) -> int:
+    request = _mixed_ready_update_request_from_args(args)
+    result = write_mixed_ready_update(request)
+    emit({"schema_version": 1, **result.to_dict()}, json_output=args.json)
+    return 0 if result.wrote_registry else 1
+
+
+def cmd_validate_mixed_ready_registry_update(args: argparse.Namespace) -> int:
+    payload = read_json(Path(args.update).resolve())
+    result = validate_mixed_ready_update_record(payload)
+    emit(result, json_output=args.json)
+    return 0 if result["ok"] else 1
+
+
+def _registration_evidence_request_payload_from_args(args: argparse.Namespace, backend: str) -> dict:
+    required = {
+        "--worker-id": args.worker_id,
+        "--workspace-root": args.workspace_root,
+        "--runtime-backend": args.runtime_backend,
+    }
+    missing = [flag for flag, value in required.items() if not value]
+    if missing:
+        raise RuntimeAdapterError(f"missing required registration evidence arguments: {', '.join(missing)}")
+    return {
+        "backend_kind": backend,
+        "worker_id": args.worker_id,
+        "worker_label": args.worker_label,
+        "workspace_root": args.workspace_root,
+        "runtime_backend": args.runtime_backend,
+        "runtime_binding_kind": args.runtime_binding_kind,
+        "pane_id": args.pane_id,
+        "process_id": args.process_id,
+        "port": args.port,
+        "user_owned_pane": args.user_owned_pane,
+        "authorization_record_path": str(Path(args.authorization_record).resolve()) if args.authorization_record else "",
+        "live_enable_config_path": str(Path(args.config).resolve()) if args.config else "",
+        "preflight_request_path": str(Path(args.preflight_request).resolve()) if args.preflight_request else "",
+        "expected_business_index_files": list(args.expected_business_index or []),
+        "allow_mixed_worker": args.allow_mixed_worker,
+        "notes": list(args.note or []),
+    }
+
+
+def _write_json_under_root(root: Path, output: Path, payload: dict) -> None:
+    output_path = output.resolve()
+    try:
+        output_path.relative_to(root.resolve())
+    except ValueError as exc:
+        raise RuntimeAdapterError(f"output must stay under source root: {output_path}") from exc
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def contract_worker_id(contract: dict, workers: list) -> str:
+    value = contract.get("worker_id")
+    if isinstance(value, str) and value:
+        return value
+    worker = contract.get("worker")
+    if isinstance(worker, dict) and isinstance(worker.get("worker_id"), str):
+        return worker["worker_id"]
+    if workers:
+        return str(workers[0].worker_id)
+    raise RuntimeAdapterError("contract must provide worker_id or fixture must contain at least one worker")
+
+
+def validate_contract_backend(contract: dict, backend: str) -> None:
+    contract_backend = contract.get("backend")
+    if contract_backend and canonical_backend(str(contract_backend)) != canonical_backend(backend):
+        raise RuntimeAdapterError(f"contract backend mismatch: {contract_backend} != {backend}")
+
+
+def cmd_plan(args: argparse.Namespace) -> int:
+    canonical = canonical_backend(args.backend)
+    if canonical == "opencode-tui":
+        raise RuntimeAdapterError("opencode_tui planning belongs to omx_visible_dispatch; worker backend CLI does not direct submit")
+    contract = read_json(Path(args.contract).resolve())
+    validate_contract_backend(contract, args.backend)
+    adapter = adapter_from_args(args)
+    workers = adapter.discover_workers(args.root)
+    worker_id = contract_worker_id(contract, workers)
+    result = adapter.submit_plan(args.root, worker_id, task_reference={"source": "fixture-contract", "contract": args.contract})
+    payload = {
+        **backend_payload(args),
+        "contract_path": str(Path(args.contract).resolve()),
+        "fixture_path": str(Path(args.fixture).resolve()),
+        "ok": True,
+        "contract": {
+            "worker_id": worker_id,
+            "allowed_write_scope": contract.get("allowed_write_scope", []),
+            "requires_report_marker": bool(contract.get("requires_report_marker", True)),
+        },
+        **result.to_dict(),
+    }
+    emit(payload, json_output=args.json)
+    return 0
+
+
+def terminal_markers_from_result(result: dict) -> list[str]:
+    markers = result.get("terminal_markers")
+    if isinstance(markers, list):
+        return [str(item) for item in markers if str(item) in {"done", "fail", "blocked"}]
+    marker = result.get("terminal_marker")
+    if isinstance(marker, str) and marker in {"done", "fail", "blocked"}:
+        return [marker]
+    found = []
+    for name in ("done", "fail", "blocked"):
+        if result.get(name) is True:
+            found.append(name)
+    return found
+
+
+def write_paths_from_result(result: dict) -> list[str]:
+    paths = []
+    for item in result.get("writes", []):
+        if isinstance(item, str):
+            paths.append(item)
+        elif isinstance(item, dict) and isinstance(item.get("path"), str):
+            paths.append(item["path"])
+    return paths
+
+
+def path_in_scope(path: str, allowed_scopes: list[str]) -> bool:
+    clean = Path(path).as_posix().lstrip("/")
+    for scope in allowed_scopes:
+        allowed = Path(str(scope)).as_posix().lstrip("/")
+        if clean == allowed or clean.startswith(f"{allowed.rstrip('/')}/"):
+            return True
+    return False
+
+
+def cmd_validate_result(args: argparse.Namespace) -> int:
+    canonical = canonical_backend(args.backend)
+    if canonical == "opencode-tui":
+        raise RuntimeAdapterError("opencode_tui results are validated by visible task reports, not this fixture CLI")
+    contract = read_json(Path(args.contract).resolve())
+    result = read_json(Path(args.result).resolve())
+    validate_contract_backend(contract, args.backend)
+    adapter = adapter_from_args(args)
+    workers = adapter.discover_workers(args.root)
+    worker_id = contract_worker_id(contract, workers)
+
+    errors = []
+    markers = terminal_markers_from_result(result)
+    report_text = str(result.get("report", ""))
+    if contract.get("requires_report_marker", True) and len(markers) != 1:
+        errors.append(f"expected exactly one terminal marker, got {markers}")
+    if not report_text.strip():
+        errors.append("report must be non-empty")
+    allowed_scopes = [str(item) for item in contract.get("allowed_write_scope", [])]
+    out_of_scope = [path for path in write_paths_from_result(result) if allowed_scopes and not path_in_scope(path, allowed_scopes)]
+    if out_of_scope:
+        errors.append(f"out-of-scope writes: {out_of_scope}")
+
+    payload = {
+        **backend_payload(args),
+        "contract_path": str(Path(args.contract).resolve()),
+        "result_path": str(Path(args.result).resolve()),
+        "fixture_path": str(Path(args.fixture).resolve()),
+        "worker_id": worker_id,
+        "ok": not errors,
+        "terminal_markers": markers,
+        "report_non_empty": bool(report_text.strip()),
+        "allowed_write_scope": allowed_scopes,
+        "writes": write_paths_from_result(result),
+        "out_of_scope_writes": out_of_scope,
+        "errors": errors,
+        "warnings": [
+            f"{public_backend_name(canonical)} validate-result is fixture-only; no live process is contacted"
+        ],
+    }
+    emit(payload, json_output=args.json)
+    return 0 if not errors else 1
+
+
+def cmd_workers(args: argparse.Namespace) -> int:
+    adapter = adapter_from_args(args)
+    payload = {
+        **backend_payload(args),
+        "workers": [worker.to_dict() for worker in adapter.discover_workers(args.root)],
+    }
+    emit(payload, json_output=args.json)
+    return 0
+
+
+def cmd_resolve(args: argparse.Namespace) -> int:
+    adapter = adapter_from_args(args)
+    result = adapter.resolve_worker(args.root, args.worker)
+    payload = {**backend_payload(args), **result.to_dict()}
+    emit(payload, json_output=args.json)
+    return 0
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    adapter = adapter_from_args(args)
+    result = adapter.verify_worker(args.root, args.worker)
+    payload = {**backend_payload(args), **result.to_dict()}
+    emit(payload, json_output=args.json)
+    return 0 if result.ok else 1
+
+
+def cmd_readiness(args: argparse.Namespace) -> int:
+    adapter = adapter_from_args(args)
+    result = adapter.fetch_readiness(args.root, args.worker)
+    payload = {**backend_payload(args), **result.to_dict(), "dispatch_allowed": False}
+    emit(payload, json_output=args.json)
+    return 0
+
+
+def cmd_submit_plan(args: argparse.Namespace) -> int:
+    adapter = adapter_from_args(args)
+    result = adapter.submit_plan(args.root, args.worker, task_reference={"source": "cli-plan"})
+    payload = {**backend_payload(args), **result.to_dict()}
+    emit(payload, json_output=args.json)
+    return 0
+
+
+def add_backend_args(sub: argparse.ArgumentParser, *, worker: bool = False) -> None:
+    sub.add_argument("--root", type=repo_root, default=runtime_root(), help="repository root")
+    sub.add_argument(
+        "--backend",
+        required=True,
+        choices=sorted(BACKEND_ALIASES),
+        help="worker backend",
+    )
+    sub.add_argument("--fixture", help="fixture directory containing worker-backends.json")
+    sub.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    if worker:
+        sub.add_argument("--worker", required=True, help="worker id")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="omx_worker_backend",
+        description=(
+            "Read-only WorkerBackend utility. It does not call Claude Code, Cursor Agent, "
+            "OpenCode, rmux, tmux input, or mutate live runtime state."
+        ),
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    list_cmd = subparsers.add_parser("list-backends", help="show worker agent backends")
+    list_cmd.add_argument("--root", type=repo_root, default=runtime_root(), help="repository root")
+    list_cmd.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    list_cmd.set_defaults(func=cmd_list_backends)
+
+    list_public = subparsers.add_parser("list", help="show public worker backend names")
+    list_public.add_argument("--root", type=repo_root, default=runtime_root(), help="repository root")
+    list_public.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    list_public.set_defaults(func=cmd_list)
+
+    config_paths = subparsers.add_parser("config-paths", help="show live-enable config path resolution")
+    config_paths.add_argument("--root", type=repo_root, default=runtime_root(), help="repository root")
+    config_paths.add_argument("--backend", default="claude_code", choices=sorted(BACKEND_ALIASES), help="worker backend")
+    config_paths.add_argument("--config", help="optional live enable config JSON")
+    config_paths.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    config_paths.set_defaults(func=cmd_config_paths)
+
+    obsidian = subparsers.add_parser("obsidian-logging-check", help="dry-run Obsidian logging opt-in policy check")
+    obsidian.add_argument("--root", type=repo_root, default=runtime_root(), help="repository root")
+    obsidian.add_argument("--allow-obsidian-log", action="store_true", help="explicitly opt in to Obsidian logging")
+    obsidian.add_argument("--target-vault-path", default="", help="explicit target Obsidian vault path")
+    obsidian.add_argument("--target-note", default="", help="explicit target Obsidian note path")
+    obsidian.add_argument("--purpose", default="", help="explicit logging purpose")
+    obsidian.add_argument("--allowed-content-scope", default="", help="explicit allowed content scope")
+    obsidian.add_argument("--append-only", action="store_true", help="authorize append-only note changes")
+    obsidian.add_argument("--rollback-allowed", action="store_true", help="authorize rollback if a future write is requested")
+    obsidian.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    obsidian.set_defaults(func=cmd_obsidian_logging_check)
+
+    for name, handler, help_text in (
+        ("interface", cmd_interface, "print the WorkerBackend interface document"),
+        ("schema", cmd_schema, "print the worker backend contract schema"),
+    ):
+        sub = subparsers.add_parser(name, help=help_text)
+        sub.add_argument("--root", type=repo_root, default=runtime_root(), help="repository root")
+        sub.set_defaults(func=handler)
+
+    workers = subparsers.add_parser("workers", help="list fixture workers for a backend")
+    add_backend_args(workers)
+    workers.set_defaults(func=cmd_workers)
+
+    capabilities = subparsers.add_parser("capabilities", help="show backend capabilities without contacting live agents")
+    capabilities.add_argument("--root", type=repo_root, default=runtime_root(), help="repository root")
+    capabilities.add_argument("--backend", required=True, choices=sorted(BACKEND_ALIASES), help="worker backend")
+    capabilities.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    capabilities.set_defaults(func=cmd_capabilities)
+
+    eligibility = subparsers.add_parser(
+        "check-live-eligibility",
+        help="report whether a backend may be used for live submit without performing submit",
+    )
+    eligibility.add_argument("--root", type=repo_root, default=runtime_root(), help="repository root")
+    eligibility.add_argument("--backend", required=True, choices=sorted(BACKEND_ALIASES), help="worker backend")
+    eligibility.add_argument("--config", help="optional live enable config JSON")
+    eligibility.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    eligibility.set_defaults(func=cmd_check_live_eligibility)
+
+    live_status = subparsers.add_parser("live-enable-status", help="show fail-closed live enable status")
+    live_status.add_argument("--root", type=repo_root, default=runtime_root(), help="repository root")
+    live_status.add_argument("--backend", required=True, choices=sorted(BACKEND_ALIASES), help="worker backend")
+    live_status.add_argument("--config", help="optional live enable config JSON")
+    live_status.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    live_status.set_defaults(func=cmd_live_enable_status)
+
+    live_check = subparsers.add_parser("live-enable-check", help="evaluate live enable gate without live calls")
+    live_check.add_argument("--root", type=repo_root, default=runtime_root(), help="repository root")
+    live_check.add_argument("--backend", required=True, choices=sorted(BACKEND_ALIASES), help="worker backend")
+    live_check.add_argument("--config", help="optional live enable config JSON")
+    live_check.add_argument("--workspace-root", default="", help="candidate workspace root")
+    live_check.add_argument("--worker-id", default="", help="candidate worker id")
+    live_check.add_argument("--runtime-backend", default="", help="candidate runtime substrate backend")
+    live_check.add_argument("--user-owned-pane", action="store_true", help="candidate binding is a user-owned pane")
+    live_check.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    live_check.set_defaults(func=cmd_live_enable_check)
+
+    for name, handler, help_text in (
+        ("claude-live-plan", cmd_claude_live_plan, "build a fail-closed Claude visible-pane live submit plan"),
+        ("claude-live-submit", cmd_claude_live_submit, "return a fail-closed Claude visible-pane live submit result"),
+    ):
+        claude_live = subparsers.add_parser(name, help=help_text)
+        claude_live.add_argument("--root", type=repo_root, default=runtime_root(), help="repository root")
+        claude_live.add_argument("--worker-id", required=True, help="candidate worker id")
+        claude_live.add_argument("--workspace-root", required=True, help="candidate workspace root")
+        claude_live.add_argument("--runtime-backend", required=True, help="candidate runtime substrate backend")
+        claude_live.add_argument("--runtime-binding-kind", default="tmux-pane", help="pane/process/headless binding kind")
+        claude_live.add_argument("--pane-id", default="", help="candidate pane id")
+        claude_live.add_argument("--pane-pid", default="", help="candidate pane pid")
+        claude_live.add_argument("--process-id", default="", help="candidate process id")
+        claude_live.add_argument("--command", default="", help="candidate command path")
+        claude_live.add_argument("--user-owned-pane", action="store_true", help="candidate binding is a user-owned pane")
+        claude_live.add_argument("--task-dir", default="", help="future task artifact directory")
+        claude_live.add_argument("--task-id", default="", help="future task id")
+        claude_live.add_argument("--prompt-text", default="", help="future prompt text for planning only")
+        claude_live.add_argument("--prompt-file", default="", help="future prompt file path for audited tmux load-buffer")
+        claude_live.add_argument("--authorization-record", default="", help="explicit authorization record JSON")
+        claude_live.add_argument("--config", default="", help="optional live enable config JSON")
+        claude_live.add_argument("--allowed-write-root", action="append", help="candidate allowed write root")
+        claude_live.add_argument("--forbidden-path", action="append", help="candidate forbidden path")
+        claude_live.add_argument("--expected-output", action="append", help="expected worker output path or marker")
+        claude_live.add_argument("--report-path", default="", help="expected report.md path")
+        claude_live.add_argument("--terminal-marker", action="append", help="allowed terminal marker name")
+        claude_live.add_argument("--allow-real", action="store_true", help="authorize real submit attempt if all gates pass")
+        claude_live.add_argument("--allow-tmux-input", action="store_true", help="authorize dedicated adapter tmux input if all gates pass")
+        claude_live.add_argument("--allow-user-owned-pane", action="store_true", help="authorize user-owned pane use")
+        claude_live.add_argument("--dry-run", action="store_true", default=True, help="plan only; default for claude-live-plan")
+        claude_live.add_argument("--no-report-marker-protocol", action="store_true", help="disable report marker protocol requirement")
+        claude_live.add_argument("--note", action="append", help="extra planning note")
+        claude_live.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+        claude_live.set_defaults(func=handler)
+
+    dry_run = subparsers.add_parser("dry-run-register", help="plan worker registration without writing live registry")
+    dry_run.add_argument("--root", type=repo_root, default=runtime_root(), help="repository root")
+    dry_run.add_argument("--backend", required=True, choices=sorted(BACKEND_ALIASES), help="worker backend")
+    dry_run.add_argument("--config", help="optional live enable config JSON")
+    dry_run.add_argument("--worker-id", required=True, help="candidate worker id")
+    dry_run.add_argument("--workspace-root", required=True, help="candidate workspace root")
+    dry_run.add_argument("--runtime-backend", required=True, help="candidate runtime substrate backend")
+    dry_run.add_argument("--runtime-binding-kind", default="", help="pane/process/headless binding kind")
+    dry_run.add_argument("--pane-id", default="", help="candidate pane id")
+    dry_run.add_argument("--process-id", default="", help="candidate process id")
+    dry_run.add_argument("--port", default="", help="candidate port")
+    dry_run.add_argument("--user-owned-pane", action="store_true", help="candidate binding is a user-owned pane")
+    dry_run.add_argument("--user-authorization-record", default="", help="explicit authorization record reference")
+    dry_run.add_argument("--allowed-write-root", action="append", help="candidate allowed write root")
+    dry_run.add_argument("--allowed-read-root", action="append", help="candidate allowed read root")
+    dry_run.add_argument("--task-profile", default="", help="candidate task profile")
+    dry_run.add_argument("--note", action="append", help="extra dry-run note")
+    dry_run.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    dry_run.set_defaults(func=cmd_dry_run_register)
+
+    preflight = subparsers.add_parser("preflight-evidence", help="collect dry-run preflight evidence without live submit")
+    preflight.add_argument("--root", type=repo_root, default=runtime_root(), help="repository root")
+    preflight.add_argument("--backend", required=True, choices=sorted(BACKEND_ALIASES), help="worker backend")
+    preflight.add_argument("--request", help="fixture request JSON")
+    preflight.add_argument("--worker-id", default="", help="candidate worker id")
+    preflight.add_argument("--workspace-root", default="", help="candidate workspace root")
+    preflight.add_argument("--runtime-backend", default="", help="candidate runtime substrate backend")
+    preflight.add_argument("--runtime-binding-kind", default="", help="pane/process/headless binding kind")
+    preflight.add_argument("--pane-id", default="", help="candidate pane id")
+    preflight.add_argument("--process-id", default="", help="candidate process id")
+    preflight.add_argument("--port", default="", help="candidate port")
+    preflight.add_argument("--user-owned-pane", action="store_true", help="candidate binding is a user-owned pane")
+    preflight.add_argument("--user-authorization-record", default="", help="explicit authorization record reference")
+    preflight.add_argument("--authorization-record", help="explicit user authorization record JSON")
+    preflight.add_argument("--config", help="optional live enable config JSON")
+    preflight.add_argument("--allowed-workspace-root", action="append", help="candidate allowed workspace root")
+    preflight.add_argument("--allowed-write-root", action="append", help="candidate allowed write root")
+    preflight.add_argument("--allowed-read-root", action="append", help="candidate allowed read root")
+    preflight.add_argument("--expected-business-index", action="append", help="expected staged business repo file")
+    preflight.add_argument("--allow-read-live", action="store_true", help="allow read-only live evidence collection")
+    preflight.add_argument("--note", action="append", help="extra preflight note")
+    preflight.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    preflight.set_defaults(func=cmd_preflight_evidence)
+
+    authorization = subparsers.add_parser(
+        "validate-authorization-record",
+        help="validate explicit user authorization record JSON without live calls",
+    )
+    authorization.add_argument("--root", type=repo_root, default=runtime_root(), help="repository root")
+    authorization.add_argument("--record", required=True, help="authorization record JSON")
+    authorization.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    authorization.set_defaults(func=cmd_validate_authorization_record)
+
+    evidence = subparsers.add_parser(
+        "build-registration-evidence-package",
+        help="build a fail-closed registration evidence package without live calls",
+    )
+    evidence.add_argument("--root", type=repo_root, default=runtime_root(), help="repository root")
+    evidence.add_argument("--backend", required=True, choices=sorted(BACKEND_ALIASES), help="worker backend")
+    evidence.add_argument("--request", help="fixture request JSON")
+    evidence.add_argument("--worker-id", default="", help="candidate worker id")
+    evidence.add_argument("--worker-label", default="", help="candidate worker label")
+    evidence.add_argument("--workspace-root", default="", help="candidate workspace root")
+    evidence.add_argument("--runtime-backend", default="", help="candidate runtime substrate backend")
+    evidence.add_argument("--runtime-binding-kind", default="", help="pane/process/headless binding kind")
+    evidence.add_argument("--pane-id", default="", help="candidate pane id")
+    evidence.add_argument("--process-id", default="", help="candidate process id")
+    evidence.add_argument("--port", default="", help="candidate port")
+    evidence.add_argument("--user-owned-pane", action="store_true", help="candidate binding is a user-owned pane")
+    evidence.add_argument("--authorization-record", help="explicit user authorization record JSON")
+    evidence.add_argument("--config", help="optional live enable config JSON")
+    evidence.add_argument("--preflight-request", help="optional preflight request JSON reference")
+    evidence.add_argument("--expected-business-index", action="append", help="expected staged business repo file")
+    evidence.add_argument("--allow-mixed-worker", action="store_true", help="allow mixed-worker evidence")
+    evidence.add_argument("--note", action="append", help="extra package note")
+    evidence.add_argument("--output", help="write package JSON under source root")
+    evidence.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    evidence.set_defaults(func=cmd_build_registration_evidence_package)
+
+    evidence_validate = subparsers.add_parser(
+        "validate-registration-evidence-package",
+        help="validate registration evidence package shape and fail-closed invariants",
+    )
+    evidence_validate.add_argument("--root", type=repo_root, default=runtime_root(), help="repository root")
+    evidence_validate.add_argument("--package", required=True, help="registration evidence package JSON")
+    evidence_validate.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    evidence_validate.set_defaults(func=cmd_validate_registration_evidence_package)
+
+    registered_build = subparsers.add_parser(
+        "build-registered-worker-record",
+        help="build a source-only registered worker record without live registry writes",
+    )
+    registered_build.add_argument("--root", type=repo_root, default=runtime_root(), help="repository root")
+    registered_build.add_argument("--backend", required=True, choices=sorted(BACKEND_ALIASES), help="worker backend")
+    registered_build.add_argument("--worker-id", required=True, help="candidate worker id")
+    registered_build.add_argument("--workspace-root", required=True, help="candidate workspace root")
+    registered_build.add_argument("--runtime-backend", required=True, help="candidate runtime substrate backend")
+    registered_build.add_argument("--runtime-binding-kind", default="tmux-pane", help="pane/process/headless binding kind")
+    registered_build.add_argument("--pane-id", default="", help="candidate pane id")
+    registered_build.add_argument("--pane-pid", default="", help="candidate pane pid")
+    registered_build.add_argument("--process-id", default="", help="candidate process id")
+    registered_build.add_argument("--command", default="", help="candidate command path for evidence only")
+    registered_build.add_argument("--port", default="", help="candidate port")
+    registered_build.add_argument("--user-owned-pane", action="store_true", help="candidate binding is a user-owned pane")
+    registered_build.add_argument("--registration-status", default="planned", help="candidate inventory status")
+    registered_build.add_argument("--live-enabled", action="store_true", help="record live_enabled=true for validation only")
+    registered_build.add_argument("--allow-business-repo-writes", action="store_true", help="record business write intent")
+    registered_build.add_argument("--allow-mixed-worker", action="store_true", help="record mixed-worker intent")
+    registered_build.add_argument("--authorization-record", default="", help="authorization record reference")
+    registered_build.add_argument("--live-enable-config", default="", help="live-enable config reference")
+    registered_build.add_argument("--config", default="", help="alias for --live-enable-config")
+    registered_build.add_argument("--smoke-evidence-path", default="", help="report marker artifact directory")
+    registered_build.add_argument("--last-smoke-artifact", default="", help="alias for --smoke-evidence-path")
+    registered_build.add_argument("--registry-path", default=".omx/framework/team/registered-workers.json", help="future registry path")
+    registered_build.add_argument("--allow-register", action="store_true", help="plan flag only; still does not write registry")
+    registered_build.add_argument("--allow-build-record-output", action="store_true", help="allow source-root output file")
+    registered_build.add_argument("--output", help="write record JSON under source root")
+    registered_build.add_argument("--note", action="append", help="extra record note")
+    registered_build.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    registered_build.set_defaults(func=cmd_build_registered_worker_record)
+
+    registered_validate = subparsers.add_parser(
+        "validate-registered-worker-record",
+        help="validate a registered worker record without live calls",
+    )
+    registered_validate.add_argument("--root", type=repo_root, default=runtime_root(), help="repository root")
+    registered_validate.add_argument("--record", required=True, help="registered worker record JSON")
+    registered_validate.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    registered_validate.set_defaults(func=cmd_validate_registered_worker_record)
+
+    registered_plan = subparsers.add_parser(
+        "registered-worker-plan",
+        help="build a dry-run registered worker plan without registry writes",
+    )
+    registered_plan.add_argument("--root", type=repo_root, default=runtime_root(), help="repository root")
+    registered_plan.add_argument("--record", help="registered worker record JSON")
+    registered_plan.add_argument("--backend", default="claude_code", choices=sorted(BACKEND_ALIASES), help="worker backend")
+    registered_plan.add_argument("--worker-id", default="", help="candidate worker id")
+    registered_plan.add_argument("--workspace-root", default="", help="candidate workspace root")
+    registered_plan.add_argument("--runtime-backend", default="", help="candidate runtime substrate backend")
+    registered_plan.add_argument("--runtime-binding-kind", default="tmux-pane", help="pane/process/headless binding kind")
+    registered_plan.add_argument("--pane-id", default="", help="candidate pane id")
+    registered_plan.add_argument("--pane-pid", default="", help="candidate pane pid")
+    registered_plan.add_argument("--process-id", default="", help="candidate process id")
+    registered_plan.add_argument("--command", default="", help="candidate command path for evidence only")
+    registered_plan.add_argument("--user-owned-pane", action="store_true", help="candidate binding is a user-owned pane")
+    registered_plan.add_argument("--authorization-record", default="", help="authorization record reference")
+    registered_plan.add_argument("--live-enable-config", default="", help="live-enable config reference")
+    registered_plan.add_argument("--config", default="", help="alias for --live-enable-config")
+    registered_plan.add_argument("--smoke-evidence-path", default="", help="report marker artifact directory")
+    registered_plan.add_argument("--last-smoke-artifact", default="", help="alias for --smoke-evidence-path")
+    registered_plan.add_argument("--registry-path", default=".omx/framework/team/registered-workers.json", help="future registry path")
+    registered_plan.add_argument("--allow-register", action="store_true", help="plan flag only; still does not write registry")
+    registered_plan.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    registered_plan.set_defaults(func=cmd_registered_worker_plan)
+
+    register_plan = subparsers.add_parser(
+        "registered-worker-register-plan",
+        help="plan a registered worker registry write without writing files",
+    )
+    register_plan.add_argument("--root", type=Path, default=runtime_root(), help="registry framework root")
+    register_plan.add_argument("--record", required=True, help="registered worker record JSON")
+    register_plan.add_argument("--registry", required=True, help="registered worker registry JSON")
+    register_plan.add_argument(
+        "--allow-framework-registry",
+        action="store_true",
+        help="allow the explicit <root>/.omx/framework/team/registered-workers registry root",
+    )
+    register_plan.add_argument("--replace-existing", action="store_true", help="plan replacing an existing worker")
+    register_plan.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    register_plan.set_defaults(func=cmd_registered_worker_register_plan)
+
+    register = subparsers.add_parser(
+        "registered-worker-register",
+        help="write a registered worker record into a fixture/temp registry with explicit --allow-register",
+    )
+    register.add_argument("--root", type=Path, default=runtime_root(), help="registry framework root")
+    register.add_argument("--record", required=True, help="registered worker record JSON")
+    register.add_argument("--registry", required=True, help="registered worker registry JSON")
+    register.add_argument("--allow-register", action="store_true", help="explicitly allow this local registry write")
+    register.add_argument(
+        "--allow-framework-registry",
+        action="store_true",
+        help="allow the explicit <root>/.omx/framework/team/registered-workers registry root",
+    )
+    register.add_argument("--replace-existing", action="store_true", help="replace an existing worker with the same id")
+    register.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    register.set_defaults(func=cmd_registered_worker_register)
+
+    auth_update_plan = subparsers.add_parser(
+        "registered-worker-authorization-update-plan",
+        help="plan a no-live registered worker authorization refresh without writing files",
+    )
+    auth_update_plan.add_argument("--root", type=Path, default=runtime_root(), help="registry framework root")
+    auth_update_plan.add_argument("--worker-id", required=True, help="registered worker id")
+    auth_update_plan.add_argument(
+        "--registered-worker-registry",
+        required=True,
+        help="registered worker registry JSON",
+    )
+    auth_update_plan.add_argument("--authorization-record", required=True, help="new authorization record JSON")
+    auth_update_plan.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    auth_update_plan.set_defaults(func=cmd_registered_worker_authorization_update_plan)
+
+    auth_update = subparsers.add_parser(
+        "registered-worker-authorization-update",
+        help="refresh a registered worker authorization record with explicit allow flags",
+    )
+    auth_update.add_argument("--root", type=Path, default=runtime_root(), help="registry framework root")
+    auth_update.add_argument("--worker-id", required=True, help="registered worker id")
+    auth_update.add_argument(
+        "--registered-worker-registry",
+        required=True,
+        help="registered worker registry JSON",
+    )
+    auth_update.add_argument("--authorization-record", required=True, help="new authorization record JSON")
+    auth_update.add_argument(
+        "--allow-framework-registry",
+        action="store_true",
+        help="allow the explicit <root>/.omx/framework/team/registered-workers registry root",
+    )
+    auth_update.add_argument(
+        "--allow-authorization-update",
+        action="store_true",
+        help="explicitly allow this no-live authorization reference update",
+    )
+    auth_update.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    auth_update.set_defaults(func=cmd_registered_worker_authorization_update)
+
+    registry_validate = subparsers.add_parser(
+        "validate-registered-worker-registry",
+        help="validate a registered worker registry without live checks",
+    )
+    registry_validate.add_argument("--root", type=repo_root, default=runtime_root(), help="repository root")
+    registry_validate.add_argument("--registry", required=True, help="registered worker registry JSON")
+    registry_validate.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    registry_validate.set_defaults(func=cmd_validate_registered_worker_registry)
+
+    registry_status_cmd = subparsers.add_parser(
+        "registered-worker-registry-status",
+        help="read registered worker registry status without live health checks",
+    )
+    registry_status_cmd.add_argument("--root", type=repo_root, default=runtime_root(), help="repository root")
+    registry_status_cmd.add_argument("--registry", required=True, help="registered worker registry JSON")
+    registry_status_cmd.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    registry_status_cmd.set_defaults(func=cmd_registered_worker_registry_status)
+
+    registered_status = subparsers.add_parser(
+        "registered-worker-status",
+        help="source-only registered worker status with smoke artifact validation",
+    )
+    registered_status.add_argument("--root", type=repo_root, default=runtime_root(), help="repository root")
+    registered_status.add_argument("--registry", required=True, help="registered worker registry JSON")
+    registered_status.add_argument("--allow-read-live", action="store_true", help="reserved for read-only liveness checks; default is source-only")
+    registered_status.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    registered_status.set_defaults(func=cmd_registered_worker_status)
+
+    registered_health = subparsers.add_parser(
+        "registered-worker-health",
+        help="source-only registered worker health summary without pane or Claude calls",
+    )
+    registered_health.add_argument("--root", type=repo_root, default=runtime_root(), help="repository root")
+    registered_health.add_argument("--registry", required=True, help="registered worker registry JSON")
+    registered_health.add_argument("--allow-read-live", action="store_true", help="reserved for read-only liveness checks; default is source-only")
+    registered_health.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    registered_health.set_defaults(func=cmd_registered_worker_health)
+
+    mixed_plan = subparsers.add_parser(
+        "mixed-worker-plan",
+        help="build a source-only OpenCode plus registered Claude mixed worker plan without live calls",
+    )
+    mixed_plan.add_argument("--root", type=repo_root, default=runtime_root(), help="runtime or source root")
+    mixed_plan.add_argument("--registered-worker-registry", required=True, help="registered worker registry JSON")
+    mixed_plan.add_argument("--opencode-visible-registry", required=True, help="OpenCode visible worker registry JSON")
+    mixed_plan.add_argument(
+        "--include-backend",
+        action="append",
+        choices=["opencode_tui", "opencode-tui", "claude_code", "claude-code-fixture", "cursor_agent", "cursor-agent-fixture"],
+        help="backend to include in the source-only mixed plan",
+    )
+    mixed_plan.add_argument("--execution-mode", default="no-live", choices=["no-live", "live"], help="default and only allowed mode is no-live")
+    mixed_plan.add_argument("--business-repo-writes-requested", action="store_true", help="model a forbidden business repo write request")
+    mixed_plan.add_argument("--runtime-telemetry", help="optional fixture runtime telemetry JSON")
+    mixed_plan.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    mixed_plan.set_defaults(func=cmd_mixed_worker_plan)
+
+    mixed_fixture = subparsers.add_parser(
+        "mixed-worker-fixture-plan",
+        help="build a fixture-only mixed worker plan without live calls",
+    )
+    mixed_fixture.add_argument("--fixture", required=True, help="mixed worker fixture directory")
+    mixed_fixture.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    mixed_fixture.set_defaults(func=cmd_mixed_worker_fixture_plan)
+
+    mixed_noop_plan = subparsers.add_parser(
+        "mixed-noop-contract-plan",
+        help="build a source-only mixed no-op contract plan without live calls or artifact writes",
+    )
+    mixed_noop_plan.add_argument("--root", type=repo_root, default=runtime_root(), help="runtime or source root")
+    mixed_noop_plan.add_argument("--registered-worker-registry", required=True, help="registered worker registry JSON")
+    mixed_noop_plan.add_argument("--opencode-visible-registry", required=True, help="OpenCode visible worker registry JSON")
+    mixed_noop_plan.add_argument("--include-worker", action="append", help="specific worker id to include")
+    mixed_noop_plan.add_argument("--execution-mode", default="no-live", choices=["no-live", "live"], help="default and only allowed mode is no-live")
+    mixed_noop_plan.add_argument("--business-repo-writes-requested", action="store_true", help="model a forbidden business repo write request")
+    mixed_noop_plan.add_argument("--runtime-telemetry", help="optional fixture runtime telemetry JSON")
+    mixed_noop_plan.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    mixed_noop_plan.set_defaults(func=cmd_mixed_noop_contract_plan)
+
+    mixed_noop_fixture = subparsers.add_parser(
+        "mixed-noop-fixture-plan",
+        help="build a fixture-only mixed no-op contract plan without live calls",
+    )
+    mixed_noop_fixture.add_argument("--fixture", required=True, help="mixed no-op fixture directory")
+    mixed_noop_fixture.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    mixed_noop_fixture.set_defaults(func=cmd_mixed_noop_fixture_plan)
+
+    mixed_noop_validate = subparsers.add_parser(
+        "validate-mixed-noop-contract",
+        help="validate a mixed no-op contract JSON file",
+    )
+    mixed_noop_validate.add_argument("--contract", required=True, help="mixed no-op contract JSON")
+    mixed_noop_validate.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    mixed_noop_validate.set_defaults(func=cmd_validate_mixed_noop_contract)
+
+    mixed_noop_result = subparsers.add_parser(
+        "validate-mixed-noop-result",
+        help="validate mixed no-op result reports and terminal markers",
+    )
+    mixed_noop_result.add_argument("--contract", required=True, help="mixed no-op contract JSON")
+    mixed_noop_result.add_argument("--result", required=True, help="mixed no-op result JSON")
+    mixed_noop_result.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    mixed_noop_result.set_defaults(func=cmd_validate_mixed_noop_result)
+
+    def add_mixed_noop_live_args(sub: argparse.ArgumentParser, *, execute: bool = False) -> None:
+        sub.add_argument("--root", type=repo_root, default=runtime_root(), help="runtime root")
+        sub.add_argument("--registered-worker-registry", required=True, help="registered worker registry JSON")
+        sub.add_argument("--opencode-visible-registry", required=True, help="OpenCode visible worker registry JSON")
+        sub.add_argument("--include-worker", action="append", help="specific worker id to include")
+        sub.add_argument("--execution-mode", default="no-live", choices=["no-live"], help="must remain no-live; live execution is authorized only by --allow-mixed-noop-live")
+        sub.add_argument("--run-id", default="", help="optional mixed run id")
+        sub.add_argument("--timeout", type=int, default=240, help="per-worker live timeout")
+        sub.add_argument("--dispatch-bin", default="", help="override omx_visible_dispatch path for tests")
+        sub.add_argument("--worker-backend-bin", default="", help="override omx_worker_backend path for tests")
+        sub.add_argument("--watcher-bin", default="", help="override omx_visible_watcher path for tests")
+        sub.add_argument("--live-enable-config", default="", help="override Claude live-enable config path")
+        if execute:
+            sub.add_argument("--allow-mixed-noop-live", action="store_true", help="explicitly authorize one controlled mixed no-op live run")
+        sub.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+
+    mixed_noop_live_plan = subparsers.add_parser(
+        "mixed-noop-live-plan",
+        help="plan one controlled OpenCode + Claude mixed no-op live run without touching workers",
+    )
+    add_mixed_noop_live_args(mixed_noop_live_plan)
+    mixed_noop_live_plan.set_defaults(func=cmd_mixed_noop_live_plan)
+
+    mixed_noop_live_execute = subparsers.add_parser(
+        "execute-mixed-noop-live",
+        help="execute one authorized mixed no-op live run through controlled wrappers",
+    )
+    add_mixed_noop_live_args(mixed_noop_live_execute, execute=True)
+    mixed_noop_live_execute.set_defaults(func=cmd_execute_mixed_noop_live)
+
+    mixed_noop_live_validate = subparsers.add_parser(
+        "validate-mixed-noop-live-result",
+        help="validate a mixed no-op live result JSON file",
+    )
+    mixed_noop_live_validate.add_argument("--result", required=True, help="mixed no-op live result JSON")
+    mixed_noop_live_validate.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    mixed_noop_live_validate.set_defaults(func=cmd_validate_mixed_noop_live_result)
+
+    list_profiles = subparsers.add_parser(
+        "list-authorization-profiles",
+        help="list reusable worker authorization profiles",
+    )
+    list_profiles.add_argument("--root", type=repo_root, default=runtime_root(), help="runtime or installed root")
+    list_profiles.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    list_profiles.set_defaults(func=cmd_list_authorization_profiles)
+
+    validate_profile = subparsers.add_parser(
+        "validate-authorization-profile",
+        help="validate a reusable worker authorization profile without live checks",
+    )
+    validate_profile.add_argument("--profile", required=True, help="authorization profile JSON")
+    validate_profile.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    validate_profile.set_defaults(func=cmd_validate_authorization_profile)
+
+    default_profile = subparsers.add_parser(
+        "default-authorization-profile",
+        help="show the configured default authorization profile for a kind",
+    )
+    default_profile.add_argument("--root", type=repo_root, default=runtime_root(), help="runtime or installed root")
+    default_profile.add_argument("--kind", default="business_readonly_review", choices=["business_readonly_review"], help="default profile kind")
+    default_profile.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    default_profile.set_defaults(func=cmd_default_authorization_profile)
+
+    summary_profile = subparsers.add_parser(
+        "profile-summary",
+        help="summarize a reusable authorization profile and forbidden matrix",
+    )
+    summary_profile.add_argument("--profile", required=True, help="authorization profile JSON")
+    summary_profile.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    summary_profile.set_defaults(func=cmd_profile_summary)
+
+    def add_authorization_profile_args(sub: argparse.ArgumentParser, *, execute: bool = False) -> None:
+        sub.add_argument("--root", type=repo_root, default=runtime_root(), help="runtime or installed root")
+        sub.add_argument("--profile", required=True, help="authorization profile JSON")
+        sub.add_argument("--registered-worker-registry", required=True, help="registered worker registry JSON")
+        sub.add_argument("--opencode-visible-registry", required=True, help="OpenCode visible worker registry JSON")
+        sub.add_argument("--execution-mode", default="no-live", choices=["no-live", "live"], help="default and only allowed planning mode is no-live")
+        sub.add_argument("--run-id", default="", help="optional mixed pressure run id")
+        sub.add_argument("--timeout", type=int, default=240, help="per-worker live timeout for future explicit execution")
+        sub.add_argument("--dispatch-bin", default="", help="override omx_visible_dispatch path for tests")
+        sub.add_argument("--worker-backend-bin", default="", help="override omx_worker_backend path for tests")
+        sub.add_argument("--watcher-bin", default="", help="override omx_visible_watcher path for tests")
+        sub.add_argument("--live-enable-config", default="", help="override Claude live-enable config path")
+        sub.add_argument("--worker-id", default="", help="explicit business-readonly reviewer worker; required for business readonly live until a default reviewer exists")
+        sub.add_argument("--business-repo", default="", help="business repository path for readonly review boundary snapshots")
+        if execute:
+            sub.add_argument("--allow-profile-live", action="store_true", help="explicitly authorize exactly one profile-backed live execution")
+        sub.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+
+    plan_profile = subparsers.add_parser(
+        "plan-with-profile",
+        help="build a read-only no-live execution plan from an authorization profile",
+    )
+    add_authorization_profile_args(plan_profile)
+    plan_profile.set_defaults(func=cmd_plan_with_profile)
+
+    plan_default_profile = subparsers.add_parser(
+        "plan-default-profile",
+        help="build a read-only no-live execution plan from the configured default profile",
+    )
+    plan_default_profile.add_argument("--root", type=repo_root, default=runtime_root(), help="runtime or installed root")
+    plan_default_profile.add_argument("--kind", default="business_readonly_review", choices=["business_readonly_review"], help="default profile kind")
+    plan_default_profile.add_argument("--registered-worker-registry", required=True, help="registered worker registry JSON")
+    plan_default_profile.add_argument("--opencode-visible-registry", required=True, help="OpenCode visible worker registry JSON")
+    plan_default_profile.add_argument("--execution-mode", default="no-live", choices=["no-live", "live"], help="default and only allowed planning mode is no-live")
+    plan_default_profile.add_argument("--run-id", default="", help="optional mixed pressure run id")
+    plan_default_profile.add_argument("--timeout", type=int, default=240, help="per-worker live timeout for future explicit execution")
+    plan_default_profile.add_argument("--dispatch-bin", default="", help="override omx_visible_dispatch path for tests")
+    plan_default_profile.add_argument("--worker-backend-bin", default="", help="override omx_worker_backend path for tests")
+    plan_default_profile.add_argument("--watcher-bin", default="", help="override omx_visible_watcher path for tests")
+    plan_default_profile.add_argument("--live-enable-config", default="", help="override Claude live-enable config path")
+    plan_default_profile.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    plan_default_profile.set_defaults(func=cmd_plan_default_profile)
+
+    prompt_template = subparsers.add_parser(
+        "short-prompt-template",
+        help="show the short default-profile task prompt template without live authorization",
+    )
+    prompt_template.add_argument("--root", type=repo_root, default=runtime_root(), help="runtime or installed root")
+    prompt_template.add_argument("--profile-kind", default="business_readonly_review", choices=["business_readonly_review"], help="default profile kind")
+    prompt_template.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    prompt_template.set_defaults(func=cmd_short_prompt_template)
+
+    write_scope = subparsers.add_parser(
+        "validate-business-write-scope",
+        help="validate a future business scoped-write contract without live execution",
+    )
+    write_scope.add_argument("--profile", required=True, help="business scoped-write profile JSON")
+    write_scope.add_argument("--contract", required=True, help="business write-scope contract JSON")
+    write_scope.add_argument("--changed-file", action="append", default=[], help="actual changed file from git diff --name-only; repeatable")
+    write_scope.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    write_scope.set_defaults(func=cmd_validate_business_write_scope)
+
+    scoped_write_smoke = subparsers.add_parser(
+        "prepare-business-scoped-write-smoke",
+        help="prepare a no-live 1 writer + 1 reviewer scoped-write smoke package",
+    )
+    scoped_write_smoke.add_argument("--profile", required=True, help="business scoped-write profile JSON")
+    scoped_write_smoke.add_argument("--contract", required=True, help="business write-scope contract JSON")
+    scoped_write_smoke.add_argument("--writer", required=True, help="candidate writer worker id")
+    scoped_write_smoke.add_argument("--reviewer", required=True, help="candidate reviewer worker id")
+    scoped_write_smoke.add_argument("--output-dir", default="", help="optional directory for writing the no-live prep package JSON")
+    scoped_write_smoke.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    scoped_write_smoke.set_defaults(func=cmd_prepare_business_scoped_write_smoke)
+
+    validate_scoped_write_smoke = subparsers.add_parser(
+        "validate-business-scoped-write-smoke-prep",
+        help="validate a no-live business scoped-write smoke preparation package",
+    )
+    validate_scoped_write_smoke.add_argument("--package", required=True, help="prep package JSON")
+    validate_scoped_write_smoke.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    validate_scoped_write_smoke.set_defaults(func=cmd_validate_business_scoped_write_smoke_prep)
+
+    rollback_smoke = subparsers.add_parser(
+        "prepare-business-scoped-rollback-smoke",
+        help="prepare a no-live rollback package for one untracked business smoke file",
+    )
+    rollback_smoke.add_argument("--profile", required=True, help="business scoped-write profile JSON")
+    rollback_smoke.add_argument("--target-file", required=True, help="business repo file to remove after separate approval")
+    rollback_smoke.add_argument("--expected-status", required=True, help="expected git status --short line for the target")
+    rollback_smoke.add_argument("--expected-sha256", required=True, help="expected pre-rollback target file sha256")
+    rollback_smoke.add_argument("--rollback-worker", required=True, help="candidate rollback worker id")
+    rollback_smoke.add_argument("--reviewer", required=True, help="candidate reviewer worker id")
+    rollback_smoke.add_argument("--output-dir", default="", help="optional directory for writing the no-live rollback prep package JSON")
+    rollback_smoke.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    rollback_smoke.set_defaults(func=cmd_prepare_business_scoped_rollback_smoke)
+
+    validate_rollback = subparsers.add_parser(
+        "validate-business-scoped-rollback-prep",
+        help="validate a no-live business rollback preparation package",
+    )
+    validate_rollback.add_argument("--package", required=True, help="rollback prep package JSON")
+    validate_rollback.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    validate_rollback.set_defaults(func=cmd_validate_business_scoped_rollback_prep)
+
+    validate_rollback_approval = subparsers.add_parser(
+        "validate-business-scoped-rollback-approval",
+        help="validate a live rollback approval against a no-live rollback prep package",
+    )
+    validate_rollback_approval.add_argument("--approval", required=True, help="rollback approval JSON")
+    validate_rollback_approval.add_argument("--prep-package", required=True, help="rollback prep package JSON")
+    validate_rollback_approval.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    validate_rollback_approval.set_defaults(func=cmd_validate_business_scoped_rollback_approval)
+
+    role_task_package = subparsers.add_parser(
+        "plan-role-task-package",
+        help="prepare a no-live Coder + Reviewer + Gate role task package",
+    )
+    role_task_package.add_argument("--profile", required=True, help="business scoped-write profile JSON")
+    role_task_package.add_argument("--contract", required=True, help="business write-scope contract JSON")
+    role_task_package.add_argument("--coder", required=True, help="candidate coder worker id")
+    role_task_package.add_argument("--reviewer", required=True, help="candidate reviewer worker id")
+    role_task_package.add_argument("--output-dir", default="", help="optional directory for writing role task package JSON files")
+    role_task_package.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    role_task_package.set_defaults(func=cmd_plan_role_task_package)
+
+    validate_role_package = subparsers.add_parser(
+        "validate-role-task-package",
+        help="validate a no-live Coder + Reviewer + Gate role task package directory",
+    )
+    validate_role_package.add_argument("--package-dir", required=True, help="directory containing role task package JSON files")
+    validate_role_package.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    validate_role_package.set_defaults(func=cmd_validate_role_task_package)
+
+    validate_role_cycle = subparsers.add_parser(
+        "validate-role-task-cycle-ready",
+        help="validate that a no-live Coder + Reviewer role cycle has been consumed before another writer run",
+    )
+    validate_role_cycle.add_argument("--package-dir", required=True, help="directory containing role task package JSON files")
+    validate_role_cycle.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    validate_role_cycle.set_defaults(func=cmd_validate_role_task_cycle_ready)
+
+    sandbox_role_harness = subparsers.add_parser(
+        "evaluate-sandbox-role-harness",
+        help="evaluate no-live sandbox Coder + Reviewer + Gate evidence without dispatch",
+    )
+    sandbox_role_harness.add_argument("--evidence", required=True, help="sandbox role evidence JSON")
+    sandbox_role_harness.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    sandbox_role_harness.set_defaults(func=cmd_evaluate_sandbox_role_harness)
+
+    sandbox_role_run = subparsers.add_parser(
+        "evaluate-sandbox-role-run",
+        help="collect and evaluate no-live sandbox Coder + Reviewer + Gate task artifacts",
+    )
+    sandbox_role_run.add_argument("--spec", required=True, help="sandbox role-run collection spec JSON")
+    sandbox_role_run.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    sandbox_role_run.set_defaults(func=cmd_evaluate_sandbox_role_run)
+
+    sandbox_role_run_spec = subparsers.add_parser(
+        "build-sandbox-role-run-spec",
+        help="build a no-live sandbox role-run spec from visible dispatch metadata",
+    )
+    sandbox_role_run_spec.add_argument("--metadata", required=True, help="sandbox role dispatch metadata JSON")
+    sandbox_role_run_spec.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    sandbox_role_run_spec.set_defaults(func=cmd_build_sandbox_role_run_spec)
+
+    sandbox_role_closeout = subparsers.add_parser(
+        "closeout-sandbox-role-run",
+        help="build, collect, and evaluate a no-live sandbox role-run from visible dispatch metadata",
+    )
+    sandbox_role_closeout.add_argument("--metadata", required=True, help="sandbox role dispatch metadata JSON")
+    sandbox_role_closeout.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    sandbox_role_closeout.set_defaults(func=cmd_closeout_sandbox_role_run)
+
+    sandbox_role_artifact_closeout = subparsers.add_parser(
+        "closeout-sandbox-role-run-artifact",
+        help="build dispatch metadata and close out a no-live sandbox role-run from one artifact",
+    )
+    sandbox_role_artifact_closeout.add_argument("--artifact", required=True, help="sandbox role-run artifact JSON")
+    sandbox_role_artifact_closeout.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    sandbox_role_artifact_closeout.set_defaults(func=cmd_closeout_sandbox_role_run_artifact)
+
+    sandbox_role_live_smoke_package = subparsers.add_parser(
+        "build-sandbox-role-live-smoke-package",
+        help="build a no-live reusable sandbox Coder + Reviewer + Gate prompt package",
+    )
+    sandbox_role_live_smoke_package.add_argument("--request", required=True, help="sandbox role live smoke request JSON")
+    sandbox_role_live_smoke_package.add_argument("--output-dir", default="", help="directory for writing prompt and artifact templates")
+    sandbox_role_live_smoke_package.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    sandbox_role_live_smoke_package.set_defaults(func=cmd_build_sandbox_role_live_smoke_package)
+
+    sandbox_role_live_smoke_runner = subparsers.add_parser(
+        "run-sandbox-role-live-smoke-package",
+        help="plan a sandbox Coder + Reviewer + Gate live smoke run and fail closed without explicit live authorization",
+    )
+    sandbox_role_live_smoke_runner.add_argument("--package-dir", required=True, help="directory containing a sandbox role live smoke package")
+    sandbox_role_live_smoke_runner.add_argument("--output-dir", default="", help="directory for writing runner plan and future run artifacts")
+    sandbox_role_live_smoke_runner.add_argument("--timeout", type=int, default=240, help="per-role visible dispatch timeout")
+    sandbox_role_live_smoke_runner.add_argument("--dispatch-bin", default="", help="override omx_visible_dispatch path")
+    sandbox_role_live_smoke_runner.add_argument("--result-output", default="", help="write final runner JSON to this path after creating parent directories")
+    sandbox_role_live_smoke_runner.add_argument("--allow-real", action="store_true", help="explicitly authorize one future controlled live runner attempt")
+    sandbox_role_live_smoke_runner.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    sandbox_role_live_smoke_runner.set_defaults(func=cmd_run_sandbox_role_live_smoke_package)
+
+    validate_scoped_write_approval = subparsers.add_parser(
+        "validate-business-scoped-write-approval",
+        help="validate a live scoped-write approval against a no-live prep package",
+    )
+    validate_scoped_write_approval.add_argument("--approval", required=True, help="approval JSON")
+    validate_scoped_write_approval.add_argument("--prep-package", required=True, help="prep package JSON")
+    validate_scoped_write_approval.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    validate_scoped_write_approval.set_defaults(func=cmd_validate_business_scoped_write_approval)
+
+    rehearse_scoped_write = subparsers.add_parser(
+        "rehearse-business-scoped-write",
+        help="rehearse scoped-write prep, approval, and changed-file gates without live execution",
+    )
+    rehearse_scoped_write.add_argument("--profile", required=True, help="business scoped-write profile JSON")
+    rehearse_scoped_write.add_argument("--contract", required=True, help="business write-scope contract JSON")
+    rehearse_scoped_write.add_argument("--prep-package", required=True, help="prep package JSON")
+    rehearse_scoped_write.add_argument("--approval", required=True, help="approval JSON")
+    rehearse_scoped_write.add_argument("--changed-file", action="append", default=[], help="actual changed file from git diff --name-only; repeatable")
+    rehearse_scoped_write.add_argument("--output", default="", help="optional path for writing the rehearsal JSON artifact")
+    rehearse_scoped_write.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    rehearse_scoped_write.set_defaults(func=cmd_rehearse_business_scoped_write)
+
+    baseline_delta = subparsers.add_parser(
+        "validate-business-baseline-delta",
+        help="validate that post-write git status differs from a dirty baseline only by expected files",
+    )
+    baseline_delta.add_argument("--baseline-status", required=True, help="pre-write git status --short snapshot file")
+    baseline_delta.add_argument("--current-status", required=True, help="post-write git status --short snapshot file")
+    baseline_delta.add_argument("--expected-added-file", action="append", default=[], help="allowed newly untracked file; repeatable")
+    baseline_delta.add_argument("--expected-baseline-sha256", default="", help="optional sha256 expected for the baseline status file")
+    baseline_delta.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    baseline_delta.set_defaults(func=cmd_validate_business_baseline_delta)
+
+    business_readonly_validate = subparsers.add_parser(
+        "validate-business-readonly-review-result",
+        help="validate controlled business-readonly review result boundaries",
+    )
+    business_readonly_validate.add_argument("--result", required=True, help="business readonly result JSON")
+    business_readonly_validate.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    business_readonly_validate.set_defaults(func=cmd_validate_business_readonly_review_result)
+
+    execute_profile = subparsers.add_parser(
+        "execute-with-profile",
+        help="execute one profile-backed controlled run only when explicitly allowed; business readonly forbids business, registry, state-team writes and retry",
+    )
+    add_authorization_profile_args(execute_profile, execute=True)
+    execute_profile.set_defaults(func=cmd_execute_with_profile)
+
+    mixed_business = subparsers.add_parser(
+        "mixed-business-readiness-plan",
+        help="plan the no-live business-readiness gate after a mixed no-op live closeout",
+    )
+    mixed_business.add_argument("--root", type=repo_root, default=runtime_root(), help="runtime or source root")
+    mixed_business.add_argument("--registered-worker-registry", required=True, help="registered worker registry JSON")
+    mixed_business.add_argument("--opencode-visible-registry", required=True, help="OpenCode visible worker registry JSON")
+    mixed_business.add_argument("--mixed-result", required=True, help="validated mixed no-op live result JSON")
+    mixed_business.add_argument("--include-worker", action="append", help="specific worker id to include")
+    mixed_business.add_argument("--execution-mode", default="no-live", choices=["no-live", "live"], help="must remain no-live")
+    mixed_business.add_argument("--business-readiness-requested", action="store_true", help="model a future business-readiness candidate review")
+    mixed_business.add_argument("--business-repo-writes-requested", action="store_true", help="model a forbidden business repo write request")
+    mixed_business.add_argument("--registry-write-requested", action="store_true", help="model a forbidden registry write request")
+    mixed_business.add_argument("--business-task-live-requested", action="store_true", help="model a forbidden live business task request")
+    mixed_business.add_argument("--raw-tmux-requested", action="store_true", help="model a forbidden raw tmux request")
+    mixed_business.add_argument("--direct-tui-requested", action="store_true", help="model a forbidden direct /tui request")
+    mixed_business.add_argument("--direct-adapter-submit-requested", action="store_true", help="model a forbidden direct adapter submit request")
+    mixed_business.add_argument("--rmux-requested", action="store_true", help="model a forbidden rmux request")
+    mixed_business.add_argument("--business-write-scope-contract-present", action="store_true", help="future business write-scope contract exists")
+    mixed_business.add_argument("--opencode-allowed-write-root", action="append", help="future OpenCode business write root candidate")
+    mixed_business.add_argument("--claude-allowed-write-root", action="append", help="future Claude review root candidate")
+    mixed_business.add_argument("--forbidden-business-path", action="append", help="forbidden business path in future scope contract")
+    mixed_business.add_argument("--test-command", action="append", help="test command required for future business gate")
+    mixed_business.add_argument("--dry-run-fixture-task-present", action="store_true", help="future dry-run fixture task is defined")
+    mixed_business.add_argument("--tiny-sandbox-smoke-planned", action="store_true", help="future tiny sandbox write smoke is planned")
+    mixed_business.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    mixed_business.set_defaults(func=cmd_mixed_business_readiness_plan)
+
+    mixed_business_fixture = subparsers.add_parser(
+        "mixed-business-readiness-fixture-plan",
+        help="build a fixture-only mixed business-readiness gate plan without live calls",
+    )
+    mixed_business_fixture.add_argument("--fixture", required=True, help="mixed business-readiness fixture directory")
+    mixed_business_fixture.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    mixed_business_fixture.set_defaults(func=cmd_mixed_business_readiness_fixture_plan)
+
+    mixed_business_validate = subparsers.add_parser(
+        "validate-mixed-business-readiness-plan",
+        help="validate no-live mixed business-readiness plan invariants",
+    )
+    mixed_business_validate.add_argument("--plan", required=True, help="mixed business-readiness plan JSON")
+    mixed_business_validate.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    mixed_business_validate.set_defaults(func=cmd_validate_mixed_business_readiness_plan)
+
+    claude_mixed = subparsers.add_parser(
+        "claude-mixed-readiness-check",
+        help="evaluate a registered Claude mixed-ready candidate without live calls or registry writes",
+    )
+    claude_mixed.add_argument("--root", type=repo_root, default=runtime_root(), help="runtime or source root")
+    claude_mixed.add_argument("--worker-id", required=True, help="registered Claude worker id")
+    claude_mixed.add_argument("--registered-worker-registry", required=True, help="registered worker registry JSON")
+    claude_mixed.add_argument("--opencode-visible-registry", required=True, help="OpenCode visible worker registry JSON")
+    claude_mixed.add_argument("--done-smoke", required=True, help="task directory with non-empty report.md and .done")
+    claude_mixed.add_argument("--blocked-smoke", required=True, help="task directory with non-empty report.md and .blocked")
+    claude_mixed.add_argument("--fail-smoke", required=True, help="task directory with non-empty report.md and .fail")
+    claude_mixed.add_argument("--execution-mode", default="no-live", choices=["no-live", "live"], help="default and only allowed mode is no-live")
+    claude_mixed.add_argument("--runtime-telemetry", help="optional runtime telemetry JSON")
+    claude_mixed.add_argument("--claude-allowed-write-root", action="append", help="candidate Claude write root")
+    claude_mixed.add_argument("--opencode-allowed-write-root", action="append", help="candidate OpenCode write root")
+    claude_mixed.add_argument("--business-repo-writes-requested", action="store_true", help="model a forbidden business repo write request")
+    claude_mixed.add_argument("--cursor-requested", action="store_true", help="model a forbidden Cursor request")
+    claude_mixed.add_argument("--fixture-only", action="store_true", help="skip live registry validation for local fixture files")
+    claude_mixed.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    claude_mixed.set_defaults(func=cmd_claude_mixed_readiness_check)
+
+    claude_mixed_fixture = subparsers.add_parser(
+        "claude-mixed-readiness-fixture-check",
+        help="evaluate a fixture-only registered Claude mixed-ready candidate",
+    )
+    claude_mixed_fixture.add_argument("--fixture", required=True, help="Claude mixed-readiness fixture directory")
+    claude_mixed_fixture.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    claude_mixed_fixture.set_defaults(func=cmd_claude_mixed_readiness_fixture_check)
+
+    opencode_mixed = subparsers.add_parser(
+        "opencode-mixed-readiness-check",
+        help="evaluate an OpenCode mixed-ready candidate without live calls or registry writes",
+    )
+    opencode_mixed.add_argument("--root", type=repo_root, default=runtime_root(), help="runtime or source root")
+    opencode_mixed.add_argument("--worker-id", required=True, help="OpenCode visible worker id")
+    opencode_mixed.add_argument("--opencode-visible-registry", required=True, help="OpenCode visible worker registry JSON")
+    opencode_mixed.add_argument("--registered-worker-registry", required=True, help="registered worker registry JSON")
+    opencode_mixed.add_argument("--done-smoke", required=True, help="task directory with non-empty report.md and .done")
+    opencode_mixed.add_argument("--blocked-smoke", required=True, help="task directory with non-empty report.md and .blocked")
+    opencode_mixed.add_argument("--fail-smoke", required=True, help="task directory with non-empty report.md and .fail")
+    opencode_mixed.add_argument("--lock-evidence", required=True, help="worker-scoped lock evidence JSON")
+    opencode_mixed.add_argument("--settle-evidence", required=True, help="worker-scoped settle evidence JSON")
+    opencode_mixed.add_argument("--execution-mode", default="no-live", choices=["no-live", "live"], help="default and only allowed mode is no-live")
+    opencode_mixed.add_argument("--runtime-telemetry", help="optional runtime telemetry JSON")
+    opencode_mixed.add_argument("--opencode-allowed-write-root", action="append", help="candidate OpenCode write root")
+    opencode_mixed.add_argument("--claude-allowed-write-root", action="append", help="candidate Claude write root")
+    opencode_mixed.add_argument("--business-repo-writes-requested", action="store_true", help="model a forbidden business repo write request")
+    opencode_mixed.add_argument("--cursor-requested", action="store_true", help="model a forbidden Cursor request")
+    opencode_mixed.add_argument("--fixture-only", action="store_true", help="skip live registry validation for local fixture files")
+    opencode_mixed.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    opencode_mixed.set_defaults(func=cmd_opencode_mixed_readiness_check)
+
+    opencode_mixed_fixture = subparsers.add_parser(
+        "opencode-mixed-readiness-fixture-check",
+        help="evaluate a fixture-only OpenCode mixed-ready candidate",
+    )
+    opencode_mixed_fixture.add_argument("--fixture", required=True, help="OpenCode mixed-readiness fixture directory")
+    opencode_mixed_fixture.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    opencode_mixed_fixture.set_defaults(func=cmd_opencode_mixed_readiness_fixture_check)
+
+    opencode_mixed_status = subparsers.add_parser(
+        "opencode-mixed-status",
+        help="summarize current OpenCode mixed-readiness evidence status without live calls",
+    )
+    opencode_mixed_status.add_argument("scope", nargs="?", default="current", choices=["current"], help="status scope alias")
+    opencode_mixed_status.add_argument("root_arg", nargs="?", help="runtime or source root")
+    opencode_mixed_status.add_argument("--root", type=repo_root, default=runtime_root(), help="runtime or source root")
+    opencode_mixed_status.add_argument("--worker-id", default="", help="OpenCode visible worker id")
+    opencode_mixed_status.add_argument("--opencode-visible-registry", default="", help="OpenCode visible worker registry JSON")
+    opencode_mixed_status.add_argument("--registered-worker-registry", default="", help="registered worker registry JSON")
+    opencode_mixed_status.add_argument("--all-workers", action="store_true", help="summarize all OpenCode workers")
+    opencode_mixed_status.add_argument("--execution-mode", default="no-live", choices=["no-live", "live"], help="default and only allowed mode is no-live")
+    opencode_mixed_status.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    opencode_mixed_status.set_defaults(func=cmd_opencode_mixed_status)
+
+    opencode_mixed_status_fixture = subparsers.add_parser(
+        "opencode-mixed-status-fixture",
+        help="summarize a fixture-only OpenCode mixed-readiness status scenario",
+    )
+    opencode_mixed_status_fixture.add_argument("fixture", nargs="?", default="current-blocked", help="fixture name or directory")
+    opencode_mixed_status_fixture.add_argument("--fixture", dest="fixture_path", help="fixture directory")
+    opencode_mixed_status_fixture.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    opencode_mixed_status_fixture.set_defaults(func=cmd_opencode_mixed_status_fixture)
+
+    opencode_evidence_plan = subparsers.add_parser(
+        "opencode-mixed-readiness-evidence-plan",
+        help="plan source-only OpenCode mixed-readiness evidence smoke collection without live calls",
+    )
+    opencode_evidence_plan.add_argument("--root", type=repo_root, default=runtime_root(), help="runtime or source root")
+    opencode_evidence_plan.add_argument("--worker-id", required=True, help="OpenCode visible worker id")
+    opencode_evidence_plan.add_argument("--opencode-visible-registry", required=True, help="OpenCode visible worker registry JSON")
+    opencode_evidence_plan.add_argument("--registered-worker-registry", required=True, help="registered worker registry JSON")
+    opencode_evidence_plan.add_argument("--execution-mode", default="no-live", choices=["no-live", "live"], help="default and only allowed mode is no-live")
+    opencode_evidence_plan.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    opencode_evidence_plan.set_defaults(func=cmd_opencode_mixed_readiness_evidence_plan)
+
+    opencode_evidence_fixture_plan = subparsers.add_parser(
+        "opencode-mixed-readiness-evidence-fixture-plan",
+        help="build a fixture-only OpenCode mixed-readiness evidence smoke plan",
+    )
+    opencode_evidence_fixture_plan.add_argument("--fixture", required=True, help="OpenCode evidence smoke fixture directory")
+    opencode_evidence_fixture_plan.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    opencode_evidence_fixture_plan.set_defaults(func=cmd_opencode_mixed_readiness_evidence_fixture_plan)
+
+    opencode_evidence_validate = subparsers.add_parser(
+        "validate-opencode-mixed-readiness-evidence",
+        help="validate source-only OpenCode mixed-readiness evidence without live calls",
+    )
+    opencode_evidence_validate.add_argument("--evidence", required=True, help="OpenCode mixed-readiness evidence JSON")
+    opencode_evidence_validate.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    opencode_evidence_validate.set_defaults(func=cmd_validate_opencode_mixed_readiness_evidence)
+
+    opencode_evidence_execution_plan = subparsers.add_parser(
+        "opencode-mixed-readiness-evidence-execution-plan",
+        help="plan future OpenCode evidence smoke execution without live calls or worker touches",
+    )
+    opencode_evidence_execution_plan.add_argument("--root", type=repo_root, default=runtime_root(), help="runtime or source root")
+    opencode_evidence_execution_plan.add_argument("--worker-id", required=True, help="OpenCode visible worker id")
+    opencode_evidence_execution_plan.add_argument("--opencode-visible-registry", required=True, help="OpenCode visible worker registry JSON")
+    opencode_evidence_execution_plan.add_argument("--registered-worker-registry", required=True, help="registered worker registry JSON")
+    opencode_evidence_execution_plan.add_argument("--execution-mode", default="no-live", choices=["no-live", "live"], help="default and only allowed mode is no-live")
+    opencode_evidence_execution_plan.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    opencode_evidence_execution_plan.set_defaults(func=cmd_opencode_mixed_readiness_evidence_execution_plan)
+
+    opencode_evidence_execution_fixture_plan = subparsers.add_parser(
+        "opencode-mixed-readiness-evidence-execution-fixture-plan",
+        help="build a fixture-only OpenCode evidence execution plan",
+    )
+    opencode_evidence_execution_fixture_plan.add_argument("--fixture", required=True, help="OpenCode evidence execution fixture directory")
+    opencode_evidence_execution_fixture_plan.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    opencode_evidence_execution_fixture_plan.set_defaults(func=cmd_opencode_mixed_readiness_evidence_execution_fixture_plan)
+
+    opencode_evidence_execution_validate = subparsers.add_parser(
+        "validate-opencode-mixed-readiness-evidence-execution-plan",
+        help="validate a source-only OpenCode evidence execution plan without live calls",
+    )
+    opencode_evidence_execution_validate.add_argument("--plan", required=True, help="OpenCode evidence execution plan JSON")
+    opencode_evidence_execution_validate.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    opencode_evidence_execution_validate.set_defaults(func=cmd_validate_opencode_mixed_readiness_evidence_execution_plan)
+
+    opencode_authorization_plan = subparsers.add_parser(
+        "opencode-evidence-authorization-plan",
+        help="plan a no-execution OpenCode evidence authorization package without writing files",
+    )
+    opencode_authorization_plan.add_argument("--root", type=repo_root, default=runtime_root(), help="runtime or source root")
+    opencode_authorization_plan.add_argument("--worker-id", required=True, help="OpenCode visible worker id")
+    opencode_authorization_plan.add_argument("--opencode-visible-registry", required=True, help="OpenCode visible worker registry JSON")
+    opencode_authorization_plan.add_argument("--registered-worker-registry", required=True, help="registered worker registry JSON")
+    opencode_authorization_plan.add_argument("--execution-mode", default="no-live", choices=["no-live", "live"], help="default and only allowed mode is no-live")
+    opencode_authorization_plan.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    opencode_authorization_plan.set_defaults(func=cmd_opencode_evidence_authorization_plan)
+
+    opencode_authorization_build = subparsers.add_parser(
+        "build-opencode-evidence-authorization-package",
+        help="write a no-execution OpenCode evidence authorization package artifact",
+    )
+    opencode_authorization_build.add_argument("--root", type=repo_root, default=runtime_root(), help="runtime or source root")
+    opencode_authorization_build.add_argument("--worker-id", required=True, help="OpenCode visible worker id")
+    opencode_authorization_build.add_argument("--opencode-visible-registry", required=True, help="OpenCode visible worker registry JSON")
+    opencode_authorization_build.add_argument("--registered-worker-registry", required=True, help="registered worker registry JSON")
+    opencode_authorization_build.add_argument("--output-dir", required=True, help="authorization package output directory")
+    opencode_authorization_build.add_argument("--execution-mode", default="no-live", choices=["no-live", "live"], help="default and only allowed mode is no-live")
+    opencode_authorization_build.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    opencode_authorization_build.set_defaults(func=cmd_build_opencode_evidence_authorization_package)
+
+    opencode_authorization_validate = subparsers.add_parser(
+        "validate-opencode-evidence-authorization-package",
+        help="validate a no-execution OpenCode evidence authorization package",
+    )
+    opencode_authorization_validate.add_argument("--package", required=True, help="authorization package JSON")
+    opencode_authorization_validate.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    opencode_authorization_validate.set_defaults(func=cmd_validate_opencode_evidence_authorization_package)
+
+    opencode_authorization_fixture = subparsers.add_parser(
+        "opencode-evidence-authorization-fixture-plan",
+        help="build a fixture-only OpenCode evidence authorization package plan",
+    )
+    opencode_authorization_fixture.add_argument("--fixture", required=True, help="OpenCode evidence authorization fixture directory")
+    opencode_authorization_fixture.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    opencode_authorization_fixture.set_defaults(func=cmd_opencode_evidence_authorization_fixture_plan)
+
+    opencode_runner_plan = subparsers.add_parser(
+        "opencode-evidence-runner-plan",
+        help="derive a source-only OpenCode evidence runner plan from a reviewed authorization package",
+    )
+    opencode_runner_plan.add_argument("--package", required=True, help="authorization package JSON")
+    opencode_runner_plan.add_argument("--root", type=repo_root, default=runtime_root(), help="runtime root shown in the dry-run dispatch plan")
+    opencode_runner_plan.add_argument("--target-worker-id", "--target-worker", dest="target_worker_id", default="", help="optional expected target worker id")
+    opencode_runner_plan.add_argument("--execution-mode", default="no-live", choices=["no-live", "live"], help="default and only allowed mode is no-live")
+    opencode_runner_plan.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    opencode_runner_plan.set_defaults(func=cmd_opencode_evidence_runner_plan)
+
+    opencode_runner_fixture = subparsers.add_parser(
+        "opencode-evidence-runner-fixture-plan",
+        help="build a fixture-only OpenCode evidence runner plan",
+    )
+    opencode_runner_fixture.add_argument("--fixture", required=True, help="OpenCode evidence runner fixture directory")
+    opencode_runner_fixture.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    opencode_runner_fixture.set_defaults(func=cmd_opencode_evidence_runner_fixture_plan)
+
+    opencode_runner_validate = subparsers.add_parser(
+        "validate-opencode-evidence-runner-plan",
+        help="validate a source-only OpenCode evidence runner plan without live calls",
+    )
+    opencode_runner_validate.add_argument("--plan", required=True, help="OpenCode evidence runner plan JSON")
+    opencode_runner_validate.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    opencode_runner_validate.set_defaults(func=cmd_validate_opencode_evidence_runner_plan)
+
+    opencode_runner_execute = subparsers.add_parser(
+        "execute-opencode-evidence-runner-package",
+        help="execute an explicitly authorized OpenCode evidence package through visible dispatch only",
+    )
+    opencode_runner_execute.add_argument("--package", required=True, help="authorization package JSON")
+    opencode_runner_execute.add_argument("--root", type=repo_root, default=runtime_root(), help="runtime root")
+    opencode_runner_execute.add_argument("--target-worker-id", "--target-worker", dest="target_worker_id", required=True, help="must match the package target worker")
+    opencode_runner_execute.add_argument("--timeout", type=int, default=180, help="timeout per terminal smoke")
+    opencode_runner_execute.add_argument("--dispatch-bin", default="", help="override omx_visible_dispatch path for tests")
+    opencode_runner_execute.add_argument("--adapter-bin", default="", help="override omx_opencode_tui_adapter path for tests")
+    opencode_runner_execute.add_argument("--watcher-bin", default="", help="override omx_visible_watcher path for tests")
+    opencode_runner_execute.add_argument("--allow-live-evidence", action="store_true", help="required; executes target-only evidence smokes")
+    opencode_runner_execute.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    opencode_runner_execute.set_defaults(func=cmd_execute_opencode_evidence_runner_package)
+
+    opencode_identity = subparsers.add_parser(
+        "opencode-worker-identity-diagnose",
+        help="diagnose OpenCode visible worker pane/process/port identity without live submit or registry writes",
+    )
+    opencode_identity.add_argument("--root", type=repo_root, default=runtime_root(), help="runtime root")
+    opencode_identity.add_argument("--worker-id", required=True, help="OpenCode visible worker id")
+    opencode_identity.add_argument("--opencode-visible-registry", required=True, help="OpenCode visible worker registry JSON")
+    opencode_identity.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    opencode_identity.set_defaults(func=cmd_opencode_worker_identity_diagnose)
+
+    opencode_identity_fixture = subparsers.add_parser(
+        "opencode-worker-identity-fixture-diagnose",
+        help="diagnose fixture-only OpenCode visible worker identity without live calls",
+    )
+    opencode_identity_fixture.add_argument("--fixture", required=True, help="OpenCode worker identity fixture directory")
+    opencode_identity_fixture.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    opencode_identity_fixture.set_defaults(func=cmd_opencode_worker_identity_fixture_diagnose)
+
+    def add_opencode_binding_update_args(sub: argparse.ArgumentParser, *, write: bool) -> None:
+        sub.add_argument("--fixture", help="binding update fixture directory; reads binding-input.json instead of live readonly commands")
+        sub.add_argument("--root", type=Path, default=runtime_root(), help="runtime, source, fixture, or temp root")
+        sub.add_argument("--worker-id", required=True, help="OpenCode visible worker id")
+        sub.add_argument("--opencode-visible-registry", required=True, help="OpenCode visible worker registry JSON")
+        sub.add_argument("--target-pane", required=True, help="target tmux pane id, for example %%7")
+        sub.add_argument("--target-port", required=True, type=int, help="target OpenCode TUI port")
+        sub.add_argument("--propose-default-for-new-tasks", action="store_true", help="test-only forbidden proposed default_for_new_tasks=true")
+        sub.add_argument("--propose-mixed-ready", action="store_true", help="test-only forbidden proposed mixed_ready=true")
+        sub.add_argument(
+            "--allow-framework-registry",
+            action="store_true",
+            help="allow the exact <root>/.omx/framework/team/opencode_visible_workers.json registry path",
+        )
+        if write:
+            sub.add_argument("--allow-binding-update", action="store_true", help="explicitly allow this binding-only registry write")
+        sub.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+
+    opencode_binding_plan = subparsers.add_parser(
+        "opencode-visible-binding-update-plan",
+        help="plan a binding-only OpenCode visible registry update without writing files",
+    )
+    add_opencode_binding_update_args(opencode_binding_plan, write=False)
+    opencode_binding_plan.set_defaults(func=cmd_opencode_visible_binding_update_plan)
+
+    opencode_binding_update = subparsers.add_parser(
+        "opencode-visible-binding-update",
+        help="write a binding-only OpenCode visible registry update with explicit allow flags",
+    )
+    add_opencode_binding_update_args(opencode_binding_update, write=True)
+    opencode_binding_update.set_defaults(func=cmd_opencode_visible_binding_update)
+
+    opencode_binding_validate = subparsers.add_parser(
+        "validate-opencode-visible-binding-update",
+        help="validate an OpenCode visible binding update plan",
+    )
+    opencode_binding_validate.add_argument("--root", type=repo_root, default=runtime_root(), help="repository root")
+    opencode_binding_validate.add_argument("--update", required=True, help="binding update plan JSON")
+    opencode_binding_validate.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    opencode_binding_validate.set_defaults(func=cmd_validate_opencode_visible_binding_update)
+
+    def add_opencode_worker_disable_args(sub: argparse.ArgumentParser, *, write: bool) -> None:
+        sub.add_argument("--root", type=Path, default=runtime_root(), help="runtime, source, fixture, or temp root")
+        sub.add_argument("--worker-id", required=True, help="OpenCode visible worker id")
+        sub.add_argument("--opencode-visible-registry", required=True, help="OpenCode visible worker registry JSON")
+        sub.add_argument("--rebind-check", required=True, help="binding_failed rmux/tmux rebind-check JSON evidence")
+        sub.add_argument("--proposed-status", default="stale_binding_disabled", help="replacement worker status after disable")
+        sub.add_argument(
+            "--allow-framework-registry",
+            action="store_true",
+            help="allow the exact <root>/.omx/framework/team/opencode_visible_workers.json registry path",
+        )
+        if write:
+            sub.add_argument("--allow-worker-disable", action="store_true", help="explicitly allow this disable-only registry write")
+        sub.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+
+    opencode_worker_disable_plan = subparsers.add_parser(
+        "opencode-visible-worker-disable-plan",
+        help="plan a disable-only OpenCode visible registry update for a stale non-default worker",
+    )
+    add_opencode_worker_disable_args(opencode_worker_disable_plan, write=False)
+    opencode_worker_disable_plan.set_defaults(func=cmd_opencode_visible_worker_disable_plan)
+
+    opencode_worker_disable = subparsers.add_parser(
+        "opencode-visible-worker-disable",
+        help="write a disable-only OpenCode visible registry update with explicit allow flags",
+    )
+    add_opencode_worker_disable_args(opencode_worker_disable, write=True)
+    opencode_worker_disable.set_defaults(func=cmd_opencode_visible_worker_disable)
+
+    opencode_worker_disable_validate = subparsers.add_parser(
+        "validate-opencode-visible-worker-disable",
+        help="validate an OpenCode visible worker disable plan",
+    )
+    opencode_worker_disable_validate.add_argument("--root", type=repo_root, default=runtime_root(), help="repository root")
+    opencode_worker_disable_validate.add_argument("--update", required=True, help="disable plan JSON")
+    opencode_worker_disable_validate.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    opencode_worker_disable_validate.set_defaults(func=cmd_validate_opencode_visible_worker_disable)
+
+    def add_opencode_worker_enable_args(sub: argparse.ArgumentParser, *, write: bool) -> None:
+        sub.add_argument("--root", type=Path, default=runtime_root(), help="runtime, source, fixture, or temp root")
+        sub.add_argument("--worker-id", required=True, help="OpenCode visible worker id")
+        sub.add_argument("--opencode-visible-registry", required=True, help="OpenCode visible worker registry JSON")
+        sub.add_argument("--rebind-check", required=True, help="current_binding_ok rmux/tmux rebind-check JSON evidence")
+        sub.add_argument("--proposed-status", default="ok", help="replacement worker status after enable")
+        sub.add_argument(
+            "--allow-framework-registry",
+            action="store_true",
+            help="allow the exact <root>/.omx/framework/team/opencode_visible_workers.json registry path",
+        )
+        if write:
+            sub.add_argument("--allow-worker-enable", action="store_true", help="explicitly allow this enable-only registry write")
+        sub.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+
+    opencode_worker_enable_plan = subparsers.add_parser(
+        "opencode-visible-worker-enable-plan",
+        help="plan an enable-only OpenCode visible registry update for a recovered non-default worker",
+    )
+    add_opencode_worker_enable_args(opencode_worker_enable_plan, write=False)
+    opencode_worker_enable_plan.set_defaults(func=cmd_opencode_visible_worker_enable_plan)
+
+    opencode_worker_enable = subparsers.add_parser(
+        "opencode-visible-worker-enable",
+        help="write an enable-only OpenCode visible registry update with explicit allow flags",
+    )
+    add_opencode_worker_enable_args(opencode_worker_enable, write=True)
+    opencode_worker_enable.set_defaults(func=cmd_opencode_visible_worker_enable)
+
+    opencode_worker_enable_validate = subparsers.add_parser(
+        "validate-opencode-visible-worker-enable",
+        help="validate an OpenCode visible worker enable plan",
+    )
+    opencode_worker_enable_validate.add_argument("--root", type=repo_root, default=runtime_root(), help="repository root")
+    opencode_worker_enable_validate.add_argument("--update", required=True, help="enable plan JSON")
+    opencode_worker_enable_validate.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    opencode_worker_enable_validate.set_defaults(func=cmd_validate_opencode_visible_worker_enable)
+
+    def add_opencode_mixed_ready_update_args(sub: argparse.ArgumentParser, *, write: bool) -> None:
+        sub.add_argument("--root", type=Path, default=runtime_root(), help="runtime, source, fixture, or temp root")
+        sub.add_argument("--worker-id", required=True, help="OpenCode visible worker id")
+        sub.add_argument("--opencode-visible-registry", required=True, help="OpenCode visible worker registry JSON")
+        sub.add_argument("--evidence", required=True, help="validated OpenCode mixed-readiness evidence JSON")
+        sub.add_argument("--propose-business-ready", action="store_true", help="test-only forbidden proposed business_ready=true")
+        sub.add_argument(
+            "--propose-allow-business-repo-writes",
+            action="store_true",
+            help="test-only forbidden proposed allow_business_repo_writes=true",
+        )
+        sub.add_argument("--propose-binding-change", action="store_true", help="test-only forbidden proposed pane binding change")
+        sub.add_argument("--propose-default-for-new-tasks", action="store_true", help="test-only forbidden proposed default worker change")
+        sub.add_argument(
+            "--allow-framework-registry",
+            action="store_true",
+            help="allow the exact <root>/.omx/framework/team/opencode_visible_workers.json registry path",
+        )
+        if write:
+            sub.add_argument("--allow-opencode-mixed-ready-update", action="store_true", help="explicitly allow this no-live mixed-ready registry write")
+        sub.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+
+    opencode_mixed_ready_plan = subparsers.add_parser(
+        "opencode-mixed-ready-update-plan",
+        help="plan a no-live OpenCode mixed_ready registry update without writing files",
+    )
+    add_opencode_mixed_ready_update_args(opencode_mixed_ready_plan, write=False)
+    opencode_mixed_ready_plan.set_defaults(func=cmd_opencode_mixed_ready_update_plan)
+
+    opencode_mixed_ready_update = subparsers.add_parser(
+        "opencode-mixed-ready-update",
+        help="write a no-live OpenCode mixed_ready registry update with explicit allow flags",
+    )
+    add_opencode_mixed_ready_update_args(opencode_mixed_ready_update, write=True)
+    opencode_mixed_ready_update.set_defaults(func=cmd_opencode_mixed_ready_update)
+
+    opencode_mixed_ready_validate = subparsers.add_parser(
+        "validate-opencode-mixed-ready-registry-update",
+        help="validate an OpenCode mixed-ready registry update plan or result",
+    )
+    opencode_mixed_ready_validate.add_argument("--root", type=repo_root, default=runtime_root(), help="repository root")
+    opencode_mixed_ready_validate.add_argument("--update-result", required=True, help="OpenCode mixed-ready update plan/result JSON")
+    opencode_mixed_ready_validate.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    opencode_mixed_ready_validate.set_defaults(func=cmd_validate_opencode_mixed_ready_registry_update)
+
+    def add_mixed_ready_update_args(sub: argparse.ArgumentParser, *, write: bool) -> None:
+        sub.add_argument("--fixture", help="mixed-ready update fixture directory")
+        sub.add_argument("--root", type=Path, default=runtime_root(), help="runtime, source, fixture, or temp root")
+        sub.add_argument("--worker-id", default="", help="registered Claude worker id")
+        sub.add_argument("--registered-worker-registry", default="", help="registered worker registry JSON")
+        sub.add_argument("--opencode-visible-registry", default="", help="OpenCode visible worker registry JSON")
+        sub.add_argument("--done-smoke", default="", help="task directory with non-empty report.md and .done")
+        sub.add_argument("--blocked-smoke", default="", help="task directory with non-empty report.md and .blocked")
+        sub.add_argument("--fail-smoke", default="", help="task directory with non-empty report.md and .fail")
+        sub.add_argument("--execution-mode", default="no-live", choices=["no-live", "live"], help="default and only allowed mode is no-live")
+        sub.add_argument("--runtime-telemetry", help="optional runtime telemetry JSON")
+        sub.add_argument("--claude-allowed-write-root", action="append", help="candidate Claude write root")
+        sub.add_argument("--opencode-allowed-write-root", action="append", help="candidate OpenCode write root")
+        sub.add_argument("--business-repo-writes-requested", action="store_true", help="model a forbidden business repo write request")
+        sub.add_argument("--cursor-requested", action="store_true", help="model a forbidden Cursor request")
+        sub.add_argument("--fixture-only", action="store_true", help="skip live registry validation for local fixture files")
+        sub.add_argument(
+            "--allow-framework-registry",
+            action="store_true",
+            help="allow the explicit <root>/.omx/framework/team/registered-workers registry root",
+        )
+        sub.add_argument("--propose-business-ready", action="store_true", help="test-only forbidden proposed business_ready=true")
+        sub.add_argument(
+            "--propose-allow-business-repo-writes",
+            action="store_true",
+            help="test-only forbidden proposed allow_business_repo_writes=true",
+        )
+        if write:
+            sub.add_argument("--allow-mixed-ready-update", action="store_true", help="explicitly allow this local mixed-ready registry write")
+        sub.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+
+    mixed_ready_plan = subparsers.add_parser(
+        "claude-mixed-ready-update-plan",
+        help="plan a source-only Claude mixed_ready registry update without writing files",
+    )
+    add_mixed_ready_update_args(mixed_ready_plan, write=False)
+    mixed_ready_plan.set_defaults(func=cmd_claude_mixed_ready_update_plan)
+
+    mixed_ready_update = subparsers.add_parser(
+        "claude-mixed-ready-update",
+        help="write a Claude mixed_ready registry update with explicit allow flags",
+    )
+    add_mixed_ready_update_args(mixed_ready_update, write=True)
+    mixed_ready_update.set_defaults(func=cmd_claude_mixed_ready_update)
+
+    mixed_ready_validate = subparsers.add_parser(
+        "validate-mixed-ready-registry-update",
+        help="validate a mixed-ready registry update record",
+    )
+    mixed_ready_validate.add_argument("--root", type=repo_root, default=runtime_root(), help="repository root")
+    mixed_ready_validate.add_argument("--update", required=True, help="mixed-ready update JSON")
+    mixed_ready_validate.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    mixed_ready_validate.set_defaults(func=cmd_validate_mixed_ready_registry_update)
+
+    plan = subparsers.add_parser("plan", help="build a fixture-only task plan from a contract")
+    add_backend_args(plan)
+    plan.add_argument("--contract", required=True, help="fixture contract JSON")
+    plan.set_defaults(func=cmd_plan)
+
+    validate = subparsers.add_parser("validate-result", help="validate fixture result protocol evidence")
+    add_backend_args(validate)
+    validate.add_argument("--contract", required=True, help="fixture contract JSON")
+    validate.add_argument("--result", required=True, help="fixture result JSON")
+    validate.set_defaults(func=cmd_validate_result)
+
+    for name, handler, help_text in (
+        ("resolve", cmd_resolve, "resolve one fixture worker"),
+        ("verify", cmd_verify, "verify one fixture worker"),
+        ("readiness", cmd_readiness, "read fixture readiness telemetry"),
+        ("submit-plan", cmd_submit_plan, "build a non-mutating submit plan"),
+    ):
+        sub = subparsers.add_parser(name, help=help_text)
+        add_backend_args(sub, worker=True)
+        sub.set_defaults(func=handler)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return args.func(args)
+    except RuntimeAdapterError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

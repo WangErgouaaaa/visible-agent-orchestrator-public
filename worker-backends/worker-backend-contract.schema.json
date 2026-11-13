@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "visible-agent-orchestrator worker backend fixture contract",
+  "type": "object",
+  "required": ["schema_version", "backend", "agent_kind", "fixture_only", "live_enabled", "workers"],
+  "properties": {
+    "schema_version": {"type": "integer", "const": 1},
+    "backend": {
+      "type": "string",
+      "enum": ["claude-code-fixture", "cursor-agent-fixture"]
+    },
+    "agent_kind": {
+      "type": "string",
+      "enum": ["claude-code", "cursor-agent"]
+    },
+    "fixture_only": {"type": "boolean", "const": true},
+    "live_enabled": {"type": "boolean", "const": false},
+    "workers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["worker_id", "role", "readiness", "runtime_backend", "dispatch_adapter"],
+        "properties": {
+          "worker_id": {"type": "string"},
+          "role": {"type": "string"},
+          "readiness": {"type": "string", "enum": ["unknown", "fixture-ready", "fixture-blocked"]},
+          "runtime_backend": {"type": "string"},
+          "dispatch_adapter": {"type": "string"},
+          "receipt_protocol": {"type": "string"},
+          "default_for_new_tasks": {"type": "boolean"},
+          "capabilities": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["name", "supported"],
+              "properties": {
+                "name": {"type": "string"},
+                "supported": {"type": "boolean"},
+                "detail": {"type": "string"}
+              },
+              "additionalProperties": false
+            }
+          },
+          "warnings": {"type": "array", "items": {"type": "string"}},
+          "errors": {"type": "array", "items": {"type": "string"}}
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "additionalProperties": true
+}

@@ -1,0 +1,201 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OpenCode Runtime-Proof Runner Plan",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "plan_kind",
+    "runner_plan_id",
+    "source_package_id",
+    "source_package_path",
+    "source_package_sha256",
+    "source_package_manifest_snapshot_sha256",
+    "source_package",
+    "source_package_validation",
+    "source_package_target_worker_id",
+    "target_worker_id",
+    "dispatch_target_worker_id",
+    "backend_kind",
+    "execution_mode",
+    "approved_invocation",
+    "planned_artifacts",
+    "allowed_write_roots",
+    "preflight_gates",
+    "future_execution_order",
+    "validation_requirements",
+    "postcheck_requirements",
+    "forbidden_paths",
+    "would_execute_opencode",
+    "would_execute_live",
+    "would_touch_worker",
+    "would_create_artifacts",
+    "would_write_live_config",
+    "would_write_task_local",
+    "would_write_registry",
+    "would_write_state_team",
+    "safe_next_actions",
+    "forbidden_next_actions",
+    "blocked_reasons",
+    "warnings",
+    "validation",
+    "advisory"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "plan_kind": { "const": "opencode-runtime-proof-runner-plan" },
+    "runner_plan_id": { "type": "string" },
+    "source_package_id": { "type": "string" },
+    "source_package_path": { "type": "string" },
+    "source_package_sha256": { "type": "string" },
+    "source_package_manifest_snapshot_sha256": { "type": "string" },
+    "source_package": {
+      "type": "object",
+      "required": [
+        "package_kind",
+        "package_id",
+        "manifest_snapshot_sha256",
+        "approval_record",
+        "disposable_artifacts"
+      ],
+      "properties": {
+        "package_kind": { "const": "opencode-runtime-proof-authorization-package" },
+        "package_id": { "type": "string" },
+        "manifest_snapshot_sha256": { "type": "string" },
+        "approval_record": { "type": "object" },
+        "disposable_artifacts": { "type": "object" }
+      },
+      "additionalProperties": true
+    },
+    "source_package_validation": { "type": "object" },
+    "source_package_target_worker_id": { "type": "string" },
+    "target_worker_id": { "type": "string" },
+    "dispatch_target_worker_id": { "type": "string" },
+    "backend_kind": { "const": "opencode_tui" },
+    "execution_mode": { "const": "no-execution" },
+    "approved_invocation": {
+      "type": "object",
+      "required": [
+        "backend_kind",
+        "target_worker_id",
+        "approved_argv",
+        "approved_env",
+        "unset_env",
+        "approved_write_roots",
+        "timebox_seconds",
+        "attempt_limit",
+        "single_attempt_only",
+        "no_retry",
+        "required_stop_conditions"
+      ],
+      "properties": {
+        "backend_kind": { "const": "opencode_tui" },
+        "target_worker_id": { "type": "string" },
+        "approved_argv": { "type": "array", "items": { "type": "string" } },
+        "approved_env": { "type": "object" },
+        "unset_env": { "type": "array", "items": { "type": "string" } },
+        "approved_write_roots": { "type": "array", "items": { "type": "string" } },
+        "timebox_seconds": { "type": "integer", "minimum": 1 },
+        "attempt_limit": { "const": 1 },
+        "single_attempt_only": { "const": true },
+        "no_retry": { "const": true },
+        "required_stop_conditions": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": true
+    },
+    "planned_artifacts": {
+      "type": "object",
+      "required": [
+        "temp_root",
+        "xdg_config_home",
+        "config_json_path",
+        "raw_events_jsonl_path",
+        "runtime_log_path",
+        "postcheck_marker_path",
+        "cleanup_receipt_path",
+        "allowed_write_roots",
+        "cleanup_required",
+        "cleanup_scope",
+        "leak_allowed",
+        "task_local_marker_write_allowed"
+      ],
+      "properties": {
+        "temp_root": { "type": "string" },
+        "xdg_config_home": { "type": "string" },
+        "config_json_path": { "type": "string" },
+        "raw_events_jsonl_path": { "type": "string" },
+        "runtime_log_path": { "type": "string" },
+        "postcheck_marker_path": { "type": "string" },
+        "cleanup_receipt_path": { "type": "string" },
+        "allowed_write_roots": { "type": "array", "items": { "type": "string" } },
+        "cleanup_required": { "const": true },
+        "cleanup_scope": { "const": "temp_root_only" },
+        "leak_allowed": { "const": false },
+        "task_local_marker_write_allowed": { "const": false }
+      },
+      "additionalProperties": true
+    },
+    "allowed_write_roots": { "type": "array", "items": { "type": "string" } },
+    "preflight_gates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["gate", "required", "fail_closed", "description"],
+        "properties": {
+          "gate": { "type": "string" },
+          "required": { "const": true },
+          "fail_closed": { "const": true },
+          "description": { "type": "string" }
+        },
+        "additionalProperties": true
+      }
+    },
+    "future_execution_order": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["step", "future_only", "description"],
+        "properties": {
+          "step": { "type": "string" },
+          "future_only": { "const": true },
+          "description": { "type": "string" }
+        },
+        "additionalProperties": true
+      }
+    },
+    "validation_requirements": { "type": "object" },
+    "postcheck_requirements": {
+      "type": "object",
+      "required": [
+        "cleanup_proof_required",
+        "report_md_plus_exactly_one_terminal_marker",
+        "source_package_hash_must_match",
+        "target_worker_must_match_approval",
+        "no_retry_after_attempt"
+      ],
+      "properties": {
+        "cleanup_proof_required": { "const": true },
+        "report_md_plus_exactly_one_terminal_marker": { "const": true },
+        "source_package_hash_must_match": { "const": true },
+        "target_worker_must_match_approval": { "const": true },
+        "no_retry_after_attempt": { "const": true }
+      },
+      "additionalProperties": true
+    },
+    "forbidden_paths": { "type": "array", "items": { "type": "string" } },
+    "would_execute_opencode": { "const": false },
+    "would_execute_live": { "const": false },
+    "would_touch_worker": { "const": false },
+    "would_create_artifacts": { "const": false },
+    "would_write_live_config": { "const": false },
+    "would_write_task_local": { "const": false },
+    "would_write_registry": { "const": false },
+    "would_write_state_team": { "const": false },
+    "safe_next_actions": { "type": "array", "items": { "type": "string" } },
+    "forbidden_next_actions": { "type": "array", "items": { "type": "string" } },
+    "blocked_reasons": { "type": "array", "items": { "type": "string" } },
+    "warnings": { "type": "array", "items": { "type": "string" } },
+    "validation": { "type": "object" },
+    "advisory": { "type": "string" }
+  },
+  "additionalProperties": true
+}

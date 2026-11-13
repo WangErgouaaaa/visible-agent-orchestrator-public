@@ -1,0 +1,148 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Worker Authorization Profile",
+  "type": "object",
+  "required": [
+    "profile_id",
+    "profile_version",
+    "profile_kind",
+    "description",
+    "allowed_workers",
+    "required_workers",
+    "allowed_worker_backends",
+    "allowed_task_kinds",
+    "allowed_scenarios",
+    "max_parallel",
+    "wave_model",
+    "allowed_write_roots",
+    "forbidden_write_roots",
+    "allowed_registry_updates",
+    "forbidden_registry_updates",
+    "business_ready_required",
+    "business_repo_writes_allowed",
+    "live_allowed",
+    "live_requires_explicit_allow",
+    "max_live_attempts",
+    "retry_policy",
+    "worker_switch_allowed",
+    "raw_tmux_allowed",
+    "direct_tui_allowed",
+    "direct_adapter_allowed",
+    "rmux_allowed",
+    "business_task_allowed",
+    "required_preflight_checks",
+    "required_post_checks",
+    "required_result_validation",
+    "required_terminal_truth",
+    "ttl_hours",
+    "stop_conditions",
+    "final_report_requirements"
+  ],
+  "properties": {
+    "profile_id": {
+      "type": "string"
+    },
+    "profile_version": {
+      "type": "integer"
+    },
+    "profile_kind": {
+      "type": "string",
+      "enum": [
+        "business_readonly_review",
+        "business_scoped_write"
+      ]
+    },
+    "description": {
+      "type": "string"
+    },
+    "allowed_workers": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "required_workers": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "allowed_worker_backends": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "allowed_task_kinds": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "allowed_scenarios": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "max_parallel": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "wave_model": {
+      "type": "string"
+    },
+    "waves": {
+      "type": "array"
+    },
+    "allowed_write_roots": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "allowed_read_roots": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "forbidden_write_roots": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "retry_policy": {
+      "type": "object"
+    },
+    "enabled": {
+      "type": "boolean"
+    },
+    "allowed_commands": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "forbidden_commands": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "required_outputs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "write_scope_contract_fields": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "additionalProperties": true
+}

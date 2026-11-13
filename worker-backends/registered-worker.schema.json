@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Registered worker record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "backend_kind",
+    "worker_id",
+    "workspace_root",
+    "runtime_backend",
+    "registration_status",
+    "live_enabled",
+    "allow_business_repo_writes",
+    "allow_mixed_worker"
+  ],
+  "properties": {
+    "schema_version": { "type": "integer", "const": 1 },
+    "backend_kind": { "type": "string", "enum": ["claude_code", "cursor_agent", "opencode_tui"] },
+    "worker_id": { "type": "string", "minLength": 1 },
+    "workspace_root": { "type": "string", "minLength": 1 },
+    "runtime_backend": { "type": "string", "minLength": 1 },
+    "runtime_binding_kind": { "type": "string" },
+    "pane_id": { "type": "string" },
+    "pane_pid": { "type": "string" },
+    "process_id": { "type": "string" },
+    "command": { "type": "string" },
+    "port": { "type": "string" },
+    "user_owned_pane": { "type": "boolean", "default": false },
+    "registration_status": {
+      "type": "string",
+      "description": "Inventory status only; not current liveness or registration authority."
+    },
+    "live_enabled": { "type": "boolean", "default": false },
+    "allow_business_repo_writes": { "type": "boolean", "default": false },
+    "allow_mixed_worker": { "type": "boolean", "default": false },
+    "authorization_record": { "type": "string" },
+    "live_enable_config": { "type": "string" },
+    "smoke_evidence_path": { "type": "string" },
+    "last_smoke_artifact": { "type": "string" },
+    "worker_label": { "type": "string" },
+    "evidence_package": { "type": "string" },
+    "allowed_write_roots": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "forbidden_paths": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "allow_single_worker_smoke": { "type": "boolean", "default": false },
+    "business_ready": { "type": "boolean", "default": false },
+    "mixed_ready": { "type": "boolean", "default": false },
+    "registered_at": { "type": "string" },
+    "registered_by": { "type": "string" },
+    "explicit_business_repo_write_authorization": { "type": "boolean", "default": false },
+    "registered_single_worker_smoke_evidence": { "type": "boolean", "default": false },
+    "notes": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  }
+}

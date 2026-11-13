@@ -1,0 +1,1407 @@
+#!/usr/bin/env python3
+"""Read-only policy checks for visible OpenCode TUI control.
+
+The checker validates the project-local AGENTS.md managed block and the
+visible worker policy. It does not submit tasks, call OpenCode POST APIs,
+mutate .omx/state/team, or send tmux input.
+"""
+
+from __future__ import annotations
+
+import argparse
+import difflib
+import json
+import os
+import shlex
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+_THIS_FILE = Path(__file__).resolve()
+for _p in ((_THIS_FILE.parent.parent / "src").resolve(), (_THIS_FILE.parent.parent / "lib").resolve()):
+    if _p.exists() and str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
+
+from visible_agent_orchestrator.runtime.backends import available_backends, default_backend_name
+from visible_agent_orchestrator.runtime.tmux_capabilities import command_shape_supported, command_support_report
+from visible_agent_orchestrator.runtime_paths import runtime_root
+
+
+BEGIN = "<!-- OMX_VISIBLE_CONTROL_BEGIN -->"
+END = "<!-- OMX_VISIBLE_CONTROL_END -->"
+POLLUTION_DIRS = {"_framework", "demo-run", "dispatch-demo"}
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def root_path(value: str | None) -> Path:
+    return runtime_root(value)
+
+
+def framework_root(root: Path) -> Path:
+    return root / ".omx" / "framework" / "team"
+
+
+def recovery_root(root: Path) -> Path:
+    return framework_root(root) / "recovery"
+
+
+def team_root(root: Path) -> Path:
+    return root / ".omx" / "state" / "team"
+
+
+def read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def read_json(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def rel(path: Path, root: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(root.resolve()))
+    except Exception:
+        return str(path)
+
+
+def expected_block(worker_id: str, pane_id: str, port: int) -> str:
+    return f"""<!-- OMX_VISIBLE_CONTROL_BEGIN -->
+# OMX visible OpenCode TUI control rules
+
+- The only supported visible OpenCode task entrypoint is:
+  `./bin/omx_visible_dispatch run-one --root . --title "..." --body "..." --timeout <seconds> --session-action keep --session-action-reason same_domain_continuation --allow-real`
+- For step-by-step operation, only use:
+  `./bin/omx_visible_dispatch submit-new`
+  `./bin/omx_visible_dispatch wait`
+  `./bin/omx_visible_dispatch collect`
+  `./bin/omx_visible_dispatch status`
+  `./bin/omx_visible_dispatch doctor`
+- Status/telemetry may use:
+  `./bin/omx_visible_health check --root .`
+  `./bin/omx_visible_watcher once`
+  `./bin/omx_visible_watcher status --root .`
+  `./bin/omx_visible_watcher alerts --root .`
+  `./bin/omx_visible_dispatch status --root .`
+- Status telemetry should prefer:
+  `./bin/omx_visible_health check --root .`
+  `./bin/omx_visible_watcher status --root .`
+  `./bin/omx_visible_watcher alerts --root .`
+  `./bin/omx_visible_dispatch status --root .`
+- Do not use `tmux send-keys`, `tmux paste-buffer`, `C-c`, `exit`, `kill-pane`, `kill-window`, or `kill-session` for task delegation.
+- Do not directly call `./bin/omx_opencode_tui_adapter submit-visible-real` for normal task delegation.
+- Do not directly call `curl` or any HTTP client against `/tui/clear-prompt`, `/tui/append-prompt`, or `/tui/submit-prompt`.
+- Do not submit work to current test/background workers, including `vw1/%40/4201`.
+- The default visible worker comes from the registry/default-worker:
+  `.omx/framework/team/opencode_visible_workers.json`
+- Stable visible worker identity:
+  `{worker_id}`, port `{int(port)}`.
+- The registry may contain a pane snapshot such as `{pane_id}`, but tmux pane ids
+  are runtime-discovered values. Verify with
+  `./bin/omx_visible_rebind check --root . --worker {worker_id}` or
+  `./bin/omx_visible_rebind discover --root . --port {int(port)}` before submit.
+- A task is complete only when `report.md` is non-empty and exactly one of `.done`, `.fail`, or `.blocked` exists.
+- `.submitted` is not `.received`; `idle` is not `completed`; a quiet pane is not proof of completion.
+- If `run-one` fails or times out, use `collect`, `status`, and watcher alerts. Do not blindly press Enter or resubmit while an owner lock is active.
+<!-- OMX_VISIBLE_CONTROL_END -->"""
+
+
+def managed_block(text: str) -> str:
+    start = text.find(BEGIN)
+    end = text.find(END)
+    if start < 0 or end < 0 or end < start:
+        return ""
+    return text[start : end + len(END)]
+
+
+def agents_registry_binding_ok(block: str, worker_id: str, pane_id: str, port: int) -> bool:
+    return (
+        f"`{worker_id}`, port `{int(port)}`." in block
+        and f"pane snapshot such as `{pane_id}`" in block
+    )
+
+
+def prompt_registry_binding_ok(prompt_text: str, worker_id: str, pane_id: str, port: int) -> bool:
+    return (
+        "opencode_visible_workers.json" in prompt_text
+        and f"worker_id: `{worker_id}`" in prompt_text
+        and "pane: runtime-discovered" in prompt_text
+        and f"port: `{int(port)}`" in prompt_text
+    )
+
+
+def run_command(argv: list[str], cwd: Path, timeout: int = 90) -> dict[str, Any]:
+    try:
+        proc = subprocess.run(
+            argv,
+            cwd=str(cwd),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False,
+        )
+        return {
+            "argv": argv,
+            "returncode": proc.returncode,
+            "stdout": proc.stdout,
+            "stderr": proc.stderr,
+            "timed_out": False,
+        }
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "argv": argv,
+            "returncode": 124,
+            "stdout": exc.stdout or "",
+            "stderr": exc.stderr or "timed out",
+            "timed_out": True,
+        }
+
+
+def guarded_tmux_argv(mux: str, command: str, *args: str) -> list[str]:
+    supported, reason = command_shape_supported(command, list(args))
+    if not supported:
+        raise RuntimeError(reason)
+    return [mux, command, *args]
+
+
+def add(checks: list[dict[str, Any]], status: str, name: str, detail: str = "") -> None:
+    checks.append({"status": status, "name": name, "detail": detail})
+
+
+def summarize_backend_audit_failure(report: dict[str, Any]) -> str:
+    blocked = [str(item) for item in report.get("blocked_workers", [])]
+    current = report.get("current_default_worker", {}) if isinstance(report.get("current_default_worker"), dict) else {}
+    workers = report.get("workers", []) if isinstance(report.get("workers"), list) else []
+    blocked_details = [
+        f"{str(item.get('worker_id') or '-')}" + (
+            f":{str(item.get('blocker_kind') or '-')}" if str(item.get("worker_id") or "") in blocked else ""
+        )
+        for item in workers
+        if str(item.get("worker_id") or "") in blocked
+    ]
+    return (
+        f"blocked_workers={blocked or ['-']} "
+        f"blocked_details={blocked_details or ['-']} "
+        f"default_worker={current.get('worker_id') or '-'} "
+        f"ok={str(bool(current.get('ok'))).lower()}"
+    )
+
+
+def summarize_rebind_failure(result: dict[str, Any], payload: dict[str, Any]) -> str:
+    status = str(payload.get("status") or "unknown")
+    errors = payload.get("errors", []) if isinstance(payload.get("errors"), list) else []
+    if errors:
+        return f"{status}: {errors[0]}"
+    stderr = str(result.get("stderr") or "").strip()
+    stdout = str(result.get("stdout") or "").strip()
+    return stderr or stdout[:240] or status
+
+
+def summarize_doctor_failure(result: dict[str, Any], payload: dict[str, Any]) -> str:
+    if isinstance(payload, dict):
+        worker = payload.get("requested_worker_id") or payload.get("default_worker", {}).get("worker_id")
+        errors = payload.get("errors", []) if isinstance(payload.get("errors"), list) else []
+        if errors:
+            return f"worker={worker or '-'} first_error={errors[0]}"
+        if worker:
+            return f"worker={worker} doctor_returncode={result.get('returncode')}"
+    stderr = str(result.get("stderr") or "").strip()
+    stdout = str(result.get("stdout") or "").strip()
+    return stderr or stdout[:240] or f"returncode={result.get('returncode')}"
+
+
+def first_worker_blocker(payload: dict[str, Any]) -> tuple[str, str]:
+    rebind = payload.get("rebind_check") if isinstance(payload.get("rebind_check"), dict) else {}
+    rebind_errors = rebind.get("errors", []) if isinstance(rebind.get("errors"), list) else []
+    payload_errors = payload.get("errors", []) if isinstance(payload.get("errors"), list) else []
+    for candidate in [*rebind_errors, *payload_errors]:
+        text = str(candidate or "").strip()
+        if not text:
+            continue
+        lowered = text.lower()
+        if "registry pane" in lowered and "not present in current rmux panes" in lowered:
+            return "pane_missing", text
+        if "process tree does not contain opencode" in lowered:
+            return "opencode_process_missing", text
+        if "/global/health and /doc" in lowered:
+            return "port_unreachable", text
+        if "/doc missing required endpoint" in lowered:
+            return "tui_endpoints_missing", text
+        if "pane probe failed" in lowered:
+            return "pane_probe_failed", text
+        if "binding_failed" in lowered:
+            return "binding_failed", text
+        return "other", text
+    return "none", ""
+
+
+def evaluate_default_backend_guard(root: Path, workers: list[dict[str, Any]]) -> dict[str, Any]:
+    checks: list[dict[str, Any]] = []
+    errors: list[str] = []
+    warnings: list[str] = []
+    details: dict[str, Any] = {}
+    support = command_support_report()
+    backend_names = {str(item.get("name") or ""): item for item in available_backends()}
+    default_backend = default_backend_name()
+    details["runtime_default_backend"] = {
+        "default_backend": default_backend,
+        "available_backends": list(backend_names),
+        **support,
+    }
+    if default_backend == "tmux-reference":
+        add(checks, "OK", "runtime_default_backend", "tmux-reference")
+        backend_audit = build_backend_audit_report(root, "tmux-reference")
+        details["backend_audit"] = backend_audit
+        if backend_audit.get("switch_ready"):
+            add(checks, "OK", "backend_audit_switch_ready", "tmux-reference switch_ready=true")
+        else:
+            add(checks, "ERROR", "backend_audit_switch_ready", summarize_backend_audit_failure(backend_audit))
+            errors.append("tmux-reference backend audit is not switch_ready")
+    else:
+        add(checks, "WARNING", "runtime_default_backend", default_backend)
+        warnings.append(f"default runtime backend is {default_backend}, not tmux-reference")
+    return {
+        "checks": checks,
+        "errors": errors,
+        "warnings": warnings,
+        "details": details,
+        "default_backend": default_backend,
+    }
+
+
+def visible_workers(root: Path) -> list[dict[str, Any]]:
+    data = read_json(framework_root(root) / "opencode_visible_workers.json")
+    workers = data.get("workers", [])
+    result: list[dict[str, Any]] = []
+    for worker in workers:
+        if not isinstance(worker, dict):
+            continue
+        item = dict(worker)
+        status = str(item.get("status", ""))
+        if bool(item.get("default_for_new_tasks")) and bool(item.get("allow_auto_submit")):
+            item["role"] = "default"
+        elif status in {"test_fixed_workers", "agent_created_test_visible_worker"}:
+            item["role"] = "test"
+        elif not bool(item.get("allow_auto_submit")):
+            item["role"] = "disabled"
+        else:
+            item["role"] = "production_candidate"
+        result.append(item)
+    return result
+
+
+def select_visible_worker(workers: list[dict[str, Any]]) -> dict[str, Any]:
+    defaults = [worker for worker in workers if worker.get("default_for_new_tasks")]
+    if defaults:
+        return dict(defaults[0])
+    auto_submit = [worker for worker in workers if worker.get("allow_auto_submit")]
+    if auto_submit:
+        return dict(auto_submit[0])
+    if workers:
+        return dict(workers[0])
+    return {}
+
+
+def visible_worker_identity(worker: dict[str, Any]) -> tuple[str, str, int]:
+    worker_id = str(worker.get("worker_id") or "")
+    pane_id = str(worker.get("pane_id") or "")
+    port_raw = worker.get("port")
+    try:
+        port = int(port_raw or 0)
+    except (TypeError, ValueError):
+        port = 0
+    return worker_id, pane_id, port
+
+
+def usage_policy(root: Path) -> dict[str, Any]:
+    return read_json(framework_root(root) / "opencode_worker_usage_policy.json")
+
+
+def visible_runs_root(root: Path) -> Path:
+    return framework_root(root) / "visible-runs"
+
+
+def build_report(root: Path) -> dict[str, Any]:
+    checks: list[dict[str, Any]] = []
+    errors: list[str] = []
+    warnings: list[str] = []
+    details: dict[str, Any] = {}
+
+    agents = root / "AGENTS.md"
+    text = read_text(agents)
+    block = managed_block(text)
+    if agents.is_file():
+        add(checks, "OK", "agents_exists", rel(agents, root))
+    else:
+        add(checks, "ERROR", "agents_exists", "AGENTS.md is missing")
+        errors.append("AGENTS.md is missing")
+
+    if block:
+        add(checks, "OK", "managed_block_exists", f"{BEGIN} ... {END}")
+        workers = visible_workers(root)
+        default_worker_id, _default_pane, _default_port = visible_worker_identity(select_visible_worker(workers))
+        required = {
+            "run-one entrypoint": "./bin/omx_visible_dispatch run-one",
+            "daily health check": "./bin/omx_visible_health check",
+            "tmux send-keys ban": "tmux send-keys",
+            "direct adapter submit ban": "omx_opencode_tui_adapter submit-visible-real",
+            "default worker registry": "opencode_visible_workers.json",
+            "completion standard": "report.md",
+            "terminal marker standard": ".done",
+        }
+        if default_worker_id:
+            required["default worker"] = default_worker_id
+        missing = [name for name, needle in required.items() if needle not in block]
+        if missing:
+            add(checks, "ERROR", "managed_block_content", "missing: " + ", ".join(missing))
+            errors.append("managed block is missing required content: " + ", ".join(missing))
+        else:
+            add(checks, "OK", "managed_block_content", "required policy phrases present")
+    else:
+        add(checks, "ERROR", "managed_block_exists", "managed block not found")
+        errors.append("AGENTS.md managed block is missing")
+
+    prompt = framework_root(root) / "VISIBLE_LEADER_PROMPT_CURRENT.md"
+    if prompt.is_file():
+        add(checks, "OK", "current_prompt_exists", rel(prompt, root))
+    else:
+        add(checks, "ERROR", "current_prompt_exists", "VISIBLE_LEADER_PROMPT_CURRENT.md missing")
+        errors.append("VISIBLE_LEADER_PROMPT_CURRENT.md is missing")
+
+    polluted: list[str] = []
+    state_root = team_root(root)
+    if state_root.is_dir():
+        for item in state_root.iterdir():
+            if item.is_dir() and item.name in POLLUTION_DIRS:
+                polluted.append(rel(item, root))
+    details["state_team_pollution"] = polluted
+    if polluted:
+        add(checks, "ERROR", "state_team_clean", ", ".join(polluted))
+        errors.append(".omx/state/team contains framework/demo pollution")
+    else:
+        add(checks, "OK", "state_team_clean", "no framework/demo dirs under .omx/state/team")
+
+    fixture_policy = visible_runs_root(root) / "_fixtures" / "fixture_policy.json"
+    details["fixture_policy_path"] = rel(fixture_policy, root)
+    if fixture_policy.is_file():
+        policy = read_json(fixture_policy)
+        explicit = policy.get("explicit_fixtures", [])
+        add(checks, "OK", "fixture_policy_exists", f"{rel(fixture_policy, root)} explicit_fixtures={len(explicit) if isinstance(explicit, list) else 0}")
+    else:
+        add(checks, "ERROR", "fixture_policy_exists", f"missing: {rel(fixture_policy, root)}")
+        errors.append("fixture_policy.json is missing")
+
+    workers = visible_workers(root)
+    default_guard = evaluate_default_backend_guard(root, workers)
+    checks.extend(default_guard["checks"])
+    errors.extend(default_guard["errors"])
+    warnings.extend(default_guard["warnings"])
+    details.update(default_guard["details"])
+    default_backend = str(default_guard["default_backend"])
+    details["visible_workers"] = [
+        {
+            "worker_id": worker.get("worker_id"),
+            "pane_id": worker.get("pane_id"),
+            "port": worker.get("port"),
+            "default_for_new_tasks": worker.get("default_for_new_tasks"),
+            "allow_auto_submit": worker.get("allow_auto_submit"),
+            "status": worker.get("status"),
+            "role": worker.get("role"),
+        }
+        for worker in workers
+    ]
+    defaults = [worker for worker in workers if worker.get("default_for_new_tasks")]
+    if len(defaults) == 1:
+        add(checks, "OK", "default_worker_registry", f"single default worker: {defaults[0].get('worker_id')}")
+    else:
+        got = [str(worker.get("worker_id")) for worker in defaults]
+        add(checks, "ERROR", "default_worker_registry", f"default workers: {got}")
+        errors.append("expected exactly one default visible worker")
+
+    vw_user = select_visible_worker(workers)
+    vw_user_id, registry_pane, registry_port = visible_worker_identity(vw_user)
+    if registry_pane.startswith("%") and registry_port > 0 and vw_user.get("allow_auto_submit"):
+        add(checks, "OK", "default_worker_binding", f"worker={vw_user_id} pane={registry_pane} port={registry_port} allow_auto_submit=true")
+    else:
+        add(checks, "ERROR", "default_worker_binding", json.dumps(vw_user, ensure_ascii=False))
+        errors.append("default visible worker binding/policy is not valid")
+
+    if block and registry_pane:
+        expected_line = f"`{vw_user_id}`, port `{registry_port}` plus pane snapshot `{registry_pane}`"
+        if agents_registry_binding_ok(block, vw_user_id, registry_pane, registry_port):
+            add(checks, "OK", "agents_registry_binding", expected_line)
+        else:
+            add(checks, "ERROR", "agents_registry_mismatch", f"expected managed block line containing: {expected_line}")
+            errors.append("AGENTS.md managed block does not match visible worker registry")
+
+    prompt_text = read_text(prompt)
+    if prompt_text and registry_pane:
+        if prompt_registry_binding_ok(prompt_text, vw_user_id, registry_pane, registry_port):
+            add(checks, "OK", "prompt_registry_binding", f"worker={vw_user_id} pane_runtime_discovered port={registry_port}")
+        else:
+            add(checks, "WARNING", "prompt_registry_mismatch", f"expected worker={vw_user_id} runtime-discovered pane port={registry_port}")
+            warnings.append("VISIBLE_LEADER_PROMPT_CURRENT.md does not match visible worker registry")
+
+    rebind_tool = root / "bin" / "omx_visible_rebind"
+    if rebind_tool.is_file() and vw_user_id:
+        rebind = run_command([str(rebind_tool), "check", "--root", str(root), "--worker", vw_user_id, "--runtime-backend", default_backend, "--json"], root, timeout=45)
+        details["rebind_check"] = {
+            "returncode": rebind["returncode"],
+            "stdout_head": rebind["stdout"][:2000],
+            "stderr_head": rebind["stderr"][:1000],
+        }
+        rebind_json: dict[str, Any] = {}
+        try:
+            parsed = json.loads(rebind["stdout"])
+            if isinstance(parsed, dict):
+                rebind_json = parsed
+                details["rebind_check_json"] = parsed
+        except Exception:
+            pass
+        status = str(rebind_json.get("status") or "unknown")
+        if rebind["returncode"] == 0 and status == "current_binding_ok":
+            add(checks, "OK", "visible_worker_live_binding", "current_binding_ok")
+        elif status == "stale_pane_rebind_available":
+            add(checks, "ERROR", "stale_visible_worker_pane", "registry pane is stale; rebind available")
+            add(checks, "WARNING", "rebind_available", str(rebind_json.get("rebind_command", "")))
+            errors.append("visible worker pane is stale")
+            warnings.append(f"rebind is available for {vw_user.get('worker_id')}")
+        elif status == "rebind_available":
+            add(checks, "WARNING", "rebind_available", str(rebind_json.get("rebind_command", "")))
+            warnings.append("default visible worker port is bound to a different current-window pane")
+        elif status == "port_not_live":
+            detail = f"port {registry_port} is not live" if registry_port > 0 else "default visible worker port is not live"
+            add(checks, "ERROR", "visible_worker_port_live", detail)
+            errors.append("default visible worker port is not live")
+        else:
+            add(checks, "ERROR", "visible_worker_live_binding", summarize_rebind_failure(rebind, rebind_json))
+            errors.append("default visible worker live binding could not be verified")
+    elif rebind_tool.is_file():
+        add(checks, "ERROR", "visible_worker_live_binding", "default visible worker is missing")
+        errors.append("default visible worker live binding could not be verified")
+    else:
+        add(checks, "ERROR", "omx_visible_rebind_exists", "missing bin/omx_visible_rebind")
+        errors.append("bin/omx_visible_rebind is missing")
+
+    vw1 = next((worker for worker in workers if worker.get("worker_id") == "vw1" or worker.get("pane_id") == "%40"), {})
+    if not vw1 or (not vw1.get("default_for_new_tasks") or not vw1.get("allow_auto_submit")):
+        add(checks, "OK", "vw1_non_default", "vw1/%40/4201 is not the default auto-submit target")
+    else:
+        add(checks, "ERROR", "vw1_non_default", json.dumps(vw1, ensure_ascii=False))
+        errors.append("vw1/%40/4201 is still default/auto-submit eligible")
+
+    policy = usage_policy(root)
+    production_candidates = [
+        worker for worker in workers
+        if worker.get("allow_auto_submit") and not worker.get("default_for_new_tasks") and str(worker.get("role") or "") == "production_candidate"
+    ]
+    details["production_candidates"] = [
+        {"worker_id": worker.get("worker_id"), "pane_id": worker.get("pane_id"), "port": worker.get("port")}
+        for worker in production_candidates
+    ]
+    fixed = policy.get("fixed_workers", [])
+    fixed_by_pane = {str(item.get("pane_id")): item for item in fixed if isinstance(item, dict)}
+    bad_fixed = []
+    for pane in ("%32", "%34", "%35"):
+        item = fixed_by_pane.get(pane)
+        if not item or item.get("default_for_new_tasks"):
+            bad_fixed.append(pane)
+        elif item.get("status") != "test_fixed_workers":
+            bad_fixed.append(pane)
+    if bad_fixed:
+        add(checks, "ERROR", "fixed_workers_non_default", "bad: " + ", ".join(bad_fixed))
+        errors.append("%32/%34/%35 policy is not test_fixed_workers/default=false")
+    else:
+        add(checks, "OK", "fixed_workers_non_default", "%32/%34/%35 are test_fixed_workers/default=false")
+
+    doctor = run_command([str(root / "bin" / "omx_visible_dispatch"), "doctor", "--root", str(root), "--backend", default_backend, "--worker", vw_user_id, "--json"], root) if vw_user_id else {"returncode": 1, "stdout": "", "stderr": "default visible worker missing", "timed_out": False}
+    details["doctor"] = {
+        "returncode": doctor["returncode"],
+        "stdout_head": doctor["stdout"][:1000],
+        "stderr_head": doctor["stderr"][:1000],
+    }
+    doctor_json: dict[str, Any] = {}
+    try:
+        parsed_doctor = json.loads(doctor["stdout"])
+        if isinstance(parsed_doctor, dict):
+            doctor_json = parsed_doctor
+            details["doctor_json"] = parsed_doctor
+    except Exception:
+        doctor_json = {}
+    if doctor["returncode"] == 0:
+        add(checks, "OK", "doctor", "omx_visible_dispatch doctor --json returned 0")
+        if not doctor_json:
+            add(checks, "WARNING", "doctor_json_parse", "doctor returned 0 but stdout was not JSON")
+            warnings.append("doctor returned 0 but stdout was not JSON")
+    else:
+        add(checks, "ERROR", "doctor", summarize_doctor_failure(doctor, doctor_json))
+        errors.append("omx_visible_dispatch doctor failed")
+    doctor_readiness = doctor_json.get("tui_readiness", {}) if isinstance(doctor_json.get("tui_readiness"), dict) else {}
+    doctor_worker_id = str(
+        doctor_json.get("requested_worker_id")
+        or doctor_json.get("default_worker", {}).get("worker_id")
+        or vw_user_id
+        or "-"
+    )
+    readiness_state = str(doctor_readiness.get("readiness") or "")
+    effective_submit_safe = bool(doctor_readiness.get("submit_safe", False)) or readiness_state == "ready"
+    if readiness_state:
+        detail = f"worker={doctor_worker_id} readiness={readiness_state}"
+        if doctor_readiness.get("reason"):
+            detail += f" reason={doctor_readiness.get('reason')}"
+        if readiness_state == "unhealthy":
+            add(checks, "ERROR", "doctor_tui_readiness", detail)
+            errors.append("default visible worker doctor readiness is unhealthy")
+        elif readiness_state in {"busy", "unknown"}:
+            add(checks, "WARNING", "doctor_tui_readiness", detail)
+            warnings.append(f"default visible worker doctor readiness is {readiness_state}")
+        else:
+            add(checks, "OK", "doctor_tui_readiness", detail)
+    if readiness_state:
+        detail = f"worker={doctor_worker_id} submit_safe={str(bool(effective_submit_safe)).lower()}"
+        if effective_submit_safe:
+            add(checks, "OK", "doctor_submit_safe", detail)
+        elif readiness_state == "unhealthy":
+            add(checks, "ERROR", "doctor_submit_safe", detail)
+            errors.append("default visible worker doctor submit_safe=false")
+        else:
+            add(checks, "WARNING", "doctor_submit_safe", detail)
+            warnings.append("default visible worker doctor submit_safe=false")
+
+    dispatch_help = run_command([str(root / "bin" / "omx_visible_dispatch"), "run-one", "--help"], root, timeout=30)
+    settle_help = run_command([str(root / "bin" / "omx_visible_dispatch"), "settle-latest", "--help"], root, timeout=30)
+    health_help = run_command([str(root / "bin" / "omx_visible_health"), "check", "--help"], root, timeout=30)
+    multiworker_ready = (
+        "--worker" in str(dispatch_help.get("stdout") or "")
+        and "--session-action" in str(dispatch_help.get("stdout") or "")
+        and "--session-action-reason" in str(dispatch_help.get("stdout") or "")
+        and "--worker" in str(settle_help.get("stdout") or "")
+        and "--worker" in str(health_help.get("stdout") or "")
+    )
+    details["multiworker_control_surface_ready"] = multiworker_ready
+    if production_candidates:
+        if multiworker_ready:
+            add(checks, "OK", "multiworker_control_surface_ready", "worker-scoped run-one/settle/health detected")
+        else:
+            add(checks, "WARNING", "multiworker_production_candidates", f"{len(production_candidates)} production_candidate worker(s) need worker-scoped control surface")
+            warnings.append("multiworker production candidates require worker-scoped run-one/settle/health")
+
+    watcher_dir = visible_runs_root(root) / "_watcher"
+    current_alerts = read_json(watcher_dir / "current_alerts.json")
+    watcher_board = read_json(watcher_dir / "visible_board.json")
+    if watcher_board:
+        add(checks, "OK", "watcher_board_read", "read existing watcher board without refreshing it")
+    else:
+        add(checks, "WARNING", "watcher_board_read", "visible_board.json missing or unreadable")
+        warnings.append("watcher board is missing or unreadable")
+    if current_alerts:
+        add(checks, "OK", "watcher_current_alerts_read", "read current_alerts.json without reading alert history")
+    else:
+        add(checks, "WARNING", "watcher_current_alerts_read", "current_alerts.json missing; falling back to visible_board.json")
+    details["watcher_board_fixture_summary"] = {
+        "active_alerts": watcher_board.get("active_alerts"),
+        "alert_count": watcher_board.get("alert_count"),
+        "suppressed_fixtures": watcher_board.get("suppressed_fixtures"),
+        "fixture_alerts_suppressed": watcher_board.get("fixture_alerts_suppressed"),
+    }
+    details["watcher_current_alerts_summary"] = {
+        "active_alerts": current_alerts.get("active_alerts"),
+        "suppressed_fixtures": current_alerts.get("suppressed_fixtures"),
+        "fixture_alerts_suppressed": current_alerts.get("fixture_alerts_suppressed"),
+    }
+    active_alerts = watcher_board.get("alerts", [])
+    if isinstance(active_alerts, list):
+        fixture_active = [item for item in active_alerts if isinstance(item, dict) and item.get("fixture")]
+        non_fixture_delivery = [
+            item for item in active_alerts
+            if isinstance(item, dict)
+            and not item.get("fixture")
+            and item.get("type") == "delivery_uncertain_alert"
+        ]
+        if fixture_active:
+            add(checks, "ERROR", "fixture_alert_suppression", f"fixture alerts still active: {len(fixture_active)}")
+            errors.append("fixture alerts are still present in active watcher alerts")
+        else:
+            add(checks, "OK", "fixture_alert_suppression", f"suppressed={watcher_board.get('fixture_alerts_suppressed', 0)}")
+        if non_fixture_delivery:
+            add(checks, "WARNING", "non_fixture_delivery_uncertain", f"active non-fixture delivery alerts: {len(non_fixture_delivery)}")
+            warnings.append("non-fixture delivery_uncertain alerts are active")
+        else:
+            add(checks, "OK", "active_alerts_non_fixture_only", f"active_alerts={len(active_alerts)}")
+    else:
+        add(checks, "WARNING", "watcher_board_alerts_parse", "visible_board.json alerts field is not a list")
+        warnings.append("could not parse watcher active alerts")
+
+    daemon_health = run_command([str(root / "bin" / "omx_visible_watcher"), "daemon-health", "--root", str(root), "--json"], root, timeout=45)
+    details["watcher_daemon_health"] = {
+        "returncode": daemon_health["returncode"],
+        "stdout_head": daemon_health["stdout"][:1500],
+        "stderr_head": daemon_health["stderr"][:1000],
+    }
+    try:
+        daemon_health_json = json.loads(daemon_health["stdout"])
+        details["watcher_daemon_health_json"] = daemon_health_json
+    except Exception:
+        daemon_health_json = {}
+    daemon_health_status = str(daemon_health_json.get("status") or "unknown")
+    if daemon_health["returncode"] == 0:
+        add(checks, "OK", "watcher_daemon_health", daemon_health_status)
+    else:
+        add(checks, "ERROR", "watcher_daemon_health", daemon_health["stderr"] or daemon_health["stdout"])
+        errors.append("watcher daemon health check failed")
+
+    return {
+        "generated_at": utc_now(),
+        "root": str(root),
+        "default_backend": default_backend,
+        "tmux_support": command_support_report(),
+        "ok": not errors,
+        "checks": checks,
+        "errors": errors,
+        "warnings": warnings,
+        "details": details,
+    }
+
+
+def print_human(report: dict[str, Any]) -> None:
+    print(f"policy_check: {'OK' if report['ok'] else 'ERROR'}")
+    support = report.get("tmux_support", {}) if isinstance(report.get("tmux_support"), dict) else {}
+    if support:
+        print(f"tmux_live_baseline: {support.get('tmux_live_baseline')}")
+        print(f"active_runtime_substrate: {support.get('active_runtime_substrate')}")
+        features = support.get("blocked_post_baseline_features", [])
+        if isinstance(features, list):
+            print(f"blocked_post_baseline_features: {', '.join(str(item) for item in features) or '-'}")
+    details = report.get("details", {}) if isinstance(report.get("details"), dict) else {}
+    doctor_json = details.get("doctor_json", {}) if isinstance(details.get("doctor_json"), dict) else {}
+    doctor_readiness = doctor_json.get("tui_readiness", {}) if isinstance(doctor_json.get("tui_readiness"), dict) else {}
+    if doctor_readiness:
+        readiness_state = str(doctor_readiness.get("readiness") or "-")
+        submit_safe = bool(doctor_readiness.get("submit_safe", False)) or readiness_state == "ready"
+        print(f"default_worker_tui_readiness: {readiness_state}")
+        print(f"default_worker_submit_safe: {str(submit_safe).lower()}")
+        if doctor_readiness.get("reason"):
+            print(f"default_worker_tui_readiness_reason: {doctor_readiness.get('reason')}")
+    for item in report["checks"]:
+        status = item["status"]
+        print(f"{status:7} {item['name']}: {item.get('detail', '')}")
+    if report["warnings"]:
+        print("\nWarnings:")
+        for warning in report["warnings"]:
+            print(f"  - {warning}")
+    if report["errors"]:
+        print("\nErrors:")
+        for error in report["errors"]:
+            print(f"  - {error}")
+
+
+def build_backend_audit_report(root: Path, backend: str) -> dict[str, Any]:
+    support = command_support_report()
+    workers = visible_workers(root)
+    audited_workers = [worker for worker in workers if bool(worker.get("allow_auto_submit"))]
+    default_worker = next((worker for worker in workers if worker.get("default_for_new_tasks")), {})
+    per_worker: list[dict[str, Any]] = []
+    ready_workers: list[str] = []
+    blocked_workers: list[str] = []
+    for worker in audited_workers:
+        worker_id = str(worker.get("worker_id") or "")
+        result = run_command(
+            [
+                str(root / "bin" / "omx_visible_dispatch"),
+                "doctor",
+                "--root",
+                str(root),
+                "--backend",
+                backend,
+                "--worker",
+                worker_id,
+                "--json",
+            ],
+            root,
+            timeout=90,
+        )
+        try:
+            payload = json.loads(result.get("stdout") or "{}")
+        except Exception:
+            payload = {}
+        ok = bool(result.get("returncode") == 0 and payload.get("ok"))
+        blocker_kind, blocker_detail = first_worker_blocker(payload if isinstance(payload, dict) else {})
+        entry = {
+            "worker_id": worker_id,
+            "role": str(worker.get("role") or ""),
+            "pane_id": str(worker.get("pane_id") or worker.get("pane") or ""),
+            "port": worker.get("port"),
+            "binding_confidence": str(worker.get("binding_confidence") or ""),
+            "ok": ok,
+            "doctor_returncode": int(result.get("returncode") or 0),
+            "errors": payload.get("errors", []) if isinstance(payload.get("errors"), list) else [],
+            "warnings": payload.get("warnings", []) if isinstance(payload.get("warnings"), list) else [],
+            "blocker_kind": blocker_kind,
+            "blocker_detail": blocker_detail,
+        }
+        per_worker.append(entry)
+        if ok:
+            ready_workers.append(worker_id)
+        else:
+            blocked_workers.append(worker_id)
+    default_worker_id = str(default_worker.get("worker_id") or "")
+    default_worker_ok = next((item.get("ok") for item in per_worker if item.get("worker_id") == default_worker_id), False)
+    return {
+        "generated_at": utc_now(),
+        "root": str(root),
+        "backend": backend,
+        "backend_type": "rmux" if str(backend).startswith("rmux") else "tmux",
+        "default_backend": default_backend_name(),
+        "available_backends": [item.get("name") for item in available_backends()],
+        **support,
+        "switch_ready": bool(default_worker_id and default_worker_ok and not blocked_workers),
+        "current_default_worker": {
+            "worker_id": default_worker_id,
+            "pane_id": str(default_worker.get("pane_id") or default_worker.get("pane") or ""),
+            "port": default_worker.get("port"),
+            "ok": bool(default_worker_ok),
+        },
+        "audited_worker_count": len(audited_workers),
+        "ready_workers": ready_workers,
+        "blocked_workers": blocked_workers,
+        "workers": per_worker,
+    }
+
+
+def print_backend_audit_human(report: dict[str, Any]) -> None:
+    print(f"candidate_backend: {report.get('backend')}")
+    print(f"candidate_backend_type: {report.get('backend_type')}")
+    print(f"default_backend: {report.get('default_backend')}")
+    print(f"tmux_live_baseline: {report.get('tmux_live_baseline')}")
+    print(f"active_runtime_substrate: {report.get('active_runtime_substrate')}")
+    features = report.get("blocked_post_baseline_features", [])
+    if isinstance(features, list):
+        print(f"blocked_post_baseline_features: {', '.join(str(item) for item in features) or '-'}")
+    print(f"switch_ready: {str(bool(report.get('switch_ready'))).lower()}")
+    current = report.get("current_default_worker", {})
+    print(
+        "current_default_worker: "
+        f"{current.get('worker_id') or '-'} "
+        f"pane={current.get('pane_id') or '-'} "
+        f"port={current.get('port') or '-'} "
+        f"ok={str(bool(current.get('ok'))).lower()}"
+    )
+    print(f"audited_worker_count: {report.get('audited_worker_count', 0)}")
+    print(f"ready_workers: {', '.join(report.get('ready_workers', [])) or '-'}")
+    print(f"blocked_workers: {', '.join(report.get('blocked_workers', [])) or '-'}")
+    print("Workers:")
+    for worker in report.get("workers", []):
+        status = "OK" if worker.get("ok") else "ERROR"
+        print(
+            "  - "
+            f"{worker.get('worker_id') or '-'} "
+            f"role={worker.get('role') or '-'} "
+            f"pane={worker.get('pane_id') or '-'} "
+            f"port={worker.get('port') or '-'} "
+            f"binding={worker.get('binding_confidence') or '-'} "
+            f"status={status} "
+            f"blocker={worker.get('blocker_kind') or '-'}"
+        )
+        for item in worker.get("errors", []):
+            print(f"    error: {item}")
+        for item in worker.get("warnings", []):
+            print(f"    warning: {item}")
+
+
+def build_backend_reconcile_report(root: Path, backend: str) -> dict[str, Any]:
+    audit = build_backend_audit_report(root, backend)
+    workers = audit.get("workers", []) if isinstance(audit.get("workers"), list) else []
+    default_worker = audit.get("current_default_worker", {}) if isinstance(audit.get("current_default_worker"), dict) else {}
+    default_worker_id = str(default_worker.get("worker_id") or "")
+    disable_candidates: list[dict[str, Any]] = []
+    investigate_candidates: list[dict[str, Any]] = []
+    default_worker_action = "none"
+    default_worker_reason = ""
+    default_worker_recovery: dict[str, Any] = {}
+    for worker in workers:
+        worker_id = str(worker.get("worker_id") or "")
+        blocker_kind = str(worker.get("blocker_kind") or "none")
+        role = str(worker.get("role") or "")
+        candidate = {
+            "worker_id": worker_id,
+            "pane_id": str(worker.get("pane_id") or ""),
+            "port": worker.get("port"),
+            "blocker_kind": blocker_kind,
+            "blocker_detail": str(worker.get("blocker_detail") or ""),
+        }
+        if worker_id == default_worker_id:
+            if blocker_kind == "pane_missing":
+                default_worker_action = "manual_restore_or_rebind_required"
+                default_worker_reason = candidate["blocker_detail"]
+            elif blocker_kind == "port_unreachable":
+                default_worker_action = "live_worker_not_listening"
+                default_worker_reason = candidate["blocker_detail"]
+            elif blocker_kind not in {"none", ""}:
+                default_worker_action = "manual_diagnosis_required"
+                default_worker_reason = candidate["blocker_detail"]
+            continue
+        if role == "production_candidate" and blocker_kind in {"pane_missing", "opencode_process_missing", "port_unreachable"}:
+            disable_candidates.append(candidate)
+        elif blocker_kind not in {"none", ""}:
+            investigate_candidates.append(candidate)
+    next_actions: list[str] = []
+    if disable_candidates:
+        next_actions.append("non-default stale workers can be disabled from auto-submit with opencode-visible-worker-disable")
+    if default_worker_action != "none":
+        next_actions.append(f"default worker {default_worker_id or '-'} requires {default_worker_action}")
+        default_port = default_worker.get("port")
+        if isinstance(default_port, int) or str(default_port).isdigit():
+            default_worker_recovery = build_default_worker_recovery(root, default_worker_id, int(default_port))
+    report = {
+        "generated_at": utc_now(),
+        "root": str(root),
+        "backend": backend,
+        "switch_ready": bool(audit.get("switch_ready")),
+        "default_worker": default_worker,
+        "default_worker_action": default_worker_action,
+        "default_worker_reason": default_worker_reason,
+        "default_worker_recovery": default_worker_recovery,
+        "disable_candidates": disable_candidates,
+        "investigate_candidates": investigate_candidates,
+        "next_actions": next_actions,
+        "audit": audit,
+    }
+    if default_worker_recovery:
+        report["default_worker_recovery_artifact"] = build_default_worker_recovery_status_from_report(root, report)
+    else:
+        report["default_worker_recovery_artifact"] = {}
+    return report
+
+
+def print_backend_reconcile_human(report: dict[str, Any]) -> None:
+    print(f"candidate_backend: {report.get('backend')}")
+    print(f"switch_ready: {str(bool(report.get('switch_ready'))).lower()}")
+    default_worker = report.get("default_worker", {}) if isinstance(report.get("default_worker"), dict) else {}
+    print(
+        "default_worker: "
+        f"{default_worker.get('worker_id') or '-'} "
+        f"pane={default_worker.get('pane_id') or '-'} "
+        f"port={default_worker.get('port') or '-'}"
+    )
+    print(f"default_worker_action: {report.get('default_worker_action') or 'none'}")
+    if report.get("default_worker_reason"):
+        print(f"default_worker_reason: {report.get('default_worker_reason')}")
+    recovery = report.get("default_worker_recovery", {}) if isinstance(report.get("default_worker_recovery"), dict) else {}
+    if recovery:
+        print(f"default_worker_recovery_kind: {recovery.get('recovery_kind') or 'none'}")
+        if recovery.get("runtime_substrate"):
+            print(f"default_worker_runtime_substrate: {recovery.get('runtime_substrate')}")
+        if recovery.get("discover_status"):
+            print(f"default_worker_discover_status: {recovery.get('discover_status')}")
+        if recovery.get("discover_pane_id"):
+            print(f"default_worker_discover_pane: {recovery.get('discover_pane_id')}")
+        if recovery.get("launch_command"):
+            print(f"default_worker_launch_command: {recovery.get('launch_command')}")
+        if recovery.get("recommended_commands"):
+            print("default_worker_recommended_commands:")
+            for item in recovery.get("recommended_commands", []):
+                print(f"  - {item}")
+    artifact = report.get("default_worker_recovery_artifact", {}) if isinstance(report.get("default_worker_recovery_artifact"), dict) else {}
+    if artifact:
+        print(f"default_worker_recovery_artifact_fresh: {str(bool(artifact.get('fresh'))).lower()}")
+        print(f"default_worker_recovery_artifact_ready_to_execute: {str(bool(artifact.get('ready_to_execute'))).lower()}")
+        if artifact.get("script_path"):
+            print(f"default_worker_recovery_artifact_path: {artifact.get('script_path')}")
+        if artifact.get("artifact_run_command"):
+            print(f"default_worker_recovery_artifact_run_command: {artifact.get('artifact_run_command')}")
+        if artifact.get("artifact_export_command"):
+            print(f"default_worker_recovery_artifact_export_command: {artifact.get('artifact_export_command')}")
+        if artifact.get("artifact_validate_command"):
+            print(f"default_worker_recovery_artifact_validate_command: {artifact.get('artifact_validate_command')}")
+        if artifact.get("stale_reasons"):
+            print(f"default_worker_recovery_artifact_stale_reasons: {', '.join(artifact.get('stale_reasons', []))}")
+        if artifact.get("execution_blockers"):
+            print(f"default_worker_recovery_artifact_execution_blockers: {', '.join(artifact.get('execution_blockers', []))}")
+    print("disable_candidates:")
+    for item in report.get("disable_candidates", []):
+        print(
+            f"  - {item.get('worker_id') or '-'} "
+            f"pane={item.get('pane_id') or '-'} "
+            f"port={item.get('port') or '-'} "
+            f"blocker={item.get('blocker_kind') or '-'}"
+        )
+    if not report.get("disable_candidates"):
+        print("  - none")
+    print("investigate_candidates:")
+    for item in report.get("investigate_candidates", []):
+        print(
+            f"  - {item.get('worker_id') or '-'} "
+            f"pane={item.get('pane_id') or '-'} "
+            f"port={item.get('port') or '-'} "
+            f"blocker={item.get('blocker_kind') or '-'}"
+        )
+    if not report.get("investigate_candidates"):
+        print("  - none")
+    print("next_actions:")
+    for item in report.get("next_actions", []):
+        print(f"  - {item}")
+    if not report.get("next_actions"):
+        print("  - none")
+
+
+def render_default_worker_recovery_script(report: dict[str, Any]) -> str:
+    recovery = report.get("default_worker_recovery", {}) if isinstance(report.get("default_worker_recovery"), dict) else {}
+    default_worker = report.get("default_worker", {}) if isinstance(report.get("default_worker"), dict) else {}
+    worker_id = str(default_worker.get("worker_id") or "")
+    lines = [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        "",
+        f"# backend: {report.get('backend') or '-'}",
+        f"# worker: {worker_id or '-'}",
+        f"# recovery_kind: {recovery.get('recovery_kind') or 'none'}",
+    ]
+    if recovery.get("runtime_substrate"):
+        lines.append(f"# runtime_substrate: {recovery.get('runtime_substrate')}")
+    if recovery.get("discover_status"):
+        lines.append(f"# discover_status: {recovery.get('discover_status')}")
+    lines.extend(["", "# Launch / restore"])
+    launch_command = str(recovery.get("launch_command") or "").strip()
+    rebind_command = str(recovery.get("rebind_command") or "").strip()
+    verify_commands = [str(item).strip() for item in recovery.get("verify_commands", []) if str(item).strip()]
+    if launch_command:
+        lines.append(launch_command)
+    if rebind_command:
+        lines.extend(["", "# Rebind", rebind_command])
+    if verify_commands:
+        lines.extend(["", "# Verify"])
+        lines.extend(verify_commands)
+    return "\n".join(lines) + "\n"
+
+
+def export_default_worker_recovery(root: Path, report: dict[str, Any], output: str | None = None) -> dict[str, Any]:
+    default_worker = report.get("default_worker", {}) if isinstance(report.get("default_worker"), dict) else {}
+    worker_id = str(default_worker.get("worker_id") or "default-worker")
+    out_path = Path(output).resolve() if output else (recovery_root(root) / f"{worker_id}-reconcile.sh")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    script = render_default_worker_recovery_script(report)
+    out_path.write_text(script, encoding="utf-8")
+    os.chmod(out_path, 0o755)
+    meta_path = out_path.with_suffix(out_path.suffix + ".json")
+    metadata = {
+        "generated_at": utc_now(),
+        "root": str(root),
+        "backend": report.get("backend"),
+        "default_worker": default_worker,
+        "default_worker_action": report.get("default_worker_action"),
+        "default_worker_reason": report.get("default_worker_reason"),
+        "default_worker_recovery": report.get("default_worker_recovery", {}),
+        "script_path": str(out_path),
+    }
+    meta_path.write_text(json.dumps(metadata, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
+    return {
+        "script_path": str(out_path),
+        "metadata_path": str(meta_path),
+        "worker_id": worker_id,
+    }
+
+
+def build_default_worker_recovery_status_from_report(root: Path, report: dict[str, Any], script_path: str | None = None) -> dict[str, Any]:
+    default_worker = report.get("default_worker", {}) if isinstance(report.get("default_worker"), dict) else {}
+    worker_id = str(default_worker.get("worker_id") or "default-worker")
+    path = Path(script_path).resolve() if script_path else (recovery_root(root) / f"{worker_id}-reconcile.sh")
+    metadata_path = path.with_suffix(path.suffix + ".json")
+    expected_script = render_default_worker_recovery_script(report)
+    script_exists = path.is_file()
+    metadata_exists = metadata_path.is_file()
+    script_text = path.read_text(encoding="utf-8") if script_exists else ""
+    script_executable = os.access(path, os.X_OK) if script_exists else False
+    metadata: dict[str, Any] = {}
+    if metadata_exists:
+        try:
+            parsed = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if isinstance(parsed, dict):
+                metadata = parsed
+        except Exception:
+            metadata = {}
+    recovery = report.get("default_worker_recovery", {}) if isinstance(report.get("default_worker_recovery"), dict) else {}
+    stable_recovery = {
+        "recovery_kind": recovery.get("recovery_kind"),
+        "runtime_substrate": recovery.get("runtime_substrate"),
+        "discover_status": recovery.get("discover_status"),
+        "launch_command": recovery.get("launch_command"),
+        "rebind_command": recovery.get("rebind_command"),
+        "verify_commands": recovery.get("verify_commands", []),
+        "recommended_commands": recovery.get("recommended_commands", []),
+    }
+    expected_metadata = {
+        "backend": report.get("backend"),
+        "default_worker": report.get("default_worker"),
+        "default_worker_action": report.get("default_worker_action"),
+        "default_worker_reason": report.get("default_worker_reason"),
+        "default_worker_recovery": stable_recovery,
+        "root": str(root),
+        "script_path": str(path),
+    }
+    script_matches_current = script_exists and script_text == expected_script
+    metadata_matches_current = bool(metadata)
+    for key in ("backend", "default_worker", "default_worker_action", "default_worker_reason", "root", "script_path"):
+        if metadata.get(key) != expected_metadata.get(key):
+            metadata_matches_current = False
+            break
+    metadata_recovery = metadata.get("default_worker_recovery", {}) if isinstance(metadata.get("default_worker_recovery"), dict) else {}
+    if metadata_matches_current:
+        for key, value in stable_recovery.items():
+            candidate = metadata_recovery.get(key, [] if key in {"verify_commands", "recommended_commands"} else None)
+            if candidate != value:
+                metadata_matches_current = False
+                break
+    stale_reasons: list[str] = []
+    if not script_exists:
+        stale_reasons.append("script_missing")
+    if not metadata_exists:
+        stale_reasons.append("metadata_missing")
+    if script_exists and not script_executable:
+        stale_reasons.append("script_not_executable")
+    if script_exists and not script_matches_current:
+        stale_reasons.append("script_mismatch")
+    if metadata_exists and not metadata:
+        stale_reasons.append("metadata_invalid")
+    elif metadata_exists and not metadata_matches_current:
+        stale_reasons.append("metadata_mismatch")
+    execution_blockers: list[str] = []
+    if stale_reasons:
+        execution_blockers.extend(stale_reasons)
+    recovery_kind = str(recovery.get("recovery_kind") or "")
+    if not str(report.get("default_worker_action") or "").strip():
+        execution_blockers.append("default_worker_action_missing")
+    if recovery_kind in {"start_worker_then_rebind"} and not str(recovery.get("launch_command") or "").strip():
+        execution_blockers.append("launch_command_missing")
+    if not str(recovery.get("rebind_command") or "").strip():
+        execution_blockers.append("rebind_command_missing")
+    if not isinstance(recovery.get("verify_commands"), list) or not recovery.get("verify_commands"):
+        execution_blockers.append("verify_commands_missing")
+    return {
+        "generated_at": utc_now(),
+        "root": str(root),
+        "backend": report.get("backend"),
+        "worker_id": worker_id,
+        "script_path": str(path),
+        "metadata_path": str(metadata_path),
+        "artifact_run_command": f"./bin/omx_visible_recovery artifact-run --root . --script {path} --allow-recovery-execute",
+        "artifact_plan_command": f"./bin/omx_visible_recovery artifact-plan --root . --script {path}",
+        "artifact_export_command": f"./bin/omx_visible_policy_check backend-reconcile-export --root . --backend {report.get('backend')} --output {path}",
+        "artifact_validate_command": f"./bin/omx_visible_policy_check backend-reconcile-validate --root . --backend {report.get('backend')} --script {path}",
+        "script_exists": script_exists,
+        "metadata_exists": metadata_exists,
+        "script_executable": script_executable,
+        "script_matches_current": script_matches_current,
+        "metadata_matches_current": metadata_matches_current,
+        "stale_reasons": stale_reasons,
+        "fresh": not stale_reasons,
+        "execution_blockers": execution_blockers,
+        "ready_to_execute": not execution_blockers,
+        "expected_script_sha256": _sha256_text(expected_script),
+        "actual_script_sha256": _sha256_text(script_text) if script_exists else "",
+    }
+
+
+def build_default_worker_recovery_status(root: Path, backend: str, script_path: str | None = None) -> dict[str, Any]:
+    report = build_backend_reconcile_report(root, backend)
+    return build_default_worker_recovery_status_from_report(root, report, script_path)
+
+
+def _sha256_text(text: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def build_default_worker_recovery(root: Path, worker_id: str, port: int) -> dict[str, Any]:
+    discover = run_command(
+        [
+            str(root / "bin" / "omx_visible_rebind"),
+            "discover",
+            "--root",
+            str(root),
+            "--port",
+            str(int(port)),
+            "--json",
+        ],
+        root,
+        timeout=60,
+    )
+    payload: dict[str, Any] = {}
+    try:
+        parsed = json.loads(discover.get("stdout") or "{}")
+        if isinstance(parsed, dict):
+            payload = parsed
+    except Exception:
+        payload = {}
+    status = str(payload.get("status") or "unknown")
+    pane_id = str(payload.get("pane_id") or "")
+    binding_confidence = str(payload.get("binding_confidence") or "")
+    runtime_context = current_runtime_context(root)
+    runtime_substrate = str(runtime_context.get("runtime_substrate") or "")
+    recommended_commands: list[str] = []
+    recovery_kind = "manual_diagnosis_required"
+    launch_command = ""
+    rebind_command = f"./bin/omx_visible_rebind rebind --root . --worker {worker_id} --port {int(port)} --allow-rebind"
+    verify_commands = [
+        f"./bin/omx_visible_rebind discover --root . --port {int(port)} --json",
+        f"./bin/omx_visible_rebind check --root . --worker {worker_id} --runtime-backend tmux-reference --json",
+        "./bin/omx_visible_policy_check backend-audit --root . --backend tmux-reference",
+    ]
+    if status == "binding_candidate" and pane_id:
+        recovery_kind = "rebind_available_after_confirmation"
+        recommended_commands.extend([rebind_command, *verify_commands])
+    elif status == "binding_failed" and not pane_id:
+        recovery_kind = "start_worker_then_rebind"
+        if runtime_substrate in {"tmux", "rmux"}:
+            worker_command = shlex.join(["opencode", str(root), "--hostname", "127.0.0.1", "--port", str(int(port))])
+            launch_command = shlex.join(["tmux", "split-window", "-c", str(root), worker_command])
+        else:
+            launch_command = shlex.join(["opencode", str(root), "--hostname", "127.0.0.1", "--port", str(int(port))])
+        recommended_commands.extend([launch_command, rebind_command, *verify_commands])
+    elif status == "binding_failed" and pane_id:
+        recovery_kind = "inspect_discovered_pane_then_rebind"
+        recommended_commands.extend([rebind_command, *verify_commands])
+    return {
+        "discover_returncode": int(discover.get("returncode") or 0),
+        "discover_status": status,
+        "discover_pane_id": pane_id,
+        "discover_binding_confidence": binding_confidence,
+        "runtime_substrate": runtime_substrate,
+        "current_display": str(runtime_context.get("display") or ""),
+        "current_panes": runtime_context.get("panes", []),
+        "recovery_kind": recovery_kind,
+        "launch_command": launch_command,
+        "rebind_command": rebind_command,
+        "verify_commands": verify_commands,
+        "recommended_commands": recommended_commands,
+    }
+
+
+def current_runtime_context(root: Path) -> dict[str, Any]:
+    for mux in ("tmux", "rmux"):
+        display = run_command(guarded_tmux_argv(mux, "display-message", "-p", "#S:#I.#P #{pane_id}"), root, timeout=10)
+        if display.get("returncode") != 0 or not str(display.get("stdout") or "").strip():
+            continue
+        panes_result = run_command(
+            guarded_tmux_argv(
+                mux,
+                "list-panes",
+                "-a",
+                "-F",
+                "#{pane_id}\t#{pane_current_command}\t#{session_name}:#{window_index}.#{pane_index}",
+            ),
+            root,
+            timeout=10,
+        )
+        panes: list[dict[str, Any]] = []
+        if panes_result.get("returncode") == 0:
+            for line in str(panes_result.get("stdout") or "").splitlines():
+                parts = line.split("\t")
+                panes.append(
+                    {
+                        "pane_id": parts[0] if len(parts) > 0 else "",
+                        "pane_current_command": parts[1] if len(parts) > 1 else "",
+                        "location": parts[2] if len(parts) > 2 else "",
+                    }
+                )
+        return {
+            "runtime_substrate": mux,
+            "display": str(display.get("stdout") or "").strip(),
+            "panes": panes,
+        }
+    return {"runtime_substrate": "", "display": "", "panes": []}
+
+
+def command_check(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    report = build_report(root)
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True, ensure_ascii=False))
+    else:
+        print_human(report)
+    return 0 if report["ok"] else 1
+
+
+def command_print_prompt(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    path = framework_root(root) / "VISIBLE_LEADER_PROMPT_CURRENT.md"
+    text = read_text(path)
+    if not text:
+        print(f"missing or empty: {rel(path, root)}", file=sys.stderr)
+        return 1
+    print(text, end="" if text.endswith("\n") else "\n")
+    return 0
+
+
+def command_diff(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    text = read_text(root / "AGENTS.md")
+    current = managed_block(text)
+    workers = visible_workers(root)
+    worker = select_visible_worker(workers)
+    worker_id, pane_id, port = visible_worker_identity(worker)
+    expected = expected_block(
+        worker_id or "vw-user<default>",
+        pane_id or "%pane",
+        port,
+    )
+    if not current:
+        print("managed block missing")
+        return 1
+    diff = list(
+        difflib.unified_diff(
+            expected.splitlines(),
+            current.splitlines(),
+            fromfile="expected-managed-block",
+            tofile="AGENTS.md-managed-block",
+            lineterm="",
+        )
+    )
+    if not diff:
+        print("managed block matches expected policy block")
+        return 0
+    print("\n".join(diff))
+    return 1
+
+
+def command_backend_audit(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    report = build_backend_audit_report(root, args.backend)
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True, ensure_ascii=False))
+    else:
+        print_backend_audit_human(report)
+    return 0 if report.get("switch_ready") else 1
+
+
+def command_backend_reconcile(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    report = build_backend_reconcile_report(root, args.backend)
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True, ensure_ascii=False))
+    else:
+        print_backend_reconcile_human(report)
+    return 0 if report.get("switch_ready") else 1
+
+
+def command_backend_reconcile_script(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    report = build_backend_reconcile_report(root, args.backend)
+    print(render_default_worker_recovery_script(report), end="")
+    return 0 if report.get("switch_ready") else 1
+
+
+def command_backend_reconcile_export(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    report = build_backend_reconcile_report(root, args.backend)
+    exported = export_default_worker_recovery(root, report, getattr(args, "output", None))
+    print(f"script_path: {exported['script_path']}")
+    print(f"metadata_path: {exported['metadata_path']}")
+    print(f"worker_id: {exported['worker_id']}")
+    return 0 if report.get("switch_ready") else 1
+
+
+def command_backend_reconcile_validate(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    report = build_default_worker_recovery_status(root, args.backend, getattr(args, "script", None))
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True, ensure_ascii=False))
+    else:
+        print(f"worker_id: {report['worker_id']}")
+        print(f"script_path: {report['script_path']}")
+        print(f"metadata_path: {report['metadata_path']}")
+        print(f"fresh: {str(bool(report['fresh'])).lower()}")
+        print(f"script_exists: {str(bool(report['script_exists'])).lower()}")
+        print(f"metadata_exists: {str(bool(report['metadata_exists'])).lower()}")
+        print(f"script_executable: {str(bool(report['script_executable'])).lower()}")
+        print(f"script_matches_current: {str(bool(report['script_matches_current'])).lower()}")
+        print(f"metadata_matches_current: {str(bool(report['metadata_matches_current'])).lower()}")
+        print(f"ready_to_execute: {str(bool(report['ready_to_execute'])).lower()}")
+        if report.get("stale_reasons"):
+            print(f"stale_reasons: {', '.join(report['stale_reasons'])}")
+        if report.get("execution_blockers"):
+            print(f"execution_blockers: {', '.join(report['execution_blockers'])}")
+    return 0 if report.get("fresh") else 1
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Read-only visible OpenCode TUI policy checker. Does not submit tasks or call OpenCode POST APIs."
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    check = sub.add_parser("check", help="check project visible-control policy and runtime readiness")
+    check.add_argument("--root", default=".")
+    check.add_argument("--json", action="store_true")
+    check.set_defaults(func=command_check)
+
+    prompt = sub.add_parser("print-prompt", help="print the current visible leader prompt")
+    prompt.add_argument("--root", default=".")
+    prompt.set_defaults(func=command_print_prompt)
+
+    diff = sub.add_parser("diff", help="show diff between expected and installed AGENTS.md managed block")
+    diff.add_argument("--root", default=".")
+    diff.set_defaults(func=command_diff)
+
+    audit = sub.add_parser("backend-audit", help="read-only audit of whether a candidate backend is ready to become the default")
+    audit.add_argument("--root", default=".")
+    audit.add_argument("--backend", default="tmux-reference", choices=["tmux-reference", "rmux-reference", "rmux-spike"])
+    audit.add_argument("--json", action="store_true")
+    audit.set_defaults(func=command_backend_audit)
+
+    reconcile = sub.add_parser("backend-reconcile", help="read-only next-action plan for blocked backend workers")
+    reconcile.add_argument("--root", default=".")
+    reconcile.add_argument("--backend", default="tmux-reference", choices=["tmux-reference", "rmux-reference", "rmux-spike"])
+    reconcile.add_argument("--json", action="store_true")
+    reconcile.set_defaults(func=command_backend_reconcile)
+
+    reconcile_script = sub.add_parser("backend-reconcile-script", help="print an ordered shell script for default worker recovery")
+    reconcile_script.add_argument("--root", default=".")
+    reconcile_script.add_argument("--backend", default="tmux-reference", choices=["tmux-reference", "rmux-reference", "rmux-spike"])
+    reconcile_script.set_defaults(func=command_backend_reconcile_script)
+
+    reconcile_export = sub.add_parser("backend-reconcile-export", help="write the default worker recovery script and metadata artifact")
+    reconcile_export.add_argument("--root", default=".")
+    reconcile_export.add_argument("--backend", default="tmux-reference", choices=["tmux-reference", "rmux-reference", "rmux-spike"])
+    reconcile_export.add_argument("--output", help="optional explicit output script path")
+    reconcile_export.set_defaults(func=command_backend_reconcile_export)
+
+    reconcile_validate = sub.add_parser("backend-reconcile-validate", help="validate an exported default worker recovery artifact against current runtime state")
+    reconcile_validate.add_argument("--root", default=".")
+    reconcile_validate.add_argument("--backend", default="tmux-reference", choices=["tmux-reference", "rmux-reference", "rmux-spike"])
+    reconcile_validate.add_argument("--script", help="optional explicit recovery script path")
+    reconcile_validate.add_argument("--json", action="store_true")
+    reconcile_validate.set_defaults(func=command_backend_reconcile_validate)
+
+    for command_parser in sub.choices.values():
+        command_parser.set_defaults(root=None)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return int(args.func(args))
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 2
+    except Exception as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

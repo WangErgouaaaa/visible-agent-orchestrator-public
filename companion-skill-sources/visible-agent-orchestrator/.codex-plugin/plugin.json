@@ -1,0 +1,10 @@
+{
+  "name": "visible-agent-orchestrator-skill-v0",
+  "version": "0.3.0",
+  "displayName": "Visible Agent Orchestrator Skill v0",
+  "description": "Canonical source plugin for tmux-only visible-worker orchestration with capability-scoped mutation admission and immutable generation rollout.",
+  "category": "Productivity",
+  "author": {
+    "name": "visible-agent-orchestrator"
+  }
+}

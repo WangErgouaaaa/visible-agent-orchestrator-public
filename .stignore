@@ -1,0 +1,14 @@
+__pycache__
+.pytest_cache
+.venv
+.env
+.env.*
+.omx
+runtime-identity.json
+runtime-config.json
+.mcp.json
+.codex/config.toml
+.codex/mcp
+reports
+*.log
+*.sock

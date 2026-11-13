@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "provenance_kind": "public_source_release",
+  "description": "Content hashes for the portable framework source; installation must match these exact reviewed bytes.",
+  "files": {
+    "bin/omx_orchestrator_loop": {
+      "runtime_path": "bin/omx_orchestrator_loop",
+      "reviewed_source_sha256": "125f72a3eded97a4f3da87bb7e6c1500223b41f3864e20586319d1e799753d96"
+    },
+    "src/visible_agent_orchestrator/orchestrator_loop.py": {
+      "runtime_path": "lib/visible_agent_orchestrator/orchestrator_loop.py",
+      "reviewed_source_sha256": "5d245dd9029862ec8ed12f90439e18d8c50980693016960edbc1b21a0173c511"
+    }
+  }
+}

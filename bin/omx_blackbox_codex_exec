@@ -1,0 +1,825 @@
+#!/usr/bin/env python3
+"""Submit a task-file prompt to a Codex tmux pane with queued-input handshake recovery."""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from dataclasses import asdict, dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Callable, Iterable
+
+
+DEFAULT_SESSIONS_ROOT = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")) / "sessions"
+DEFAULT_SUBMIT_KEY = "Enter"
+IDLE_CODEX_TITLE_PREFIXES = ("🤖 Codex |", "🤖 Codex", "⠋", "⠏", "⠧", "⠼", "⠦", "⠸", "⠴")
+CODEX_SCROLLBACK_MARKERS = (">_ OpenAI Codex",)
+CODEX_EMPTY_COMPOSER_PLACEHOLDERS = {
+    "Ask Codex to do anything",
+    "Check recently modified functions for compatibility",
+    "Explain this codebase",
+    "Find and fix a bug in @filename",
+    "How many files have been modified?",
+    "Implement {feature}",
+    "Improve documentation in @filename",
+    "Run /review on my current changes",
+    "Summarize recent commits",
+    "Use /skills to list available skills",
+    "Will this algorithm scale well?",
+    "Write tests for @filename",
+}
+
+
+class BlackboxCodexExecError(Exception):
+    """Expected operator-facing failure."""
+
+
+@dataclass
+class SessionMatch:
+    session_file: Path
+    line_no: int
+    message: str
+    timestamp: float | None
+    turn_id: str = ""
+
+
+@dataclass
+class ExecOutcome:
+    ok: bool
+    status: str
+    pane: str
+    prompt: str
+    submit_state: str
+    used_extra_enter: bool
+    reply_file: str
+    reply_exists: bool
+    session_file: str | None
+    submission_line: int | None
+    final_line: str | None
+    error: str | None
+
+
+def parse_timestamp(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def newest_session_files(root: Path, max_files: int) -> list[Path]:
+    files = [path for path in root.rglob("*.jsonl") if path.is_file()]
+    files.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    return files[:max_files]
+
+
+def session_line_baseline(root: Path, max_files: int = 50) -> dict[Path, int]:
+    return {
+        path: sum(1 for _ in path.open("r", encoding="utf-8"))
+        for path in newest_session_files(root, max_files=max_files)
+    }
+
+
+def user_message_text(payload: dict) -> str | None:
+    if payload.get("type") == "user_message":
+        return payload.get("message")
+    if payload.get("type") == "message" and payload.get("role") == "user":
+        content = payload.get("content", [])
+        parts = [item.get("text", "") for item in content if isinstance(item, dict) and item.get("type") == "input_text"]
+        return "".join(parts) or None
+    return None
+
+
+def final_answer_text(payload: dict) -> str | None:
+    if payload.get("type") == "agent_message" and payload.get("phase") == "final_answer":
+        return payload.get("message")
+    if payload.get("type") == "message" and payload.get("role") == "assistant" and payload.get("phase") == "final_answer":
+        content = payload.get("content", [])
+        parts = [item.get("text", "") for item in content if isinstance(item, dict) and item.get("type") == "output_text"]
+        return "".join(parts) or None
+    return None
+
+
+def iter_jsonl(path: Path) -> Iterable[tuple[int, dict]]:
+    with path.open("r", encoding="utf-8") as handle:
+        for line_no, raw in enumerate(handle, 1):
+            raw = raw[:-1] if raw.endswith("\n") else raw
+            if not raw.strip():
+                continue
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            yield line_no, parsed
+
+
+def payload_turn_id(payload: dict) -> str:
+    metadata = payload.get("internal_chat_message_metadata_passthrough", {})
+    return str(metadata.get("turn_id") or "") if isinstance(metadata, dict) else ""
+
+
+def find_latest_user_message(
+    root: Path,
+    *,
+    prompt: str,
+    since_epoch: float,
+    max_files: int = 50,
+    after_lines: dict[Path, int] | None = None,
+) -> SessionMatch | None:
+    latest: SessionMatch | None = None
+    for session_file in newest_session_files(root, max_files=max_files):
+        baseline_line = after_lines.get(session_file, 0) if after_lines is not None else 0
+        for line_no, parsed in iter_jsonl(session_file):
+            timestamp = parse_timestamp(parsed.get("timestamp"))
+            appended_after_baseline = after_lines is not None and line_no > baseline_line
+            if not appended_after_baseline and timestamp is not None and timestamp < since_epoch:
+                continue
+            payload = parsed.get("payload", {})
+            text = user_message_text(payload)
+            if text != prompt:
+                continue
+            match = SessionMatch(
+                session_file=session_file,
+                line_no=line_no,
+                message=text,
+                timestamp=timestamp,
+                turn_id=payload_turn_id(payload),
+            )
+            if latest is None or (
+                (match.timestamp or 0.0, bool(match.turn_id), match.line_no)
+                >= (latest.timestamp or 0.0, bool(latest.turn_id), latest.line_no)
+            ):
+                latest = match
+    return latest
+
+
+def find_first_final_answer(
+    session_file: Path,
+    *,
+    after_line: int,
+    since_epoch: float,
+    expected_final_line: str | None = None,
+) -> SessionMatch | None:
+    fallback: SessionMatch | None = None
+    for line_no, parsed in iter_jsonl(session_file):
+        if line_no <= after_line:
+            continue
+        timestamp = parse_timestamp(parsed.get("timestamp"))
+        if timestamp is not None and timestamp < since_epoch:
+            continue
+        payload = parsed.get("payload", {})
+        text = final_answer_text(payload)
+        if text is None:
+            continue
+        match = SessionMatch(session_file=session_file, line_no=line_no, message=text, timestamp=timestamp)
+        if expected_final_line is not None:
+            last_nonempty_line = next(
+                (line for line in reversed(text.splitlines()) if line.strip()),
+                "",
+            )
+            if last_nonempty_line == expected_final_line:
+                return SessionMatch(
+                    session_file=session_file,
+                    line_no=line_no,
+                    message=expected_final_line,
+                    timestamp=timestamp,
+                )
+        if fallback is None:
+            fallback = match
+    return fallback
+
+
+def run_tmux(argv: list[str]) -> str:
+    result = subprocess.run(argv, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    if result.returncode != 0:
+        raise BlackboxCodexExecError(result.stderr.strip() or result.stdout.strip() or f"tmux command failed: {' '.join(argv)}")
+    return result.stdout
+
+
+def dispatch_initial_tmux(pane: str, prompt: str, *, submit_key: str = DEFAULT_SUBMIT_KEY) -> None:
+    run_tmux(["tmux", "send-keys", "-t", pane, "-l", prompt])
+    run_tmux(["tmux", "send-keys", "-t", pane, submit_key])
+
+
+def dispatch_extra_enter_tmux(pane: str, *, submit_key: str = DEFAULT_SUBMIT_KEY) -> None:
+    run_tmux(["tmux", "send-keys", "-t", pane, submit_key])
+
+
+def pane_title_tmux(pane: str) -> str:
+    return run_tmux(["tmux", "display-message", "-p", "-t", pane, "#{pane_title}"]).strip()
+
+
+def capture_tail_tmux(pane: str, start: int = -300) -> str:
+    return run_tmux(["tmux", "capture-pane", "-p", "-J", "-S", str(start), "-t", pane])
+
+
+def default_prompt(task_file: Path) -> str:
+    return f"Please read {task_file} and execute it exactly."
+
+
+def looks_like_codex_title(title: str) -> bool:
+    return any(title.startswith(prefix) for prefix in IDLE_CODEX_TITLE_PREFIXES)
+
+
+def looks_like_codex_pane(*, title: str, tail: str) -> bool:
+    if looks_like_codex_title(title):
+        return True
+    return any(marker in tail for marker in CODEX_SCROLLBACK_MARKERS)
+
+
+def composer_rows(lines: list[str], start: int, end: int, lower_bound: int) -> str | None:
+    stripped = lines[start].lstrip()
+    origin_indent = lines[start][:len(lines[start]) - len(stripped)]
+    for previous_index in range(start - 1, -1, -1):
+        previous = lines[previous_index]
+        previous_text = previous.lstrip()
+        if previous_text.startswith("›"):
+            previous_indent = len(previous) - len(previous_text)
+            if previous_indent < len(origin_indent):
+                if previous_index < lower_bound:
+                    return None
+                start = previous_index
+                stripped = previous_text
+                origin_indent = previous[:previous_indent]
+    if origin_indent and any(row.strip() for row in lines[:start]):
+        return None
+    indent = origin_indent + "  "
+    continuation = lines[start + 1:end]
+    if any(not row.startswith(indent) for row in continuation):
+        return None
+    return "\n".join([stripped[1:].lstrip(), *(row[len(indent):] for row in continuation)])
+
+
+def current_input_buffer(tail: str) -> str | None:
+    lines = str(tail or "").splitlines()
+    for index in range(len(lines) - 1, -1, -1):
+        if " · Context " not in lines[index]:
+            continue
+        end = index
+        while end > 0 and not lines[end - 1].strip():
+            end -= 1
+        for start in range(end - 1, max(-1, index - 9), -1):
+            line = lines[start]
+            if not line.strip():
+                return None
+            stripped = line.lstrip()
+            if stripped.startswith("›"):
+                return composer_rows(lines, start, end, max(0, index - 8))
+        return None
+    for start in range(len(lines) - 1, max(-1, len(lines) - 7), -1):
+        line = lines[start]
+        if not line.strip():
+            continue
+        stripped = line.lstrip()
+        return composer_rows(lines, start, start + 1, max(0, len(lines) - 6)) if stripped.startswith("›") else None
+    return None
+
+
+def composer_text_pattern(text: str) -> re.Pattern:
+    # Only observed row boundaries may join characters or replace a prompt space.
+    return re.compile("\n?".join(
+        r"(?: |\n)" if char == " " else re.escape(char) for char in text
+    ))
+
+
+def visible_prompt_occurrences(*, prompt: str, task_file: Path, tail: str) -> int:
+    input_buffer = current_input_buffer(tail)
+    if input_buffer is None:
+        return 0
+    pattern = composer_text_pattern(prompt)
+    count = sum(1 for _ in pattern.finditer(input_buffer))
+    if count > 1:
+        return count
+    return int(pattern.fullmatch(input_buffer.rstrip(" \t")) is not None)
+
+
+def queued_prompt_state(*, prompt: str, task_file: Path, tail: str) -> str:
+    occurrences = visible_prompt_occurrences(prompt=prompt, task_file=task_file, tail=tail)
+    if occurrences > 1:
+        return "duplicate_queued_prompt"
+    if occurrences == 1:
+        return "queued_expected_prompt"
+    input_buffer = current_input_buffer(tail)
+    if input_buffer is not None and input_buffer.strip():
+        return "unexpected_queued_prompt"
+    return "not_queued"
+
+
+def input_buffer_observable(tail: str) -> bool:
+    return current_input_buffer(tail) is not None
+
+
+def observe_input_state(
+    *,
+    pane: str,
+    prompt: str,
+    task_file: Path,
+    capture_tail: Callable[[str], str],
+    timeout_seconds: float,
+    poll_interval_seconds: float,
+    now: Callable[[], float],
+    sleep: Callable[[float], None],
+    initial_tail: str,
+) -> tuple[str, str]:
+    state = queued_prompt_state(prompt=prompt, task_file=task_file, tail=initial_tail)
+    if state != "not_queued" or input_buffer_observable(initial_tail) or timeout_seconds <= 0:
+        return state, initial_tail
+
+    deadline = now() + timeout_seconds
+    tail = initial_tail
+    while now() < deadline:
+        sleep(poll_interval_seconds)
+        tail = capture_tail(pane)
+        state = queued_prompt_state(prompt=prompt, task_file=task_file, tail=tail)
+        if state != "not_queued" or input_buffer_observable(tail):
+            return state, tail
+    return state, tail
+
+
+def wait_for_submission(
+    *,
+    prompt: str,
+    since_epoch: float,
+    timeout_seconds: float,
+    poll_interval_seconds: float,
+    find_submission: Callable[[str, float], SessionMatch | None],
+    now: Callable[[], float],
+    sleep: Callable[[float], None],
+) -> SessionMatch | None:
+    deadline = now() + timeout_seconds
+    while now() <= deadline:
+        match = find_submission(prompt, since_epoch)
+        if match is not None:
+            return match
+        sleep(poll_interval_seconds)
+    return None
+
+
+def wait_for_final_answer(
+    *,
+    session_file: Path,
+    after_line: int,
+    since_epoch: float,
+    timeout_seconds: float,
+    post_reply_grace_seconds: float,
+    poll_interval_seconds: float,
+    expected_final_line: str | None,
+    find_final_answer: Callable[[Path, int, float], SessionMatch | None],
+    file_exists: Callable[[Path], bool],
+    reply_file: Path,
+    now: Callable[[], float],
+    sleep: Callable[[float], None],
+) -> tuple[SessionMatch | None, bool]:
+    initial_deadline = now() + timeout_seconds
+    deadline = initial_deadline
+    reply_deadline: float | None = None
+    last_final: SessionMatch | None = None
+    while now() <= deadline:
+        final = find_final_answer(session_file, after_line, since_epoch)
+        reply_exists = file_exists(reply_file)
+        if final is not None:
+            last_final = final
+        if final is not None and reply_exists and (expected_final_line is None or final.message == expected_final_line):
+            return final, True
+        if reply_exists and reply_deadline is None:
+            reply_deadline = initial_deadline + post_reply_grace_seconds
+            if reply_deadline > deadline:
+                deadline = reply_deadline
+        sleep(poll_interval_seconds)
+    return last_final, file_exists(reply_file)
+
+
+def execute_handshake(
+    *,
+    pane: str,
+    task_file: Path,
+    reply_file: Path,
+    expected_final_line: str | None,
+    submit_timeout_seconds: float,
+    finish_timeout_seconds: float,
+    post_reply_grace_seconds: float = 20.0,
+    poll_interval_seconds: float,
+    fail_on_unobservable_input: bool = False,
+    input_observation_timeout_seconds: float = 0.0,
+    confirmed_empty_input: bool = False,
+    dispatch_initial: Callable[[str, str], None],
+    dispatch_extra_enter: Callable[[str], None],
+    find_submission: Callable[[str, float], SessionMatch | None],
+    find_final_answer: Callable[[Path, int, float], SessionMatch | None],
+    pane_title: Callable[[str], str],
+    capture_tail: Callable[[str], str],
+    file_exists: Callable[[Path], bool],
+    now: Callable[[], float],
+    sleep: Callable[[float], None],
+) -> ExecOutcome:
+    task_file = task_file.expanduser().resolve(strict=False)
+    reply_file = reply_file.expanduser().resolve(strict=False)
+    prompt = default_prompt(task_file)
+    observed_title = pane_title(pane)
+    observed_tail = capture_tail(pane)
+    if not looks_like_codex_pane(title=observed_title, tail=observed_tail):
+        return ExecOutcome(
+            ok=False,
+            status="pane_not_codex",
+            pane=pane,
+            prompt=prompt,
+            submit_state="not_attempted",
+            used_extra_enter=False,
+            reply_file=str(reply_file),
+            reply_exists=file_exists(reply_file),
+            session_file=None,
+            submission_line=None,
+            final_line=None,
+            error=f"target pane is not an idle Codex pane: title={observed_title!r} tail={observed_tail[-200:]}",
+        )
+
+    preflight_queue_state, observed_tail = observe_input_state(
+        pane=pane,
+        prompt=prompt,
+        task_file=task_file,
+        capture_tail=capture_tail,
+        timeout_seconds=input_observation_timeout_seconds if fail_on_unobservable_input else 0.0,
+        poll_interval_seconds=poll_interval_seconds,
+        now=now,
+        sleep=sleep,
+        initial_tail=observed_tail,
+    )
+    observed_input = current_input_buffer(observed_tail)
+    confirmed_placeholder = bool(
+        confirmed_empty_input
+        and observed_input is not None
+        and any(
+            composer_text_pattern(placeholder).fullmatch(observed_input.rstrip(" \t"))
+            for placeholder in CODEX_EMPTY_COMPOSER_PLACEHOLDERS
+        )
+    )
+    if (
+        preflight_queue_state == "unexpected_queued_prompt"
+        and not confirmed_placeholder
+    ):
+        return ExecOutcome(
+            ok=False,
+            status="submit_handshake_problem",
+            pane=pane,
+            prompt=prompt,
+            submit_state="unexpected_queued_prompt",
+            used_extra_enter=False,
+            reply_file=str(reply_file),
+            reply_exists=file_exists(reply_file),
+            session_file=None,
+            submission_line=None,
+            final_line=None,
+            error=f"unexpected queued prompt title={observed_title!r} tail={observed_tail[-200:]}",
+        )
+    if preflight_queue_state == "duplicate_queued_prompt":
+        return ExecOutcome(
+            ok=False,
+            status="submit_handshake_problem",
+            pane=pane,
+            prompt=prompt,
+            submit_state="duplicate_queued_prompt",
+            used_extra_enter=False,
+            reply_file=str(reply_file),
+            reply_exists=file_exists(reply_file),
+            session_file=None,
+            submission_line=None,
+            final_line=None,
+            error=f"duplicate queued prompt title={observed_title!r} tail={observed_tail[-200:]}",
+        )
+    if confirmed_placeholder:
+        preflight_queue_state = "not_queued"
+    confirmation_used = bool(
+        fail_on_unobservable_input
+        and confirmed_empty_input
+        and preflight_queue_state == "not_queued"
+        and (
+            confirmed_placeholder
+            or not input_buffer_observable(observed_tail)
+        )
+    )
+    if (
+        fail_on_unobservable_input
+        and preflight_queue_state == "not_queued"
+        and not input_buffer_observable(observed_tail)
+        and not confirmation_used
+    ):
+        return ExecOutcome(
+            ok=False,
+            status="input_buffer_unobservable",
+            pane=pane,
+            prompt=prompt,
+            submit_state="input_buffer_unobservable",
+            used_extra_enter=False,
+            reply_file=str(reply_file),
+            reply_exists=file_exists(reply_file),
+            session_file=None,
+            submission_line=None,
+            final_line=None,
+            error=f"input buffer is not observable; refusing to paste prompt title={observed_title!r} tail={observed_tail[-200:]}",
+        )
+
+    used_extra_enter = False
+    submit_state = (
+        "submitted_after_confirmed_empty_input"
+        if confirmation_used
+        else "submitted_after_first_enter"
+    )
+    if preflight_queue_state == "queued_expected_prompt":
+        used_extra_enter = True
+        submit_state = "queued_expected_prompt"
+        submission_since = now()
+        dispatch_extra_enter(pane)
+    else:
+        submission_since = now()
+        dispatch_initial(pane, prompt)
+
+    initial_submission = wait_for_submission(
+        prompt=prompt,
+        since_epoch=submission_since,
+        timeout_seconds=submit_timeout_seconds,
+        poll_interval_seconds=poll_interval_seconds,
+        find_submission=find_submission,
+        now=now,
+        sleep=sleep,
+    )
+    if initial_submission is not None and preflight_queue_state == "queued_expected_prompt":
+        submit_state = "submitted_after_submit_only_recovery"
+
+    if initial_submission is None:
+        observed_title = pane_title(pane)
+        observed_tail = capture_tail(pane)
+        post_first_queue_state, observed_tail = observe_input_state(
+            pane=pane,
+            prompt=prompt,
+            task_file=task_file,
+            capture_tail=capture_tail,
+            timeout_seconds=input_observation_timeout_seconds if fail_on_unobservable_input else 0.0,
+            poll_interval_seconds=poll_interval_seconds,
+            now=now,
+            sleep=sleep,
+            initial_tail=observed_tail,
+        )
+        if post_first_queue_state == "unexpected_queued_prompt":
+            return ExecOutcome(
+                ok=False,
+                status="submit_handshake_problem",
+                pane=pane,
+                prompt=prompt,
+                submit_state="unexpected_queued_prompt",
+                used_extra_enter=used_extra_enter,
+                reply_file=str(reply_file),
+                reply_exists=file_exists(reply_file),
+                session_file=None,
+                submission_line=None,
+                final_line=None,
+                error=f"unexpected queued prompt title={observed_title!r} tail={observed_tail[-200:]}",
+            )
+        if post_first_queue_state == "duplicate_queued_prompt":
+            return ExecOutcome(
+                ok=False,
+                status="submit_handshake_problem",
+                pane=pane,
+                prompt=prompt,
+                submit_state="duplicate_queued_prompt",
+                used_extra_enter=used_extra_enter,
+                reply_file=str(reply_file),
+                reply_exists=file_exists(reply_file),
+                session_file=None,
+                submission_line=None,
+                final_line=None,
+                error=f"duplicate queued prompt title={observed_title!r} tail={observed_tail[-200:]}",
+            )
+        if fail_on_unobservable_input and post_first_queue_state == "not_queued" and not input_buffer_observable(observed_tail):
+            return ExecOutcome(
+                ok=False,
+                status="input_buffer_unobservable",
+                pane=pane,
+                prompt=prompt,
+                submit_state="input_buffer_unobservable_after_first_submit",
+                used_extra_enter=used_extra_enter,
+                reply_file=str(reply_file),
+                reply_exists=file_exists(reply_file),
+                session_file=None,
+                submission_line=None,
+                final_line=None,
+                error=f"input buffer is not observable after first submit; refusing submit-only recovery title={observed_title!r} tail={observed_tail[-200:]}",
+            )
+        if used_extra_enter:
+            return ExecOutcome(
+                ok=False,
+                status="submit_handshake_problem",
+                pane=pane,
+                prompt=prompt,
+                submit_state=post_first_queue_state,
+                used_extra_enter=True,
+                reply_file=str(reply_file),
+                reply_exists=file_exists(reply_file),
+                session_file=None,
+                submission_line=None,
+                final_line=None,
+                error=f"prompt-still-queued title={observed_title!r} tail={observed_tail[-200:]}",
+            )
+        used_extra_enter = True
+        submit_state = "queued_expected_prompt" if post_first_queue_state == "queued_expected_prompt" else "submitted_no"
+        submission_since = now()
+        dispatch_extra_enter(pane)
+        initial_submission = wait_for_submission(
+            prompt=prompt,
+            since_epoch=submission_since,
+            timeout_seconds=submit_timeout_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+            find_submission=find_submission,
+            now=now,
+            sleep=sleep,
+        )
+        if initial_submission is None:
+            return ExecOutcome(
+                ok=False,
+                status="submit_handshake_problem",
+                pane=pane,
+                prompt=prompt,
+                submit_state=submit_state,
+                used_extra_enter=used_extra_enter,
+                reply_file=str(reply_file),
+                reply_exists=file_exists(reply_file),
+                session_file=None,
+                submission_line=None,
+                final_line=None,
+                error=f"prompt-still-queued title={observed_title!r} tail={observed_tail[-200:]}",
+            )
+        submit_state = "submitted_after_submit_only_recovery" if preflight_queue_state == "queued_expected_prompt" else "submitted_after_extra_enter"
+
+    final, reply_exists = wait_for_final_answer(
+        session_file=initial_submission.session_file,
+        after_line=initial_submission.line_no,
+        since_epoch=initial_submission.timestamp or 0.0,
+        timeout_seconds=finish_timeout_seconds,
+        post_reply_grace_seconds=post_reply_grace_seconds,
+        poll_interval_seconds=poll_interval_seconds,
+        expected_final_line=expected_final_line,
+        find_final_answer=find_final_answer,
+        file_exists=file_exists,
+        reply_file=reply_file,
+        now=now,
+        sleep=sleep,
+    )
+    if final is None:
+        return ExecOutcome(
+            ok=False,
+            status="final_answer_missing" if reply_exists else "reply_file_missing",
+            pane=pane,
+            prompt=prompt,
+            submit_state=submit_state,
+            used_extra_enter=used_extra_enter,
+            reply_file=str(reply_file),
+            reply_exists=reply_exists,
+            session_file=str(initial_submission.session_file),
+            submission_line=initial_submission.line_no,
+            final_line=None,
+            error="final answer missing" if reply_exists else "reply file missing",
+        )
+    if expected_final_line is not None and final.message != expected_final_line:
+        return ExecOutcome(
+            ok=False,
+            status="final_answer_mismatch",
+            pane=pane,
+            prompt=prompt,
+            submit_state=submit_state,
+            used_extra_enter=used_extra_enter,
+            reply_file=str(reply_file),
+            reply_exists=reply_exists,
+            session_file=str(initial_submission.session_file),
+            submission_line=initial_submission.line_no,
+            final_line=final.message,
+            error=f"expected {expected_final_line!r} got {final.message!r}",
+        )
+    return ExecOutcome(
+        ok=True,
+        status="ok",
+        pane=pane,
+        prompt=prompt,
+        submit_state=submit_state,
+        used_extra_enter=used_extra_enter,
+        reply_file=str(reply_file),
+        reply_exists=reply_exists,
+        session_file=str(initial_submission.session_file),
+        submission_line=initial_submission.line_no,
+        final_line=final.message,
+        error=None,
+    )
+
+
+def command_run(args: argparse.Namespace) -> int:
+    sessions_root = Path(args.sessions_root).expanduser().resolve(strict=False)
+    max_session_files = int(args.max_session_files)
+    submission_baseline = session_line_baseline(
+        sessions_root,
+        max_files=max_session_files,
+    )
+    outcome = execute_handshake(
+        pane=args.pane,
+        task_file=Path(args.task_file),
+        reply_file=Path(args.reply_file),
+        expected_final_line=args.expect_final_line,
+        submit_timeout_seconds=float(args.submit_timeout),
+        finish_timeout_seconds=float(args.finish_timeout),
+        post_reply_grace_seconds=float(args.post_reply_grace),
+        poll_interval_seconds=float(args.poll_interval),
+        fail_on_unobservable_input=bool(args.fail_on_unobservable_input),
+        input_observation_timeout_seconds=float(args.input_observation_timeout),
+        confirmed_empty_input=bool(args.confirm_empty_input),
+        dispatch_initial=lambda pane, prompt: dispatch_initial_tmux(pane, prompt, submit_key=args.submit_key),
+        dispatch_extra_enter=lambda pane: dispatch_extra_enter_tmux(pane, submit_key=args.submit_key),
+        find_submission=lambda prompt, since_epoch: find_latest_user_message(
+            sessions_root,
+            prompt=prompt,
+            since_epoch=since_epoch,
+            max_files=max_session_files,
+            after_lines=submission_baseline,
+        ),
+        find_final_answer=lambda session_file, after_line, since_epoch: find_first_final_answer(
+            session_file,
+            after_line=after_line,
+            since_epoch=since_epoch,
+            expected_final_line=args.expect_final_line,
+        ),
+        pane_title=pane_title_tmux,
+        capture_tail=capture_tail_tmux,
+        file_exists=lambda path: path.exists(),
+        now=time.time,
+        sleep=time.sleep,
+    )
+    if args.json:
+        print(json.dumps(asdict(outcome), indent=2, sort_keys=True))
+    else:
+        print(f"status={outcome.status}")
+        print(f"submit_state={outcome.submit_state}")
+        print(f"used_extra_enter={str(outcome.used_extra_enter).lower()}")
+        if outcome.session_file:
+            print(f"session_file={outcome.session_file}")
+        if outcome.final_line:
+            print(f"final_line={outcome.final_line}")
+        print(f"reply_file={outcome.reply_file}")
+        print(f"reply_exists={str(outcome.reply_exists).lower()}")
+        if outcome.error:
+            print(f"error={outcome.error}", file=sys.stderr)
+    return 0 if outcome.ok else 1
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="omx_blackbox_codex_exec",
+        description="Dispatch a Codex task-file prompt to one tmux pane with queued-input handshake recovery.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    run = sub.add_parser("run", help="submit one task-file prompt to a Codex pane and verify final answer + reply file")
+    run.add_argument("--pane", required=True)
+    run.add_argument("--task-file", required=True)
+    run.add_argument("--reply-file", required=True)
+    run.add_argument("--expect-final-line")
+    run.add_argument("--sessions-root", default=str(DEFAULT_SESSIONS_ROOT))
+    run.add_argument("--max-session-files", type=int, default=50)
+    run.add_argument("--submit-timeout", type=float, default=2.0)
+    run.add_argument("--finish-timeout", type=float, default=60.0)
+    run.add_argument("--post-reply-grace", type=float, default=20.0)
+    run.add_argument("--poll-interval", type=float, default=0.25)
+    run.add_argument("--submit-key", default=DEFAULT_SUBMIT_KEY)
+    run.add_argument("--fail-on-unobservable-input", action="store_true")
+    run.add_argument(
+        "--confirm-empty-input",
+        action="store_true",
+        help=(
+            "record explicit operator confirmation that an unobservable "
+            "pre-submit composer is empty; post-submit recovery still fails closed"
+        ),
+    )
+    run.add_argument("--input-observation-timeout", type=float, default=1.0)
+    run.add_argument("--json", action="store_true")
+    run.set_defaults(func=command_run)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return int(args.func(args))
+    except BlackboxCodexExecError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    except FileNotFoundError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("ERROR: interrupted", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

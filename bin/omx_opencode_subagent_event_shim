@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+"""Convert captured OpenCode plugin events into advisory task-local subagent ledger evidence."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+
+_THIS_FILE = Path(__file__).resolve()
+_CANDIDATE_IMPORT_ROOTS = []
+
+_env_lib = os.environ.get("OMX_VISIBLE_AGENT_ORCHESTRATOR_LIB")
+if _env_lib:
+    _CANDIDATE_IMPORT_ROOTS.append(Path(_env_lib).expanduser().resolve())
+
+_CANDIDATE_IMPORT_ROOTS.append((_THIS_FILE.parent.parent / "src").resolve())
+_CANDIDATE_IMPORT_ROOTS.append((_THIS_FILE.parent.parent / "lib").resolve())
+
+for _path in _CANDIDATE_IMPORT_ROOTS:
+    if _path.exists() and str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
+
+from visible_agent_orchestrator.opencode_subagent_event_shim import (  # noqa: E402
+    SubagentEventError,
+    convert_event,
+    ledger_status,
+    read_event_json,
+    read_event_jsonl,
+    replay_events,
+)
+
+
+def _task_dir(root: Path, value: str) -> Path:
+    path = Path(value)
+    return path.resolve(strict=False) if path.is_absolute() else (root / path).resolve(strict=False)
+
+
+def _emit(payload: dict, *, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
+        return
+    print("opencode_subagent_event_shim: OK")
+    print(f"writes_task_local: {str(bool(payload.get('writes_task_local'))).lower()}")
+    print(f"control_writes: {str(bool(payload.get('control_writes'))).lower()}")
+    print(f"ledger_path: {payload.get('ledger_path') or '-'}")
+    warnings = payload.get("warnings", [])
+    if warnings:
+        print(f"warnings: {', '.join(str(item) for item in warnings)}")
+
+
+def command_convert(args: argparse.Namespace) -> int:
+    root = Path(args.root).resolve()
+    event = read_event_json(args.event_json, sys.stdin.read() if args.event_json == "-" else None)
+    payload = convert_event(
+        root,
+        _task_dir(root, args.task_dir),
+        args.worker,
+        event,
+        write_task_local=bool(args.write_task_local),
+    )
+    _emit(payload, as_json=bool(args.json))
+    return 0
+
+
+def command_validate(args: argparse.Namespace) -> int:
+    root = Path(args.root).resolve()
+    event = read_event_json(args.event_json, sys.stdin.read() if args.event_json == "-" else None)
+    payload = convert_event(root, _task_dir(root, args.task_dir), args.worker, event, write_task_local=False)
+    payload["validation"] = "ok"
+    _emit(payload, as_json=bool(args.json))
+    return 0
+
+
+def command_replay(args: argparse.Namespace) -> int:
+    root = Path(args.root).resolve()
+    events = read_event_jsonl(args.event_jsonl, sys.stdin.read() if args.event_jsonl == "-" else None)
+    payload = replay_events(
+        root,
+        _task_dir(root, args.task_dir),
+        args.worker,
+        events,
+        write_task_local=bool(args.write_task_local),
+    )
+    _emit(payload, as_json=bool(args.json))
+    return 0
+
+
+def command_status(args: argparse.Namespace) -> int:
+    root = Path(args.root).resolve()
+    payload = ledger_status(root, _task_dir(root, args.task_dir))
+    _emit(payload, as_json=bool(args.json))
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    convert = sub.add_parser("convert", help="convert one captured event to an advisory ledger row")
+    convert.add_argument("--root", required=True)
+    convert.add_argument("--task-dir", required=True)
+    convert.add_argument("--worker", required=True)
+    convert.add_argument("--event-json", required=True, help="event JSON path, or '-' for stdin")
+    convert.add_argument("--write-task-local", action="store_true", help="append to task-local subagent_ledger.jsonl")
+    convert.add_argument("--json", action="store_true")
+    convert.set_defaults(func=command_convert)
+
+    validate = sub.add_parser("validate", help="validate one captured event without writing")
+    validate.add_argument("--root", required=True)
+    validate.add_argument("--task-dir", required=True)
+    validate.add_argument("--worker", required=True)
+    validate.add_argument("--event-json", required=True, help="event JSON path, or '-' for stdin")
+    validate.add_argument("--json", action="store_true")
+    validate.set_defaults(func=command_validate)
+
+    replay = sub.add_parser("replay", help="replay captured JSONL events through dry-run validation or advisory append")
+    replay.add_argument("--root", required=True)
+    replay.add_argument("--task-dir", required=True)
+    replay.add_argument("--worker", required=True)
+    replay.add_argument("--event-jsonl", required=True, help="event JSONL path, or '-' for stdin")
+    replay.add_argument("--write-task-local", action="store_true", help="append all validated rows to subagent_ledger.jsonl")
+    replay.add_argument("--json", action="store_true")
+    replay.set_defaults(func=command_replay)
+
+    status = sub.add_parser("status", help="show task-local advisory ledger status")
+    status.add_argument("--root", required=True)
+    status.add_argument("--task-dir", required=True)
+    status.add_argument("--json", action="store_true")
+    status.set_defaults(func=command_status)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return int(args.func(args))
+    except SubagentEventError as exc:
+        print(f"opencode_subagent_event_shim_error: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

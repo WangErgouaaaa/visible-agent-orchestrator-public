@@ -1,0 +1,261 @@
+#!/usr/bin/env python3
+"""Write tmux session titles to client TTYs (VSCode terminal tabs).
+
+Standalone replacement for the title subcommands that previously lived in
+the retired omx_team_board_sidebar. Board-independent: titles are derived
+from live tmux pane metadata only.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+from pathlib import Path
+
+
+_THIS_FILE = Path(__file__).resolve()
+for _p in ((_THIS_FILE.parent.parent / "src").resolve(), (_THIS_FILE.parent.parent / "lib").resolve()):
+    if _p.exists() and str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
+
+from visible_agent_orchestrator.tmux_client_title import (
+    TmuxLatestStateWatcher,
+    cursor_title_state_path_for_tty,
+    format_tmux_session_title,
+    read_tmux_session_title_state,
+    tmux_client_title_headline,
+    tmux_client_title_updates,
+    tmux_session_agent_title_payload,
+    write_terminal_title_sequence,
+    write_tmux_session_title_state,
+)
+
+
+def positive_float_arg(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive number") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than 0")
+    return parsed
+
+
+def positive_int_arg(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than 0")
+    return parsed
+
+
+def command_title_fixture(args: argparse.Namespace) -> int:
+    import json
+
+    payload = json.load(sys.stdin)
+    print(format_tmux_session_title(payload, headline=args.headline, max_chars=args.max_chars))
+    return 0
+
+
+def command_title_once(args: argparse.Namespace) -> int:
+    import os
+
+    session_name = current_tmux_title_headline(args.tmux_command)
+    payload = (
+        tmux_session_agent_title_payload(
+            session_name,
+            tmux_command=args.tmux_command,
+        )
+        if session_name
+        else {}
+    )
+    title = format_tmux_session_title(
+        payload,
+        headline=args.headline or tmux_client_title_headline(session_name),
+        max_chars=args.max_chars,
+    )
+    state_file = args.state_file or os.environ.get("CURSOR_TAB_TITLE_STATE", "")
+    if state_file:
+        write_tmux_session_title_state(state_file, title)
+    print(title)
+    return 0
+
+
+def command_title_clients_once(args: argparse.Namespace) -> int:
+    wrote = 0
+    for client_tty, session_name, _active_pane in list_tmux_title_clients(args.tmux_command):
+        headline = args.headline or tmux_client_title_headline(session_name)
+        payload = tmux_session_agent_title_payload(
+            session_name,
+            tmux_command=args.tmux_command,
+        )
+        title = format_tmux_session_title(payload, headline=headline, max_chars=args.max_chars)
+        if write_tmux_client_title(client_tty, title):
+            print(f"{client_tty} {title}")
+            wrote += 1
+    return 0 if wrote or args.allow_empty else 1
+
+
+def command_title_clients(args: argparse.Namespace) -> int:
+    watcher = TmuxLatestStateWatcher(tmux_command=args.tmux_command)
+    last_titles: dict[str, str] = {}
+    last_connected_ttys: set[str] = set()
+    refresh_interval = args.interval
+    while True:
+        iteration_started_at = time.monotonic()
+        changed = False
+        try:
+            clients = list_tmux_title_clients(args.tmux_command)
+            connected_ttys = {client_tty for client_tty, _session_name, _active_pane in clients}
+            changed = connected_ttys != last_connected_ttys
+            last_connected_ttys = connected_ttys
+            if not clients:
+                if not args.allow_empty:
+                    return 1
+            else:
+                payloads = watcher.poll()
+                last_titles = {tty: title for tty, title in last_titles.items() if tty in connected_ttys}
+                observed_titles = {
+                    tty: read_tmux_session_title_state(cursor_title_state_path_for_tty(tty))
+                    for tty in connected_ttys
+                }
+                for client_tty, title in tmux_client_title_updates(
+                    clients,
+                    payloads,
+                    last_titles=last_titles,
+                    observed_titles=observed_titles,
+                    headline=args.headline,
+                    max_chars=args.max_chars,
+                ):
+                    changed = True
+                    if write_tmux_client_title(client_tty, title):
+                        last_titles[client_tty] = title
+        except KeyboardInterrupt:
+            return 0
+        except (OSError, RuntimeError, SystemExit) as exc:
+            changed = True
+            print(f"warning: title refresh skipped: {exc}", file=sys.stderr, flush=True)
+        refresh_interval = (
+            args.interval
+            if changed
+            else min(max(args.interval, 1.0), refresh_interval * 2)
+        )
+        try:
+            time.sleep(max(0.0, refresh_interval - (time.monotonic() - iteration_started_at)))
+        except KeyboardInterrupt:
+            return 0
+
+
+def write_tmux_client_title(client_tty: str, title: str) -> bool:
+    wrote = False
+    state_path = cursor_title_state_path_for_tty(client_tty)
+    try:
+        write_tmux_session_title_state(state_path, title)
+        wrote = True
+    except OSError as exc:
+        print(f"warning: could not write title state {state_path}: {exc}", file=sys.stderr)
+    try:
+        write_terminal_title_sequence(client_tty, title)
+        wrote = True
+    except OSError as exc:
+        print(f"warning: could not write terminal title {client_tty}: {exc}", file=sys.stderr)
+    return wrote
+
+
+def list_tmux_title_clients(tmux_command: str) -> list[tuple[str, str, str]]:
+    import subprocess
+
+    proc = subprocess.run(
+        [tmux_command, "list-clients", "-F", "#{client_tty}|#{session_name}|#{pane_id}"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise SystemExit(proc.stderr.strip() or proc.stdout.strip() or f"{tmux_command} list-clients failed")
+    clients: list[tuple[str, str, str]] = []
+    for line in proc.stdout.splitlines():
+        client_tty, sep, session_name = line.partition("|")
+        session_name, sep2, active_pane = session_name.partition("|")
+        if sep and client_tty and session_name:
+            clients.append((client_tty, session_name, active_pane if sep2 else ""))
+    return clients
+
+
+def current_tmux_title_headline(tmux_command: str = "") -> str:
+    import os
+    import subprocess
+
+    pane = os.environ.get("TMUX_PANE", "")
+    if not pane.startswith("%"):
+        return ""
+    proc = subprocess.run(
+        [
+            tmux_command or os.environ.get("TMUX_COMMAND", "tmux"),
+            "display-message",
+            "-t",
+            pane,
+            "-p",
+            "#{session_name}",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+        timeout=2,
+    )
+    return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
+def add_title_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--headline", default="", help="fixed headline; default: derived from tmux session name")
+    parser.add_argument("--max-chars", type=positive_int_arg, default=80)
+    parser.add_argument("--tmux-command", default="tmux", help="tmux command path")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="omx_tmux_client_title",
+        description="Render and write tmux session titles for VSCode terminal tabs.",
+    )
+    subparsers = parser.add_subparsers(dest="command")
+
+    title_fixture = subparsers.add_parser("title-fixture", help="render one tmux session title from JSON on stdin")
+    title_fixture.add_argument("--headline", default="")
+    title_fixture.add_argument("--max-chars", type=positive_int_arg, default=80)
+    title_fixture.set_defaults(func=command_title_fixture)
+
+    title_once = subparsers.add_parser("title-once", help="render and optionally write one tmux session title")
+    add_title_args(title_once)
+    title_once.add_argument("--state-file", default="", help="title state file to replace atomically; defaults to CURSOR_TAB_TITLE_STATE")
+    title_once.set_defaults(func=command_title_once)
+
+    title_clients_once = subparsers.add_parser("title-clients-once", help="write titles to tmux client outer TTYs for VSCode terminal tabs")
+    add_title_args(title_clients_once)
+    title_clients_once.add_argument("--allow-empty", action="store_true", help="return success when tmux has no clients")
+    title_clients_once.set_defaults(func=command_title_clients_once)
+
+    title_clients = subparsers.add_parser("title-clients", help="continuously write tmux session titles for VSCode terminal tabs")
+    add_title_args(title_clients)
+    title_clients.add_argument("--interval", type=positive_float_arg, default=30.0, help="refresh interval seconds, default: 30")
+    title_clients.add_argument("--allow-empty", action="store_true", help="keep running when tmux has no clients")
+    title_clients.set_defaults(func=command_title_clients)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not getattr(args, "func", None):
+        parser.print_help()
+        return 2
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

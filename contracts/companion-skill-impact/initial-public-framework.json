@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "change_id": "initial-public-framework",
+  "changed_paths": [
+    "bin/omx_install_sync",
+    "bin/omx_meeting_plan",
+    "bin/omx_visible_dispatch",
+    "contracts/companion-skills.registry.json",
+    "companion-skill-sources/visible-agent-orchestrator/SKILL.md",
+    "companion-skill-sources/ag2-meeting/SKILL.md"
+  ],
+  "changed_contracts": [
+    "companion-skill-lifecycle",
+    "visible-worker-dispatch",
+    "meeting-runtime"
+  ],
+  "skills": [
+    {
+      "skill_id": "visible-agent-orchestrator",
+      "disposition": "affected",
+      "reason": "Publish portable generic runtime instructions and matching discovery package."
+    },
+    {
+      "skill_id": "ag2-meeting",
+      "disposition": "affected",
+      "reason": "Publish generic offline meeting profiles and portable runtime-root instructions."
+    }
+  ]
+}

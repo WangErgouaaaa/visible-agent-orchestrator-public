@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+"""Render offline topology comparisons from explicit recorded datasets."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+LIB = ROOT / "lib"
+for package_root in (LIB, SRC):
+    if package_root.is_dir() and str(package_root) not in sys.path:
+        sys.path.insert(0, str(package_root))
+
+from visible_agent_orchestrator.orchestration_evaluation import (  # noqa: E402
+    OrchestrationEvaluationError,
+    build_orchestration_evaluation_report,
+    load_evaluation_dataset,
+    render_orchestration_evaluation_markdown,
+)
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
+def _write(path_value: str, content: str) -> None:
+    path = Path(path_value).expanduser().resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="omx_orchestration_evaluate",
+        description=(
+            "Compare recorded orchestration topology results offline. "
+            "This command never dispatches workers or reads runtime state."
+        ),
+    )
+    parser.add_argument("--input", required=True, help="recorded evaluation dataset")
+    parser.add_argument("--minimum-cases", type=_positive_int, default=20)
+    parser.add_argument("--minimum-repeats", type=_positive_int, default=3)
+    parser.add_argument("--json-out", help="optional JSON report path")
+    parser.add_argument("--markdown-out", help="optional Markdown report path")
+    parser.add_argument(
+        "--sealed-manifest",
+        help="optional sealed holdout manifest JSON",
+    )
+    parser.add_argument(
+        "--require-sealed-audit",
+        action="store_true",
+        help="block candidate eligibility unless the sealed manifest validates",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="print JSON instead of Markdown",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        dataset = load_evaluation_dataset(args.input)
+        sealed_manifest = None
+        if args.sealed_manifest:
+            sealed_manifest = json.loads(
+                Path(args.sealed_manifest)
+                .expanduser()
+                .read_text(encoding="utf-8")
+            )
+            if not isinstance(sealed_manifest, dict):
+                raise OrchestrationEvaluationError(
+                    "sealed manifest must be a JSON object"
+                )
+        report = build_orchestration_evaluation_report(
+            dataset,
+            minimum_cases=args.minimum_cases,
+            minimum_repeats=args.minimum_repeats,
+            sealed_audit_manifest=sealed_manifest,
+            require_sealed_audit=args.require_sealed_audit,
+        )
+        json_text = json.dumps(report, indent=2, sort_keys=True) + "\n"
+        markdown_text = render_orchestration_evaluation_markdown(report)
+        if args.json_out:
+            _write(args.json_out, json_text)
+        if args.markdown_out:
+            _write(args.markdown_out, markdown_text)
+        print(json_text if args.json else markdown_text, end="")
+        return 0
+    except (OrchestrationEvaluationError, OSError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("ERROR: interrupted", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

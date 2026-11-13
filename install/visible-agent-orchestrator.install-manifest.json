@@ -1,0 +1,623 @@
+{
+  "schema_version": 1,
+  "post_install_smoke_profile": "offline_bootstrap",
+  "description": "Portable framework runtime installed into the explicitly selected target prefix.",
+  "files": [
+    {
+      "source_path": "bin/codex_tmux_resume",
+      "target_path": "bin/codex_tmux_resume",
+      "file_kind": "bin_script",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": true
+    },
+    {
+      "source_path": "bin/omx_ag2_meeting",
+      "target_path": "bin/omx_ag2_meeting",
+      "file_kind": "bin_script",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": true
+    },
+    {
+      "source_path": "bin/omx_blackbox_codex_exec",
+      "target_path": "bin/omx_blackbox_codex_exec",
+      "file_kind": "bin_script",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": true
+    },
+    {
+      "source_path": "bin/omx_blackbox_report",
+      "target_path": "bin/omx_blackbox_report",
+      "file_kind": "bin_script",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": true
+    },
+    {
+      "source_path": "bin/omx_codex_appserver_client",
+      "target_path": "bin/omx_codex_appserver_client",
+      "file_kind": "bin_script",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": true
+    },
+    {
+      "source_path": "bin/omx_codex_tui_adapter",
+      "target_path": "bin/omx_codex_tui_adapter",
+      "file_kind": "bin_script",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": true
+    },
+    {
+      "source_path": "bin/omx_draft_delivery",
+      "target_path": "bin/omx_draft_delivery",
+      "file_kind": "bin_script",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": true
+    },
+    {
+      "source_path": "bin/omx_handoff_evidence",
+      "target_path": "bin/omx_handoff_evidence",
+      "file_kind": "bin_script",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": true
+    },
+    {
+      "source_path": "bin/omx_install_sync",
+      "target_path": "bin/omx_install_sync",
+      "file_kind": "bin_script",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": true
+    },
+    {
+      "source_path": "bin/omx_langgraph_control_plane",
+      "target_path": "bin/omx_langgraph_control_plane",
+      "file_kind": "bin_script",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": true
+    },
+    {
+      "source_path": "bin/omx_loop_engineering",
+      "target_path": "bin/omx_loop_engineering",
+      "file_kind": "bin_script",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": true
+    },
+    {
+      "source_path": "bin/omx_meeting_plan",
+      "target_path": "bin/omx_meeting_plan",
+      "file_kind": "bin_script",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": true
+    },
+    {
+      "source_path": "bin/omx_multiworker_smoke",
+      "target_path": "bin/omx_multiworker_smoke",
+      "file_kind": "bin_script",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": true
+    },
+    {
+      "source_path": "bin/omx_opencode_raw_capture_readiness",
+      "target_path": "bin/omx_opencode_raw_capture_readiness",
+      "file_kind": "bin_script",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": true
+    },
+    {
+      "source_path": "bin/omx_opencode_subagent_event_shim",
+      "target_path": "bin/omx_opencode_subagent_event_shim",
+      "file_kind": "bin_script",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": true
+    },
+    {
+      "source_path": "bin/omx_opencode_tui_adapter",
+      "target_path": "bin/omx_opencode_tui_adapter",
+      "file_kind": "bin_script",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": true
+    },
+    {
+      "source_path": "bin/omx_opencode_visible_launcher",
+      "target_path": "bin/omx_opencode_visible_launcher",
+      "file_kind": "bin_script",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": true
+    },
+    {
+      "source_path": "bin/omx_opencode_worker_launcher",
+      "target_path": "bin/omx_opencode_worker_launcher",
+      "file_kind": "bin_script",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": true
+    },
+    {
+      "source_path": "bin/omx_orchestration_evaluate",
+      "target_path": "bin/omx_orchestration_evaluate",
+      "file_kind": "bin_script",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": true
+    },
+    {
+      "source_path": "bin/omx_orchestrator_loop",
+      "target_path": "bin/omx_orchestrator_loop",
+      "file_kind": "bin_script",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": true
+    },
+    {
+      "source_path": "bin/omx_plugin_check",
+      "target_path": "bin/omx_plugin_check",
+      "file_kind": "bin_script",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": true
+    },
+    {
+      "source_path": "bin/omx_runtime_adapter",
+      "target_path": "bin/omx_runtime_adapter",
+      "file_kind": "bin_script",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": true
+    },
+    {
+      "source_path": "bin/omx_subagent_ledger",
+      "target_path": "bin/omx_subagent_ledger",
+      "file_kind": "bin_script",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": true
+    },
+    {
+      "source_path": "bin/omx_subagent_sidebar",
+      "target_path": "bin/omx_subagent_sidebar",
+      "file_kind": "bin_script",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": true
+    },
+    {
+      "source_path": "bin/omx_task_signal",
+      "target_path": "bin/omx_task_signal",
+      "file_kind": "bin_script",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": true
+    },
+    {
+      "source_path": "bin/omx_team_dispatch",
+      "target_path": "bin/omx_team_dispatch",
+      "file_kind": "bin_script",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": true
+    },
+    {
+      "source_path": "bin/omx_tmux_client_title",
+      "target_path": "bin/omx_tmux_client_title",
+      "file_kind": "bin_script",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": true
+    },
+    {
+      "source_path": "bin/omx_visible_dispatch",
+      "target_path": "bin/omx_visible_dispatch",
+      "file_kind": "bin_script",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": true
+    },
+    {
+      "source_path": "bin/omx_visible_health",
+      "target_path": "bin/omx_visible_health",
+      "file_kind": "bin_script",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": true
+    },
+    {
+      "source_path": "bin/omx_visible_orchestrate",
+      "target_path": "bin/omx_visible_orchestrate",
+      "file_kind": "bin_script",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": true
+    },
+    {
+      "source_path": "bin/omx_visible_policy_check",
+      "target_path": "bin/omx_visible_policy_check",
+      "file_kind": "bin_script",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": true
+    },
+    {
+      "source_path": "bin/omx_visible_rebind",
+      "target_path": "bin/omx_visible_rebind",
+      "file_kind": "bin_script",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": true
+    },
+    {
+      "source_path": "bin/omx_visible_receipt_ack",
+      "target_path": "bin/omx_visible_receipt_ack",
+      "file_kind": "bin_script",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": true
+    },
+    {
+      "source_path": "bin/omx_visible_recovery",
+      "target_path": "bin/omx_visible_recovery",
+      "file_kind": "bin_script",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": true
+    },
+    {
+      "source_path": "bin/omx_visible_task_state",
+      "target_path": "bin/omx_visible_task_state",
+      "file_kind": "bin_script",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": true
+    },
+    {
+      "source_path": "bin/omx_visible_task_state.py",
+      "target_path": "bin/omx_visible_task_state.py",
+      "file_kind": "bin_script",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": true
+    },
+    {
+      "source_path": "bin/omx_visible_watcher",
+      "target_path": "bin/omx_visible_watcher",
+      "file_kind": "bin_script",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": true
+    },
+    {
+      "source_path": "bin/omx_worker_backend",
+      "target_path": "bin/omx_worker_backend",
+      "file_kind": "bin_script",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": true
+    },
+    {
+      "source_path": "bin/runtime-handoff-plan",
+      "target_path": "bin/runtime-handoff-plan",
+      "file_kind": "bin_script",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": true
+    },
+    {
+      "source_path": "src/visible_agent_orchestrator/**/*.py",
+      "target_path": "lib/visible_agent_orchestrator/**/*.py",
+      "file_kind": "python_package",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": true
+    },
+    {
+      "source_path": "worker-backends/authorization-profile.schema.json",
+      "target_path": "worker-backends/authorization-profile.schema.json",
+      "file_kind": "worker_backend_asset",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": false
+    },
+    {
+      "source_path": "worker-backends/live-enable.default.disabled.json",
+      "target_path": "worker-backends/live-enable.default.disabled.json",
+      "file_kind": "worker_backend_asset",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": false
+    },
+    {
+      "source_path": "worker-backends/live-enable.schema.json",
+      "target_path": "worker-backends/live-enable.schema.json",
+      "file_kind": "worker_backend_asset",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": false
+    },
+    {
+      "source_path": "worker-backends/mixed-business-readiness-plan.schema.json",
+      "target_path": "worker-backends/mixed-business-readiness-plan.schema.json",
+      "file_kind": "worker_backend_asset",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": false
+    },
+    {
+      "source_path": "worker-backends/mixed-noop-contract.schema.json",
+      "target_path": "worker-backends/mixed-noop-contract.schema.json",
+      "file_kind": "worker_backend_asset",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": false
+    },
+    {
+      "source_path": "worker-backends/mixed-ready-registry-update.schema.json",
+      "target_path": "worker-backends/mixed-ready-registry-update.schema.json",
+      "file_kind": "worker_backend_asset",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": false
+    },
+    {
+      "source_path": "worker-backends/mixed-worker-plan.schema.json",
+      "target_path": "worker-backends/mixed-worker-plan.schema.json",
+      "file_kind": "worker_backend_asset",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": false
+    },
+    {
+      "source_path": "worker-backends/opencode-evidence-live-authorization-package.schema.json",
+      "target_path": "worker-backends/opencode-evidence-live-authorization-package.schema.json",
+      "file_kind": "worker_backend_asset",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": false
+    },
+    {
+      "source_path": "worker-backends/opencode-evidence-runner-plan.schema.json",
+      "target_path": "worker-backends/opencode-evidence-runner-plan.schema.json",
+      "file_kind": "worker_backend_asset",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": false
+    },
+    {
+      "source_path": "worker-backends/opencode-mixed-readiness-evidence-execution.schema.json",
+      "target_path": "worker-backends/opencode-mixed-readiness-evidence-execution.schema.json",
+      "file_kind": "worker_backend_asset",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": false
+    },
+    {
+      "source_path": "worker-backends/opencode-mixed-readiness-evidence-smoke.schema.json",
+      "target_path": "worker-backends/opencode-mixed-readiness-evidence-smoke.schema.json",
+      "file_kind": "worker_backend_asset",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": false
+    },
+    {
+      "source_path": "worker-backends/opencode-mixed-readiness-gate.schema.json",
+      "target_path": "worker-backends/opencode-mixed-readiness-gate.schema.json",
+      "file_kind": "worker_backend_asset",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": false
+    },
+    {
+      "source_path": "worker-backends/opencode-mixed-ready-registry-update.schema.json",
+      "target_path": "worker-backends/opencode-mixed-ready-registry-update.schema.json",
+      "file_kind": "worker_backend_asset",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": false
+    },
+    {
+      "source_path": "worker-backends/opencode-mixed-status.schema.json",
+      "target_path": "worker-backends/opencode-mixed-status.schema.json",
+      "file_kind": "worker_backend_asset",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": false
+    },
+    {
+      "source_path": "worker-backends/opencode-runtime-proof-authorization-package.schema.json",
+      "target_path": "worker-backends/opencode-runtime-proof-authorization-package.schema.json",
+      "file_kind": "worker_backend_asset",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": false
+    },
+    {
+      "source_path": "worker-backends/opencode-runtime-proof-evidence-postcheck.schema.json",
+      "target_path": "worker-backends/opencode-runtime-proof-evidence-postcheck.schema.json",
+      "file_kind": "worker_backend_asset",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": false
+    },
+    {
+      "source_path": "worker-backends/opencode-runtime-proof-execution-wrapper.schema.json",
+      "target_path": "worker-backends/opencode-runtime-proof-execution-wrapper.schema.json",
+      "file_kind": "worker_backend_asset",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": false
+    },
+    {
+      "source_path": "worker-backends/opencode-runtime-proof-executor-contract.schema.json",
+      "target_path": "worker-backends/opencode-runtime-proof-executor-contract.schema.json",
+      "file_kind": "worker_backend_asset",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": false
+    },
+    {
+      "source_path": "worker-backends/opencode-runtime-proof-executor-writer.schema.json",
+      "target_path": "worker-backends/opencode-runtime-proof-executor-writer.schema.json",
+      "file_kind": "worker_backend_asset",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": false
+    },
+    {
+      "source_path": "worker-backends/opencode-runtime-proof-install-sync-review.schema.json",
+      "target_path": "worker-backends/opencode-runtime-proof-install-sync-review.schema.json",
+      "file_kind": "worker_backend_asset",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": false
+    },
+    {
+      "source_path": "worker-backends/opencode-runtime-proof-one-shot-result.schema.json",
+      "target_path": "worker-backends/opencode-runtime-proof-one-shot-result.schema.json",
+      "file_kind": "worker_backend_asset",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": false
+    },
+    {
+      "source_path": "worker-backends/opencode-runtime-proof-postcheck-contract.schema.json",
+      "target_path": "worker-backends/opencode-runtime-proof-postcheck-contract.schema.json",
+      "file_kind": "worker_backend_asset",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": false
+    },
+    {
+      "source_path": "worker-backends/opencode-runtime-proof-rollout-review.schema.json",
+      "target_path": "worker-backends/opencode-runtime-proof-rollout-review.schema.json",
+      "file_kind": "worker_backend_asset",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": false
+    },
+    {
+      "source_path": "worker-backends/opencode-runtime-proof-runner-plan.schema.json",
+      "target_path": "worker-backends/opencode-runtime-proof-runner-plan.schema.json",
+      "file_kind": "worker_backend_asset",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": false
+    },
+    {
+      "source_path": "worker-backends/opencode-visible-binding-update.schema.json",
+      "target_path": "worker-backends/opencode-visible-binding-update.schema.json",
+      "file_kind": "worker_backend_asset",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": false
+    },
+    {
+      "source_path": "worker-backends/registered-worker-registry.schema.json",
+      "target_path": "worker-backends/registered-worker-registry.schema.json",
+      "file_kind": "worker_backend_asset",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": false
+    },
+    {
+      "source_path": "worker-backends/registered-worker.schema.json",
+      "target_path": "worker-backends/registered-worker.schema.json",
+      "file_kind": "worker_backend_asset",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": false
+    },
+    {
+      "source_path": "worker-backends/registration-evidence-package.schema.json",
+      "target_path": "worker-backends/registration-evidence-package.schema.json",
+      "file_kind": "worker_backend_asset",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": false
+    },
+    {
+      "source_path": "worker-backends/user-authorization-record.schema.json",
+      "target_path": "worker-backends/user-authorization-record.schema.json",
+      "file_kind": "worker_backend_asset",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": false
+    },
+    {
+      "source_path": "companion-skill-sources/visible-agent-orchestrator/references/worker-contracts.md",
+      "target_path": "companion-skill-sources/visible-agent-orchestrator/references/worker-contracts.md",
+      "file_kind": "companion_skill_reference",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": false
+    },
+    {
+      "source_path": "contracts/companion-skill-mutation-surfaces.json",
+      "target_path": "contracts/companion-skill-mutation-surfaces.json",
+      "file_kind": "companion_skill_contract",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": false
+    },
+    {
+      "source_path": "contracts/companion-skills.registry.json",
+      "target_path": "contracts/companion-skills.registry.json",
+      "file_kind": "companion_skill_contract",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": false
+    },
+    {
+      "source_path": "schemas/subagent-ledger.schema.json",
+      "target_path": "schemas/subagent-ledger.schema.json",
+      "file_kind": "schema_asset",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": false
+    },
+    {
+      "source_path": "opencode-plugins/omx-clean-room-startup-gate.mjs",
+      "target_path": "lib/visible_agent_orchestrator/opencode_plugins/omx-clean-room-startup-gate.mjs",
+      "file_kind": "opencode_plugin",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": true
+    },
+    {
+      "source_path": "opencode-plugins/omx-draft-check.mjs",
+      "target_path": "lib/visible_agent_orchestrator/opencode_plugins/omx-draft-check.mjs",
+      "file_kind": "opencode_plugin",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": true
+    },
+    {
+      "source_path": "plugins/ag2-meeting-runtime/profiles/code-design-review.json",
+      "target_path": "plugins/ag2-meeting-runtime/profiles/code-design-review.json",
+      "file_kind": "meeting_profile",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": false
+    },
+    {
+      "source_path": "plugins/ag2-meeting-runtime/profiles/idea-review.json",
+      "target_path": "plugins/ag2-meeting-runtime/profiles/idea-review.json",
+      "file_kind": "meeting_profile",
+      "install_allowed": true,
+      "requires_review": true,
+      "smoke_required_after_install": false
+    }
+  ]
+}

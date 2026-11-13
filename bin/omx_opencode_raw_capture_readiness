@@ -1,0 +1,1014 @@
+#!/usr/bin/env python3
+"""Validate isolated OpenCode raw-capture readiness plans without live writes."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+
+_THIS_FILE = Path(__file__).resolve()
+_CANDIDATE_IMPORT_ROOTS = []
+
+_env_lib = os.environ.get("OMX_VISIBLE_AGENT_ORCHESTRATOR_LIB")
+if _env_lib:
+    _CANDIDATE_IMPORT_ROOTS.append(Path(_env_lib).expanduser().resolve())
+
+_CANDIDATE_IMPORT_ROOTS.append((_THIS_FILE.parent.parent / "src").resolve())
+_CANDIDATE_IMPORT_ROOTS.append((_THIS_FILE.parent.parent / "lib").resolve())
+
+for _path in _CANDIDATE_IMPORT_ROOTS:
+    if _path.exists() and str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
+
+from visible_agent_orchestrator.opencode_raw_capture_readiness import (  # noqa: E402
+    RawCaptureReadinessError,
+    build_plan,
+    check_readiness_plan,
+    read_plan_json,
+)
+from visible_agent_orchestrator.opencode_isolated_capture_manifest import (  # noqa: E402
+    build_capture_manifest,
+)
+from visible_agent_orchestrator.opencode_runtime_proof_authorization import (  # noqa: E402
+    build_runtime_proof_authorization_package,
+    output_dir_guard_errors,
+    validate_runtime_proof_authorization_package,
+    write_runtime_proof_authorization_package,
+)
+from visible_agent_orchestrator.runtime_paths import runtime_root, workspace_root  # noqa: E402
+from visible_agent_orchestrator.opencode_runtime_proof_runner_plan import (  # noqa: E402
+    build_runtime_proof_runner_plan,
+    validate_runtime_proof_runner_plan,
+)
+from visible_agent_orchestrator.opencode_runtime_proof_execution_wrapper import (  # noqa: E402
+    build_runtime_proof_execution_wrapper,
+    validate_runtime_proof_execution_wrapper,
+)
+from visible_agent_orchestrator.opencode_runtime_proof_postcheck_contract import (  # noqa: E402
+    build_runtime_proof_postcheck_contract,
+    validate_runtime_proof_postcheck_contract,
+)
+from visible_agent_orchestrator.opencode_runtime_proof_evidence_postcheck import (  # noqa: E402
+    build_runtime_proof_evidence_postcheck,
+    validate_runtime_proof_evidence_postcheck,
+)
+from visible_agent_orchestrator.opencode_runtime_proof_executor_contract import (  # noqa: E402
+    build_runtime_proof_executor_contract,
+    validate_runtime_proof_executor_contract,
+)
+from visible_agent_orchestrator.opencode_runtime_proof_executor_writer import (  # noqa: E402
+    build_runtime_proof_executor_writer_contract,
+    validate_runtime_proof_executor_writer_contract,
+)
+from visible_agent_orchestrator.opencode_runtime_proof_one_shot_executor import (  # noqa: E402
+    execute_runtime_proof_once,
+)
+from visible_agent_orchestrator.opencode_runtime_proof_rollout_review import (  # noqa: E402
+    build_runtime_proof_rollout_review,
+    validate_runtime_proof_rollout_review,
+)
+from visible_agent_orchestrator.opencode_runtime_proof_install_sync_review import (  # noqa: E402
+    build_runtime_proof_install_sync_review,
+    validate_runtime_proof_install_sync_review,
+)
+
+
+def _emit(payload: dict, *, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
+        return
+    status = "ready" if payload.get("ready_for_future_capture") else "not_ready"
+    print(f"opencode_raw_capture_readiness: {status}")
+    print(f"checker_writes: {str(bool(payload.get('checker_writes'))).lower()}")
+    print(f"control_writes: {str(bool(payload.get('control_writes'))).lower()}")
+    print(f"isolated_config_root: {payload.get('isolated_config_root') or '-'}")
+    print(f"planned_capture_output: {payload.get('planned_capture_output') or '-'}")
+    reasons = payload.get("reasons", [])
+    if reasons:
+        print(f"reasons: {', '.join(str(item) for item in reasons)}")
+
+
+def command_validate(args: argparse.Namespace) -> int:
+    plan = read_plan_json(args.plan_json, sys.stdin.read() if args.plan_json == "-" else None)
+    payload = check_readiness_plan(plan, cwd=Path.cwd())
+    _emit(payload, as_json=bool(args.json))
+    return 0 if payload["ready_for_future_capture"] else 2
+
+
+def command_plan(args: argparse.Namespace) -> int:
+    plan = build_plan(
+        isolated_config_root=args.isolated_config_root,
+        capture_output_path=args.capture_output_path,
+        plugin_path=args.plugin_path,
+        worker_id=args.worker or "",
+        parent_run_id=args.parent_run_id or "",
+        parent_task_id=args.parent_task_id or "",
+    )
+    payload = check_readiness_plan(plan, cwd=Path.cwd())
+    _emit(payload, as_json=bool(args.json))
+    return 0 if payload["ready_for_future_capture"] else 2
+
+
+def command_manifest(args: argparse.Namespace) -> int:
+    payload = build_capture_manifest(
+        isolated_config_root=args.isolated_config_root,
+        capture_output_path=args.capture_output_path,
+        plugin_path=args.plugin_path,
+        worker_id=args.worker or "",
+        parent_run_id=args.parent_run_id or "",
+        parent_task_id=args.parent_task_id or "",
+        authorization_level=args.authorization_level,
+        cwd=Path.cwd(),
+    )
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
+    else:
+        print("opencode_isolated_capture_manifest: no-execution")
+        print(f"would_execute: {str(bool(payload.get('would_execute'))).lower()}")
+        print(f"ready_for_runtime_capture: {str(bool(payload.get('ready_for_runtime_capture'))).lower()}")
+        reasons = payload.get("blocked_reasons", [])
+        if reasons:
+            print(f"blocked_reasons: {', '.join(str(item) for item in reasons)}")
+    return 0 if payload["readiness"]["ready_for_future_capture"] else 2
+
+
+def _read_json_arg(path: str) -> dict:
+    text = sys.stdin.read() if path == "-" else Path(path).read_text(encoding="utf-8")
+    payload = json.loads(text)
+    if not isinstance(payload, dict):
+        raise RawCaptureReadinessError("JSON document must be an object")
+    return payload
+
+
+def _unwrap_rollout_review(payload: dict) -> dict:
+    nested = payload.get("rollout_review")
+    if isinstance(nested, dict):
+        return nested
+    return payload
+
+
+def _unwrap_install_sync_review(payload: dict) -> dict:
+    nested = payload.get("install_sync_review")
+    if isinstance(nested, dict):
+        return nested
+    return payload
+
+
+def _unwrap_postcheck_contract(payload: dict) -> dict:
+    nested = payload.get("postcheck_contract")
+    if isinstance(nested, dict):
+        return nested
+    return payload
+
+
+def _unwrap_evidence_postcheck(payload: dict) -> dict:
+    nested = payload.get("evidence_postcheck")
+    if isinstance(nested, dict):
+        return nested
+    return payload
+
+
+def _parse_approved_argv_json(value: str) -> list[str]:
+    payload = json.loads(value)
+    if not isinstance(payload, list) or not all(isinstance(item, str) for item in payload):
+        raise RawCaptureReadinessError("--approved-argv-json must be a JSON string array")
+    return list(payload)
+
+
+def _emit_runtime_package_payload(payload: dict, *, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
+        return
+    status = "ok" if payload.get("ok") else "not_ok"
+    print(f"opencode_runtime_proof_authorization_package: {status}")
+    print(f"would_execute_opencode: {str(bool(payload.get('would_execute_opencode'))).lower()}")
+    print(f"would_create_artifacts: {str(bool(payload.get('would_create_artifacts'))).lower()}")
+    if payload.get("package_path"):
+        print(f"package_path: {payload['package_path']}")
+    errors = payload.get("errors", [])
+    if errors:
+        print(f"errors: {', '.join(str(item) for item in errors)}")
+
+
+def _emit_runtime_runner_plan_payload(payload: dict, *, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
+        return
+    status = "ok" if payload.get("ok") else "not_ok"
+    print(f"opencode_runtime_proof_runner_plan: {status}")
+    print(f"would_execute_opencode: {str(bool(payload.get('would_execute_opencode'))).lower()}")
+    print(f"would_create_artifacts: {str(bool(payload.get('would_create_artifacts'))).lower()}")
+    errors = payload.get("errors", [])
+    if errors:
+        print(f"errors: {', '.join(str(item) for item in errors)}")
+
+
+def _emit_runtime_execution_wrapper_payload(payload: dict, *, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
+        return
+    status = "ok" if payload.get("ok") else "not_ok"
+    print(f"opencode_runtime_proof_execution_wrapper: {status}")
+    print(f"would_execute_opencode: {str(bool(payload.get('would_execute_opencode'))).lower()}")
+    print(f"would_create_artifacts: {str(bool(payload.get('would_create_artifacts'))).lower()}")
+    errors = payload.get("errors", [])
+    if errors:
+        print(f"errors: {', '.join(str(item) for item in errors)}")
+
+
+def _emit_runtime_postcheck_contract_payload(payload: dict, *, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
+        return
+    status = "ok" if payload.get("ok") else "not_ok"
+    print(f"opencode_runtime_proof_postcheck_contract: {status}")
+    print(f"would_execute_opencode: {str(bool(payload.get('would_execute_opencode'))).lower()}")
+    print(f"would_create_temp_root: {str(bool(payload.get('would_create_temp_root'))).lower()}")
+    print(f"would_read_live_artifacts: {str(bool(payload.get('would_read_live_artifacts'))).lower()}")
+    errors = payload.get("errors", [])
+    if errors:
+        print(f"errors: {', '.join(str(item) for item in errors)}")
+
+
+def _emit_runtime_evidence_postcheck_payload(payload: dict, *, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
+        return
+    status = "ok" if payload.get("ok") else "not_ok"
+    print(f"opencode_runtime_proof_evidence_postcheck: {status}")
+    print(f"would_execute_opencode: {str(bool(payload.get('would_execute_opencode'))).lower()}")
+    print(f"would_read_live_artifacts: {str(bool(payload.get('would_read_live_artifacts'))).lower()}")
+    print(f"would_collect_runtime_evidence: {str(bool(payload.get('would_collect_runtime_evidence'))).lower()}")
+    errors = payload.get("errors", [])
+    if errors:
+        print(f"errors: {', '.join(str(item) for item in errors)}")
+
+
+def _emit_runtime_executor_contract_payload(payload: dict, *, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
+        return
+    status = "ok" if payload.get("ok") else "not_ok"
+    print(f"opencode_runtime_proof_executor_contract: {status}")
+    print(f"would_execute_opencode: {str(bool(payload.get('would_execute_opencode'))).lower()}")
+    print(f"would_create_temp_root: {str(bool(payload.get('would_create_temp_root'))).lower()}")
+    print(f"would_read_live_artifacts: {str(bool(payload.get('would_read_live_artifacts'))).lower()}")
+    errors = payload.get("errors", [])
+    if errors:
+        print(f"errors: {', '.join(str(item) for item in errors)}")
+
+
+def _emit_runtime_executor_writer_payload(payload: dict, *, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
+        return
+    status = "ok" if payload.get("ok") else "not_ok"
+    print(f"opencode_runtime_proof_executor_writer: {status}")
+    print(f"would_execute_opencode: {str(bool(payload.get('would_execute_opencode'))).lower()}")
+    print(f"would_create_temp_root: {str(bool(payload.get('would_create_temp_root'))).lower()}")
+    print(f"would_run_cleanup: {str(bool(payload.get('would_run_cleanup'))).lower()}")
+    print(f"would_write_cleanup_proof: {str(bool(payload.get('would_write_cleanup_proof'))).lower()}")
+    errors = payload.get("errors", [])
+    if errors:
+        print(f"errors: {', '.join(str(item) for item in errors)}")
+
+
+def _emit_runtime_execute_once_payload(payload: dict, *, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
+        return
+    status = "ok" if payload.get("ok") else "not_ok"
+    print(f"opencode_runtime_proof_execute_once: {status}")
+    print(f"did_execute_opencode: {str(bool(payload.get('did_execute_opencode'))).lower()}")
+    print(f"single_attempt_only: {str(bool(payload.get('single_attempt_only'))).lower()}")
+    print(f"no_retry: {str(bool(payload.get('no_retry'))).lower()}")
+    errors = payload.get("errors", [])
+    if errors:
+        print(f"errors: {', '.join(str(item) for item in errors)}")
+
+
+def _emit_runtime_rollout_review_payload(payload: dict, *, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
+        return
+    status = "ok" if payload.get("ok") else "not_ok"
+    print(f"opencode_runtime_proof_rollout_review: {status}")
+    print(f"would_apply_install_sync: {str(bool(payload.get('would_apply_install_sync'))).lower()}")
+    print(f"would_write_data_sync: {str(bool(payload.get('would_write_data_sync'))).lower()}")
+    print(f"would_execute_opencode: {str(bool(payload.get('would_execute_opencode'))).lower()}")
+    errors = payload.get("errors", [])
+    if errors:
+        print(f"errors: {', '.join(str(item) for item in errors)}")
+
+
+def _emit_runtime_install_sync_review_payload(payload: dict, *, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
+        return
+    status = "ok" if payload.get("ok") else "not_ok"
+    print(f"opencode_runtime_proof_install_sync_review: {status}")
+    print(f"would_run_install_sync_apply: {str(bool(payload.get('would_run_install_sync_apply'))).lower()}")
+    print(f"would_write_data_sync: {str(bool(payload.get('would_write_data_sync'))).lower()}")
+    print(f"would_execute_opencode: {str(bool(payload.get('would_execute_opencode'))).lower()}")
+    errors = payload.get("errors", [])
+    if errors:
+        print(f"errors: {', '.join(str(item) for item in errors)}")
+
+
+def command_runtime_proof_authorization_package(args: argparse.Namespace) -> int:
+    manifest = _read_json_arg(args.manifest_json)
+    approved_argv = _parse_approved_argv_json(args.approved_argv_json)
+    package = build_runtime_proof_authorization_package(
+        manifest=manifest,
+        package_id=args.package_id,
+        target_worker_id=args.worker or "",
+        approval_id=args.approval_id,
+        approval_expires_at=args.approval_expires_at,
+        approved_argv=approved_argv,
+        timebox_seconds=args.timebox_seconds,
+        disposable_root=args.disposable_root,
+        selected_runtime_root=args.root,
+        selected_workspace_root=args.workspace_root,
+    )
+    output_errors = output_dir_guard_errors(args.output_dir) if args.output_dir else []
+    package_path = None
+    package_markdown_path = None
+    if not output_errors and args.output_dir and package["validation"]["ok"]:
+        written = write_runtime_proof_authorization_package(package, output_dir=args.output_dir)
+        package_path = written["package_path"]
+        package_markdown_path = written["package_markdown_path"]
+
+    errors = [*package["validation"]["errors"], *output_errors]
+    payload = {
+        "ok": not errors,
+        "errors": errors,
+        "validation": package["validation"],
+        "package": package,
+        "package_path": package_path,
+        "package_markdown_path": package_markdown_path,
+        "would_execute_opencode": False,
+        "would_create_artifacts": bool(package_path or package_markdown_path),
+        "would_write_live_config": False,
+        "would_write_task_local": False,
+        "would_write_registry": False,
+        "would_write_state_team": False,
+    }
+    _emit_runtime_package_payload(payload, as_json=bool(args.json))
+    return 0 if payload["ok"] else 2
+
+
+def command_validate_runtime_proof_authorization_package(args: argparse.Namespace) -> int:
+    package = _read_json_arg(args.package_json)
+    validation = validate_runtime_proof_authorization_package(package)
+    payload = {
+        "ok": validation["ok"],
+        "errors": validation["errors"],
+        "validation": validation,
+        "package_kind": package.get("package_kind", ""),
+        "would_execute_opencode": bool(package.get("would_execute_opencode", False)),
+    }
+    _emit_runtime_package_payload(payload, as_json=bool(args.json))
+    return 0 if validation["ok"] else 2
+
+
+def command_runtime_proof_runner_plan(args: argparse.Namespace) -> int:
+    package = _read_json_arg(args.package_json)
+    runner_plan = build_runtime_proof_runner_plan(
+        package=package,
+        runner_plan_id=args.runner_plan_id,
+        source_package_path=args.package_json if args.package_json != "-" else "",
+        target_worker_id=args.worker or "",
+    )
+    validation = runner_plan["validation"]
+    payload = {
+        "ok": validation["ok"],
+        "errors": validation["errors"],
+        "validation": validation,
+        "runner_plan": runner_plan,
+        "would_execute_opencode": False,
+        "would_create_artifacts": False,
+        "would_write_live_config": False,
+        "would_write_task_local": False,
+        "would_write_registry": False,
+        "would_write_state_team": False,
+    }
+    _emit_runtime_runner_plan_payload(payload, as_json=bool(args.json))
+    return 0 if payload["ok"] else 2
+
+
+def command_validate_runtime_proof_runner_plan(args: argparse.Namespace) -> int:
+    runner_plan = _read_json_arg(args.runner_plan_json)
+    validation = validate_runtime_proof_runner_plan(runner_plan)
+    payload = {
+        "ok": validation["ok"],
+        "errors": validation["errors"],
+        "validation": validation,
+        "plan_kind": runner_plan.get("plan_kind", ""),
+        "would_execute_opencode": bool(runner_plan.get("would_execute_opencode", False)),
+    }
+    _emit_runtime_runner_plan_payload(payload, as_json=bool(args.json))
+    return 0 if validation["ok"] else 2
+
+
+def command_runtime_proof_execution_wrapper(args: argparse.Namespace) -> int:
+    runner_plan = _read_json_arg(args.runner_plan_json)
+    execution_wrapper = build_runtime_proof_execution_wrapper(
+        runner_plan=runner_plan,
+        wrapper_id=args.wrapper_id,
+        source_runner_plan_path=args.runner_plan_json if args.runner_plan_json != "-" else "",
+        target_worker_id=args.worker or "",
+    )
+    validation = execution_wrapper["validation"]
+    payload = {
+        "ok": validation["ok"],
+        "errors": validation["errors"],
+        "validation": validation,
+        "execution_wrapper": execution_wrapper,
+        "would_execute_opencode": False,
+        "would_execute_live": False,
+        "would_touch_worker": False,
+        "would_create_artifacts": False,
+        "would_create_temp_root": False,
+        "would_write_live_config": False,
+        "would_write_task_local": False,
+        "would_write_registry": False,
+        "would_write_state_team": False,
+        "would_write_cleanup_proof": False,
+        "would_collect_runtime_evidence": False,
+    }
+    _emit_runtime_execution_wrapper_payload(payload, as_json=bool(args.json))
+    return 0 if payload["ok"] else 2
+
+
+def command_validate_runtime_proof_execution_wrapper(args: argparse.Namespace) -> int:
+    execution_wrapper = _read_json_arg(args.wrapper_json)
+    validation = validate_runtime_proof_execution_wrapper(execution_wrapper)
+    payload = {
+        "ok": validation["ok"],
+        "errors": validation["errors"],
+        "validation": validation,
+        "wrapper_kind": execution_wrapper.get("wrapper_kind", ""),
+        "would_execute_opencode": bool(execution_wrapper.get("would_execute_opencode", False)),
+    }
+    _emit_runtime_execution_wrapper_payload(payload, as_json=bool(args.json))
+    return 0 if validation["ok"] else 2
+
+
+def command_runtime_proof_postcheck_contract(args: argparse.Namespace) -> int:
+    wrapper = _read_json_arg(args.wrapper_json)
+    execution_receipt = _read_json_arg(args.execution_receipt_json)
+    cleanup_receipt = _read_json_arg(args.cleanup_receipt_json)
+    operator_report = _read_json_arg(args.operator_report_json)
+    postcheck_contract = build_runtime_proof_postcheck_contract(
+        wrapper=wrapper,
+        postcheck_contract_id=args.postcheck_contract_id,
+        source_wrapper_path=args.wrapper_json if args.wrapper_json != "-" else "",
+        target_worker_id=args.worker or "",
+        execution_receipt=execution_receipt,
+        cleanup_receipt=cleanup_receipt,
+        operator_report=operator_report,
+    )
+    validation = postcheck_contract["validation"]
+    payload = {
+        "ok": validation["ok"],
+        "errors": validation["errors"],
+        "validation": validation,
+        "postcheck_contract": postcheck_contract,
+        "would_execute_opencode": False,
+        "would_execute_live": False,
+        "would_touch_worker": False,
+        "would_create_artifacts": False,
+        "would_create_temp_root": False,
+        "would_read_live_artifacts": False,
+        "would_write_live_config": False,
+        "would_write_task_local": False,
+        "would_write_registry": False,
+        "would_write_state_team": False,
+        "would_write_cleanup_proof": False,
+        "would_collect_runtime_evidence": False,
+    }
+    _emit_runtime_postcheck_contract_payload(payload, as_json=bool(args.json))
+    return 0 if payload["ok"] else 2
+
+
+def command_validate_runtime_proof_postcheck_contract(args: argparse.Namespace) -> int:
+    postcheck_contract = _read_json_arg(args.postcheck_contract_json)
+    validation = validate_runtime_proof_postcheck_contract(postcheck_contract)
+    payload = {
+        "ok": validation["ok"],
+        "errors": validation["errors"],
+        "validation": validation,
+        "postcheck_kind": postcheck_contract.get("postcheck_kind", ""),
+        "would_execute_opencode": bool(postcheck_contract.get("would_execute_opencode", False)),
+        "would_read_live_artifacts": bool(postcheck_contract.get("would_read_live_artifacts", False)),
+    }
+    _emit_runtime_postcheck_contract_payload(payload, as_json=bool(args.json))
+    return 0 if validation["ok"] else 2
+
+
+def command_runtime_proof_evidence_postcheck(args: argparse.Namespace) -> int:
+    postcheck_contract = _unwrap_postcheck_contract(_read_json_arg(args.postcheck_contract_json))
+    raw_event_evidence = _read_json_arg(args.raw_event_evidence_json)
+    evidence_postcheck = build_runtime_proof_evidence_postcheck(
+        postcheck_contract=postcheck_contract,
+        evidence_postcheck_id=args.evidence_postcheck_id,
+        source_postcheck_contract_path=args.postcheck_contract_json if args.postcheck_contract_json != "-" else "",
+        target_worker_id=args.worker or "",
+        raw_event_evidence=raw_event_evidence,
+    )
+    validation = evidence_postcheck["validation"]
+    payload = {
+        "ok": validation["ok"],
+        "errors": validation["errors"],
+        "validation": validation,
+        "evidence_postcheck": evidence_postcheck,
+        "would_execute_opencode": False,
+        "would_execute_live": False,
+        "would_touch_worker": False,
+        "would_create_temp_root": False,
+        "would_read_live_artifacts": False,
+        "would_write_live_config": False,
+        "would_write_task_local": False,
+        "would_write_registry": False,
+        "would_write_state_team": False,
+        "would_collect_runtime_evidence": False,
+        "would_touch_tmux": False,
+        "would_call_tui": False,
+    }
+    _emit_runtime_evidence_postcheck_payload(payload, as_json=bool(args.json))
+    return 0 if payload["ok"] else 2
+
+
+def command_validate_runtime_proof_evidence_postcheck(args: argparse.Namespace) -> int:
+    evidence_postcheck = _unwrap_evidence_postcheck(_read_json_arg(args.evidence_postcheck_json))
+    validation = validate_runtime_proof_evidence_postcheck(evidence_postcheck)
+    payload = {
+        "ok": validation["ok"],
+        "errors": validation["errors"],
+        "validation": validation,
+        "evidence_postcheck_kind": evidence_postcheck.get("evidence_postcheck_kind", ""),
+        "would_execute_opencode": bool(evidence_postcheck.get("would_execute_opencode", False)),
+        "would_read_live_artifacts": bool(evidence_postcheck.get("would_read_live_artifacts", False)),
+        "would_collect_runtime_evidence": bool(evidence_postcheck.get("would_collect_runtime_evidence", False)),
+    }
+    _emit_runtime_evidence_postcheck_payload(payload, as_json=bool(args.json))
+    return 0 if validation["ok"] else 2
+
+
+def command_runtime_proof_executor_contract(args: argparse.Namespace) -> int:
+    wrapper = _read_json_arg(args.wrapper_json)
+    executor_contract = build_runtime_proof_executor_contract(
+        wrapper=wrapper,
+        executor_contract_id=args.executor_contract_id,
+        source_wrapper_path=args.wrapper_json if args.wrapper_json != "-" else "",
+        target_worker_id=args.worker or "",
+    )
+    validation = executor_contract["validation"]
+    payload = {
+        "ok": validation["ok"],
+        "errors": validation["errors"],
+        "validation": validation,
+        "executor_contract": executor_contract,
+        "would_execute_opencode": False,
+        "would_execute_live": False,
+        "would_touch_worker": False,
+        "would_create_artifacts": False,
+        "would_create_temp_root": False,
+        "would_read_live_artifacts": False,
+        "would_write_live_config": False,
+        "would_write_task_local": False,
+        "would_write_registry": False,
+        "would_write_state_team": False,
+        "would_write_cleanup_proof": False,
+        "would_collect_runtime_evidence": False,
+    }
+    _emit_runtime_executor_contract_payload(payload, as_json=bool(args.json))
+    return 0 if payload["ok"] else 2
+
+
+def command_validate_runtime_proof_executor_contract(args: argparse.Namespace) -> int:
+    executor_contract = _read_json_arg(args.executor_contract_json)
+    validation = validate_runtime_proof_executor_contract(executor_contract)
+    payload = {
+        "ok": validation["ok"],
+        "errors": validation["errors"],
+        "validation": validation,
+        "executor_kind": executor_contract.get("executor_kind", ""),
+        "would_execute_opencode": bool(executor_contract.get("would_execute_opencode", False)),
+        "would_read_live_artifacts": bool(executor_contract.get("would_read_live_artifacts", False)),
+    }
+    _emit_runtime_executor_contract_payload(payload, as_json=bool(args.json))
+    return 0 if validation["ok"] else 2
+
+
+def command_runtime_proof_executor_writer(args: argparse.Namespace) -> int:
+    executor_contract = _read_json_arg(args.executor_contract_json)
+    executor_writer_contract = build_runtime_proof_executor_writer_contract(
+        executor_contract=executor_contract,
+        writer_contract_id=args.writer_contract_id,
+        source_executor_contract_path=args.executor_contract_json if args.executor_contract_json != "-" else "",
+        target_worker_id=args.worker or "",
+    )
+    validation = executor_writer_contract["validation"]
+    payload = {
+        "ok": validation["ok"],
+        "errors": validation["errors"],
+        "validation": validation,
+        "executor_writer_contract": executor_writer_contract,
+        "would_execute_opencode": False,
+        "would_execute_live": False,
+        "would_touch_worker": False,
+        "would_create_temp_root": False,
+        "would_run_cleanup": False,
+        "would_read_live_artifacts": False,
+        "would_write_live_config": False,
+        "would_write_cleanup_proof": False,
+        "would_write_task_local": False,
+        "would_write_registry": False,
+        "would_write_state_team": False,
+        "would_collect_runtime_evidence": False,
+        "would_touch_tmux": False,
+        "would_call_tui": False,
+    }
+    _emit_runtime_executor_writer_payload(payload, as_json=bool(args.json))
+    return 0 if payload["ok"] else 2
+
+
+def command_validate_runtime_proof_executor_writer(args: argparse.Namespace) -> int:
+    executor_writer_contract = _read_json_arg(args.executor_writer_json)
+    validation = validate_runtime_proof_executor_writer_contract(executor_writer_contract)
+    payload = {
+        "ok": validation["ok"],
+        "errors": validation["errors"],
+        "validation": validation,
+        "writer_kind": executor_writer_contract.get("writer_kind", ""),
+        "would_execute_opencode": bool(executor_writer_contract.get("would_execute_opencode", False)),
+        "would_create_temp_root": bool(executor_writer_contract.get("would_create_temp_root", False)),
+        "would_run_cleanup": bool(executor_writer_contract.get("would_run_cleanup", False)),
+        "would_write_cleanup_proof": bool(executor_writer_contract.get("would_write_cleanup_proof", False)),
+    }
+    _emit_runtime_executor_writer_payload(payload, as_json=bool(args.json))
+    return 0 if validation["ok"] else 2
+
+
+def command_runtime_proof_execute_once(args: argparse.Namespace) -> int:
+    if not bool(args.execute_approved_once):
+        raise RawCaptureReadinessError("runtime-proof-execute-once requires --execute-approved-once")
+    wrapper = _read_json_arg(args.wrapper_json)
+    payload = execute_runtime_proof_once(
+        wrapper=wrapper,
+        execution_id=args.execution_id,
+    )
+    _emit_runtime_execute_once_payload(payload, as_json=bool(args.json))
+    return 0 if payload["ok"] else 2
+
+
+def command_runtime_proof_rollout_review(args: argparse.Namespace) -> int:
+    rollout_review = build_runtime_proof_rollout_review(
+        review_id=args.review_id,
+        source_root=args.source_root,
+        target_root=args.target_root,
+        manifest_path=args.manifest_json,
+    )
+    validation = rollout_review["validation"]
+    payload = {
+        "ok": validation["ok"],
+        "errors": validation["errors"],
+        "validation": validation,
+        "rollout_review": rollout_review,
+        "asset_count": validation["asset_count"],
+        "would_apply_install_sync": False,
+        "would_write_data_sync": False,
+        "would_execute_opencode": False,
+        "would_touch_tmux": False,
+    }
+    _emit_runtime_rollout_review_payload(payload, as_json=bool(args.json))
+    return 0 if payload["ok"] else 2
+
+
+def command_validate_runtime_proof_rollout_review(args: argparse.Namespace) -> int:
+    rollout_review = _unwrap_rollout_review(_read_json_arg(args.rollout_review_json))
+    validation = validate_runtime_proof_rollout_review(rollout_review)
+    payload = {
+        "ok": validation["ok"],
+        "errors": validation["errors"],
+        "validation": validation,
+        "review_kind": rollout_review.get("review_kind", ""),
+        "would_apply_install_sync": bool(rollout_review.get("would_apply_install_sync", False)),
+        "would_write_data_sync": bool(rollout_review.get("would_write_data_sync", False)),
+        "would_execute_opencode": bool(rollout_review.get("would_execute_opencode", False)),
+        "would_touch_tmux": bool(rollout_review.get("would_touch_tmux", False)),
+    }
+    _emit_runtime_rollout_review_payload(payload, as_json=bool(args.json))
+    return 0 if validation["ok"] else 2
+
+
+def command_runtime_proof_install_sync_review(args: argparse.Namespace) -> int:
+    rollout_review = _unwrap_rollout_review(_read_json_arg(args.rollout_review_json))
+    install_plan = _read_json_arg(args.install_plan_json)
+    install_sync_review = build_runtime_proof_install_sync_review(
+        review_id=args.review_id,
+        source_root=args.source_root,
+        target_root=args.target_root,
+        rollout_review=rollout_review,
+        install_plan=install_plan,
+    )
+    validation = install_sync_review["validation"]
+    payload = {
+        "ok": validation["ok"],
+        "errors": validation["errors"],
+        "validation": validation,
+        "install_sync_review": install_sync_review,
+        "asset_count": validation["asset_count"],
+        "would_run_install_sync_apply": False,
+        "would_write_data_sync": False,
+        "would_copy_files": False,
+        "would_chmod": False,
+        "would_run_live_smoke": False,
+        "would_execute_opencode": False,
+        "would_touch_tmux": False,
+    }
+    _emit_runtime_install_sync_review_payload(payload, as_json=bool(args.json))
+    return 0 if payload["ok"] else 2
+
+
+def command_validate_runtime_proof_install_sync_review(args: argparse.Namespace) -> int:
+    install_sync_review = _unwrap_install_sync_review(_read_json_arg(args.install_sync_review_json))
+    validation = validate_runtime_proof_install_sync_review(install_sync_review)
+    payload = {
+        "ok": validation["ok"],
+        "errors": validation["errors"],
+        "validation": validation,
+        "review_kind": install_sync_review.get("review_kind", ""),
+        "would_run_install_sync_apply": bool(install_sync_review.get("would_run_install_sync_apply", False)),
+        "would_write_data_sync": bool(install_sync_review.get("would_write_data_sync", False)),
+        "would_execute_opencode": bool(install_sync_review.get("would_execute_opencode", False)),
+        "would_touch_tmux": bool(install_sync_review.get("would_touch_tmux", False)),
+    }
+    _emit_runtime_install_sync_review_payload(payload, as_json=bool(args.json))
+    return 0 if validation["ok"] else 2
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    validate = sub.add_parser("validate", help="validate a proposed raw-capture plan JSON")
+    validate.add_argument("--plan-json", required=True, help="plan JSON path, or '-' for stdin")
+    validate.add_argument("--json", action="store_true")
+    validate.set_defaults(func=command_validate)
+
+    plan = sub.add_parser("plan", help="build and validate a no-live raw-capture readiness plan")
+    plan.add_argument("--isolated-config-root", required=True)
+    plan.add_argument("--capture-output-path", required=True)
+    plan.add_argument("--plugin-path", required=True)
+    plan.add_argument("--worker")
+    plan.add_argument("--parent-run-id")
+    plan.add_argument("--parent-task-id")
+    plan.add_argument("--json", action="store_true")
+    plan.set_defaults(func=command_plan)
+
+    manifest = sub.add_parser("manifest", help="emit a no-execution isolated raw-capture manifest")
+    manifest.add_argument("--isolated-config-root", required=True)
+    manifest.add_argument("--capture-output-path", required=True)
+    manifest.add_argument("--plugin-path", required=True)
+    manifest.add_argument("--worker")
+    manifest.add_argument("--parent-run-id")
+    manifest.add_argument("--parent-task-id")
+    manifest.add_argument("--authorization-level", default="no-execution")
+    manifest.add_argument("--json", action="store_true")
+    manifest.set_defaults(func=command_manifest)
+
+    runtime_package = sub.add_parser(
+        "runtime-proof-authorization-package",
+        help="build a no-execution runtime-proof authorization package from a manifest",
+    )
+    runtime_package.add_argument("--manifest-json", required=True, help="authorized manifest JSON path, or '-'")
+    runtime_package.add_argument("--package-id", required=True)
+    runtime_package.add_argument("--worker", required=True)
+    runtime_package.add_argument("--approval-id", required=True)
+    runtime_package.add_argument("--approval-expires-at", required=True)
+    runtime_package.add_argument("--approved-argv-json", required=True, help='JSON array, for example ["opencode","debug","config"]')
+    runtime_package.add_argument("--timebox-seconds", required=True, type=int)
+    runtime_package.add_argument("--disposable-root", required=True)
+    runtime_package.add_argument("--root", default=str(runtime_root()))
+    runtime_package.add_argument("--workspace-root", default=str(workspace_root()))
+    runtime_package.add_argument("--output-dir", help="optional safe review-artifact output directory")
+    runtime_package.add_argument("--json", action="store_true")
+    runtime_package.set_defaults(func=command_runtime_proof_authorization_package)
+
+    validate_runtime_package = sub.add_parser(
+        "validate-runtime-proof-authorization-package",
+        help="validate a no-execution runtime-proof authorization package JSON",
+    )
+    validate_runtime_package.add_argument("--package-json", required=True, help="package JSON path, or '-'")
+    validate_runtime_package.add_argument("--json", action="store_true")
+    validate_runtime_package.set_defaults(func=command_validate_runtime_proof_authorization_package)
+
+    runtime_runner_plan = sub.add_parser(
+        "runtime-proof-runner-plan",
+        help="build a source-only no-execution runtime-proof runner plan from an authorization package",
+    )
+    runtime_runner_plan.add_argument("--package-json", required=True, help="authorization package JSON path, or '-'")
+    runtime_runner_plan.add_argument("--runner-plan-id", required=True)
+    runtime_runner_plan.add_argument("--worker", help="target worker override; must match the package approval")
+    runtime_runner_plan.add_argument("--json", action="store_true")
+    runtime_runner_plan.set_defaults(func=command_runtime_proof_runner_plan)
+
+    validate_runtime_runner_plan = sub.add_parser(
+        "validate-runtime-proof-runner-plan",
+        help="validate a source-only no-execution runtime-proof runner plan JSON",
+    )
+    validate_runtime_runner_plan.add_argument("--runner-plan-json", required=True, help="runner plan JSON path, or '-'")
+    validate_runtime_runner_plan.add_argument("--json", action="store_true")
+    validate_runtime_runner_plan.set_defaults(func=command_validate_runtime_proof_runner_plan)
+
+    runtime_execution_wrapper = sub.add_parser(
+        "runtime-proof-execution-wrapper",
+        help="build a source-only no-execution runtime-proof execution-wrapper plan from a runner plan",
+    )
+    runtime_execution_wrapper.add_argument("--runner-plan-json", required=True, help="runner plan JSON path, or '-'")
+    runtime_execution_wrapper.add_argument("--wrapper-id", required=True)
+    runtime_execution_wrapper.add_argument("--worker", help="target worker override; must match the runner plan")
+    runtime_execution_wrapper.add_argument("--json", action="store_true")
+    runtime_execution_wrapper.set_defaults(func=command_runtime_proof_execution_wrapper)
+
+    validate_runtime_execution_wrapper = sub.add_parser(
+        "validate-runtime-proof-execution-wrapper",
+        help="validate a source-only no-execution runtime-proof execution-wrapper JSON",
+    )
+    validate_runtime_execution_wrapper.add_argument("--wrapper-json", required=True, help="execution-wrapper JSON path, or '-'")
+    validate_runtime_execution_wrapper.add_argument("--json", action="store_true")
+    validate_runtime_execution_wrapper.set_defaults(func=command_validate_runtime_proof_execution_wrapper)
+
+    runtime_postcheck_contract = sub.add_parser(
+        "runtime-proof-postcheck-contract",
+        help="build a source-only no-execution runtime-proof postcheck contract from supplied receipt JSON",
+    )
+    runtime_postcheck_contract.add_argument("--wrapper-json", required=True, help="execution-wrapper JSON path")
+    runtime_postcheck_contract.add_argument("--postcheck-contract-id", required=True)
+    runtime_postcheck_contract.add_argument("--execution-receipt-json", required=True)
+    runtime_postcheck_contract.add_argument("--cleanup-receipt-json", required=True)
+    runtime_postcheck_contract.add_argument("--operator-report-json", required=True)
+    runtime_postcheck_contract.add_argument("--worker", help="target worker override; must match the wrapper")
+    runtime_postcheck_contract.add_argument("--json", action="store_true")
+    runtime_postcheck_contract.set_defaults(func=command_runtime_proof_postcheck_contract)
+
+    validate_runtime_postcheck_contract = sub.add_parser(
+        "validate-runtime-proof-postcheck-contract",
+        help="validate a source-only no-execution runtime-proof postcheck contract JSON",
+    )
+    validate_runtime_postcheck_contract.add_argument(
+        "--postcheck-contract-json",
+        required=True,
+        help="postcheck contract JSON path, or '-'",
+    )
+    validate_runtime_postcheck_contract.add_argument("--json", action="store_true")
+    validate_runtime_postcheck_contract.set_defaults(func=command_validate_runtime_proof_postcheck_contract)
+
+    runtime_evidence_postcheck = sub.add_parser(
+        "runtime-proof-evidence-postcheck",
+        help="build a supplied-json-only runtime-proof evidence postcheck from a postcheck contract and raw-event evidence",
+    )
+    runtime_evidence_postcheck.add_argument("--postcheck-contract-json", required=True, help="postcheck contract JSON path")
+    runtime_evidence_postcheck.add_argument("--evidence-postcheck-id", required=True)
+    runtime_evidence_postcheck.add_argument("--raw-event-evidence-json", required=True)
+    runtime_evidence_postcheck.add_argument("--worker", help="target worker override; must match the postcheck contract")
+    runtime_evidence_postcheck.add_argument("--json", action="store_true")
+    runtime_evidence_postcheck.set_defaults(func=command_runtime_proof_evidence_postcheck)
+
+    validate_runtime_evidence_postcheck = sub.add_parser(
+        "validate-runtime-proof-evidence-postcheck",
+        help="validate a supplied-json-only runtime-proof evidence postcheck JSON",
+    )
+    validate_runtime_evidence_postcheck.add_argument(
+        "--evidence-postcheck-json",
+        required=True,
+        help="evidence postcheck JSON path, or '-'",
+    )
+    validate_runtime_evidence_postcheck.add_argument("--json", action="store_true")
+    validate_runtime_evidence_postcheck.set_defaults(func=command_validate_runtime_proof_evidence_postcheck)
+
+    runtime_executor_contract = sub.add_parser(
+        "runtime-proof-executor-contract",
+        help="build a source-only no-execution runtime-proof executor contract from an execution wrapper",
+    )
+    runtime_executor_contract.add_argument("--wrapper-json", required=True, help="execution-wrapper JSON path")
+    runtime_executor_contract.add_argument("--executor-contract-id", required=True)
+    runtime_executor_contract.add_argument("--worker", help="target worker override; must match the wrapper")
+    runtime_executor_contract.add_argument("--json", action="store_true")
+    runtime_executor_contract.set_defaults(func=command_runtime_proof_executor_contract)
+
+    validate_runtime_executor_contract = sub.add_parser(
+        "validate-runtime-proof-executor-contract",
+        help="validate a source-only no-execution runtime-proof executor contract JSON",
+    )
+    validate_runtime_executor_contract.add_argument(
+        "--executor-contract-json",
+        required=True,
+        help="executor contract JSON path, or '-'",
+    )
+    validate_runtime_executor_contract.add_argument("--json", action="store_true")
+    validate_runtime_executor_contract.set_defaults(func=command_validate_runtime_proof_executor_contract)
+
+    runtime_executor_writer = sub.add_parser(
+        "runtime-proof-executor-writer",
+        help="build a source-only no-execution runtime-proof executor-writer contract from an executor contract",
+    )
+    runtime_executor_writer.add_argument("--executor-contract-json", required=True, help="executor contract JSON path")
+    runtime_executor_writer.add_argument("--writer-contract-id", required=True)
+    runtime_executor_writer.add_argument("--worker", help="target worker override; must match the executor contract")
+    runtime_executor_writer.add_argument("--json", action="store_true")
+    runtime_executor_writer.set_defaults(func=command_runtime_proof_executor_writer)
+
+    validate_runtime_executor_writer = sub.add_parser(
+        "validate-runtime-proof-executor-writer",
+        help="validate a source-only no-execution runtime-proof executor-writer contract JSON",
+    )
+    validate_runtime_executor_writer.add_argument(
+        "--executor-writer-json",
+        required=True,
+        help="executor-writer contract JSON path, or '-'",
+    )
+    validate_runtime_executor_writer.add_argument("--json", action="store_true")
+    validate_runtime_executor_writer.set_defaults(func=command_validate_runtime_proof_executor_writer)
+
+    runtime_execute_once = sub.add_parser(
+        "runtime-proof-execute-once",
+        help="execute one approved isolated runtime-proof wrapper attempt",
+    )
+    runtime_execute_once.add_argument("--wrapper-json", required=True, help="execution-wrapper JSON path")
+    runtime_execute_once.add_argument("--execution-id", required=True)
+    runtime_execute_once.add_argument(
+        "--execute-approved-once",
+        action="store_true",
+        help="required acknowledgement that this runs the wrapper's approved argv exactly once",
+    )
+    runtime_execute_once.add_argument("--json", action="store_true")
+    runtime_execute_once.set_defaults(func=command_runtime_proof_execute_once)
+
+    runtime_rollout_review = sub.add_parser(
+        "runtime-proof-rollout-review",
+        help="build a source-only no-apply runtime-proof rollout review package",
+    )
+    runtime_rollout_review.add_argument("--review-id", required=True)
+    runtime_rollout_review.add_argument("--source-root", required=True)
+    runtime_rollout_review.add_argument("--target-root", required=True)
+    runtime_rollout_review.add_argument("--manifest-json", required=True)
+    runtime_rollout_review.add_argument("--json", action="store_true")
+    runtime_rollout_review.set_defaults(func=command_runtime_proof_rollout_review)
+
+    validate_runtime_rollout_review = sub.add_parser(
+        "validate-runtime-proof-rollout-review",
+        help="validate a source-only no-apply runtime-proof rollout review package JSON",
+    )
+    validate_runtime_rollout_review.add_argument(
+        "--rollout-review-json",
+        required=True,
+        help="rollout review JSON path, or '-'",
+    )
+    validate_runtime_rollout_review.add_argument("--json", action="store_true")
+    validate_runtime_rollout_review.set_defaults(func=command_validate_runtime_proof_rollout_review)
+
+    runtime_install_sync_review = sub.add_parser(
+        "runtime-proof-install-sync-review",
+        help="build a source-only no-apply runtime-proof install/sync review bundle",
+    )
+    runtime_install_sync_review.add_argument("--review-id", required=True)
+    runtime_install_sync_review.add_argument("--source-root", required=True)
+    runtime_install_sync_review.add_argument("--target-root", required=True)
+    runtime_install_sync_review.add_argument("--rollout-review-json", required=True, help="rollout review JSON path, or '-'")
+    runtime_install_sync_review.add_argument("--install-plan-json", required=True, help="install plan JSON path, or '-'")
+    runtime_install_sync_review.add_argument("--json", action="store_true")
+    runtime_install_sync_review.set_defaults(func=command_runtime_proof_install_sync_review)
+
+    validate_runtime_install_sync_review = sub.add_parser(
+        "validate-runtime-proof-install-sync-review",
+        help="validate a source-only no-apply runtime-proof install/sync review bundle JSON",
+    )
+    validate_runtime_install_sync_review.add_argument(
+        "--install-sync-review-json",
+        required=True,
+        help="install/sync review JSON path, or '-'",
+    )
+    validate_runtime_install_sync_review.add_argument("--json", action="store_true")
+    validate_runtime_install_sync_review.set_defaults(func=command_validate_runtime_proof_install_sync_review)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return int(args.func(args))
+    except RawCaptureReadinessError as exc:
+        print(f"opencode_raw_capture_readiness_error: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

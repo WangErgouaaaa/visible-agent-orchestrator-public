@@ -1,0 +1,251 @@
+#!/usr/bin/env python3
+"""No-live artifact tools for bounded multi-agent loop engineering."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+from typing import Any
+
+
+_THIS_FILE = Path(__file__).resolve()
+for _path in (
+    (_THIS_FILE.parent.parent / "src").resolve(),
+    (_THIS_FILE.parent.parent / "lib").resolve(),
+):
+    if _path.exists() and str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
+
+from visible_agent_orchestrator.loop_engineering_runtime import (  # noqa: E402
+    execute_main_command,
+    observe_worker_once,
+    record_main_adoption,
+    record_thinker_feedback,
+    run_loop_watchdog,
+)
+from visible_agent_orchestrator.loop_engineering import (  # noqa: E402
+    evaluate_live_pilot_gate,
+)
+from visible_agent_orchestrator.control_plane_contract import (  # noqa: E402
+    VisibleDispatchContract,
+)
+
+
+def _read_json_object(path_value: str) -> dict[str, Any]:
+    payload = json.loads(Path(path_value).read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"expected JSON object: {path_value}")
+    return payload
+
+
+def _read_snapshot_sequence(path_value: str) -> list[dict[str, Any]]:
+    payload: object = json.loads(Path(path_value).read_text(encoding="utf-8"))
+    if isinstance(payload, dict):
+        payload = payload.get("snapshots", [payload])
+    if not isinstance(payload, list) or not payload:
+        raise ValueError(f"expected non-empty snapshot list: {path_value}")
+    if not all(isinstance(item, dict) for item in payload):
+        raise ValueError(f"snapshot list must contain objects: {path_value}")
+    return [dict(item) for item in payload]
+
+
+def _read_json_rows(path_value: str) -> list[dict[str, Any]]:
+    payload: object = json.loads(Path(path_value).read_text(encoding="utf-8"))
+    if isinstance(payload, dict):
+        payload = payload.get("incidents", [])
+    if not isinstance(payload, list) or not all(
+        isinstance(item, dict) for item in payload
+    ):
+        raise ValueError(f"expected JSON object rows: {path_value}")
+    return [dict(item) for item in payload]
+
+
+def _emit(payload: dict[str, Any], *, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
+        return
+    print(f"{payload.get('loop_kind', 'loop_engineering')}:")
+    print(f"  worker_effects_executed: {payload.get('worker_effects_executed', 0)}")
+    if "cycles" in payload:
+        print(f"  cycles: {payload['cycles']}")
+    if "incidents_emitted" in payload:
+        print(f"  incidents_emitted: {payload['incidents_emitted']}")
+
+
+def command_watch(args: argparse.Namespace) -> int:
+    payload = run_loop_watchdog(
+        profile=_read_json_object(args.profile_json),
+        snapshots=_read_snapshot_sequence(args.snapshots_json),
+        output_dir=args.output_dir,
+        stale_cycle_threshold=args.stale_cycle_threshold,
+        max_cycles=args.max_cycles,
+    )
+    _emit(payload, as_json=bool(args.json))
+    return 0
+
+
+def command_observe_worker(args: argparse.Namespace) -> int:
+    contract = VisibleDispatchContract(
+        root=Path(args.root).resolve(),
+        backend=args.backend,
+    )
+    payload = observe_worker_once(
+        contract=contract,
+        profile=_read_json_object(args.profile_json),
+        output_dir=args.output_dir,
+        run_id=args.run_id,
+        workflow_revision=args.workflow_revision,
+        lane_id=args.lane_id,
+        attempt_id=args.attempt_id,
+        worker_id=args.worker,
+        stale_cycle_threshold=args.stale_cycle_threshold,
+    )
+    _emit(payload, as_json=bool(args.json))
+    return 0
+
+
+def command_command(args: argparse.Namespace) -> int:
+    payload = execute_main_command(
+        output_dir=args.output_dir,
+        command=_read_json_object(args.command_json),
+    )
+    _emit(payload, as_json=bool(args.json))
+    return 0
+
+
+def command_thinker_feedback(args: argparse.Namespace) -> int:
+    payload = record_thinker_feedback(
+        output_dir=args.output_dir,
+        review_bundle=_read_json_object(args.review_json),
+        current_snapshot_digest=args.current_snapshot_digest,
+        workflow_revision=args.workflow_revision,
+        max_rounds=args.max_rounds,
+        parent_task_dir=args.parent_task_dir or None,
+    )
+    _emit(payload, as_json=bool(args.json))
+    return 0
+
+
+def command_main_adoption(args: argparse.Namespace) -> int:
+    payload = record_main_adoption(
+        output_dir=args.output_dir,
+        decision=_read_json_object(args.decision_json),
+    )
+    _emit(payload, as_json=bool(args.json))
+    return 0
+
+
+def command_pilot_gate(args: argparse.Namespace) -> int:
+    payload = evaluate_live_pilot_gate(
+        profile=_read_json_object(args.profile_json),
+        policy=_read_json_object(args.policy_json),
+        grant=_read_json_object(args.grant_json),
+        snapshot=_read_json_object(args.snapshot_json),
+        edge_id=args.edge_id,
+        active_incidents=(
+            _read_json_rows(args.active_incidents_json)
+            if args.active_incidents_json
+            else None
+        ),
+    )
+    _emit(payload, as_json=bool(args.json))
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    watch = sub.add_parser(
+        "watch",
+        help="write bounded no-live watchdog artifacts from offline snapshots",
+    )
+    watch.add_argument("--profile-json", required=True)
+    watch.add_argument("--snapshots-json", required=True)
+    watch.add_argument("--output-dir", required=True)
+    watch.add_argument("--stale-cycle-threshold", type=int, default=2)
+    watch.add_argument("--max-cycles", type=int, default=None)
+    watch.add_argument("--json", action="store_true")
+    watch.set_defaults(func=command_watch)
+
+    observe_worker = sub.add_parser(
+        "observe-worker",
+        help="run one worker-scoped read-only health observation",
+        description="Run one worker-scoped read-only health observation.",
+    )
+    observe_worker.add_argument("--root", required=True)
+    observe_worker.add_argument("--backend", default="tmux-reference")
+    observe_worker.add_argument("--profile-json", required=True)
+    observe_worker.add_argument("--output-dir", required=True)
+    observe_worker.add_argument("--run-id", required=True)
+    observe_worker.add_argument("--workflow-revision", required=True)
+    observe_worker.add_argument("--lane-id", required=True)
+    observe_worker.add_argument("--attempt-id", required=True)
+    observe_worker.add_argument("--worker", required=True)
+    observe_worker.add_argument("--stale-cycle-threshold", type=int, default=2)
+    observe_worker.add_argument("--json", action="store_true")
+    observe_worker.set_defaults(func=command_observe_worker)
+
+    command = sub.add_parser(
+        "command",
+        help="record one Main-owned recovery command without worker effects",
+    )
+    command.add_argument("--output-dir", required=True)
+    command.add_argument("--command-json", required=True)
+    command.add_argument("--json", action="store_true")
+    command.set_defaults(func=command_command)
+
+    thinker_feedback = sub.add_parser(
+        "thinker-feedback",
+        help="record bounded advisory Thinker feedback for Main adoption",
+    )
+    thinker_feedback.add_argument("--output-dir", required=True)
+    thinker_feedback.add_argument("--review-json", required=True)
+    thinker_feedback.add_argument("--current-snapshot-digest", required=True)
+    thinker_feedback.add_argument("--workflow-revision", required=True)
+    thinker_feedback.add_argument("--max-rounds", type=int, required=True)
+    thinker_feedback.add_argument(
+        "--parent-task-dir",
+        default="",
+        help="declared completed Thinker parent task to bind as terminal evidence",
+    )
+    thinker_feedback.add_argument("--json", action="store_true")
+    thinker_feedback.set_defaults(func=command_thinker_feedback)
+
+    main_adoption = sub.add_parser(
+        "main-adoption",
+        help="record one Main-owned adoption artifact without worker effects",
+    )
+    main_adoption.add_argument("--output-dir", required=True)
+    main_adoption.add_argument("--decision-json", required=True)
+    main_adoption.add_argument("--json", action="store_true")
+    main_adoption.set_defaults(func=command_main_adoption)
+
+    pilot_gate = sub.add_parser(
+        "pilot-gate",
+        help="evaluate one no-live progressive-pilot candidate",
+    )
+    pilot_gate.add_argument("--profile-json", required=True)
+    pilot_gate.add_argument("--policy-json", required=True)
+    pilot_gate.add_argument("--grant-json", required=True)
+    pilot_gate.add_argument("--snapshot-json", required=True)
+    pilot_gate.add_argument("--active-incidents-json", default="")
+    pilot_gate.add_argument("--edge-id", required=True)
+    pilot_gate.add_argument("--json", action="store_true")
+    pilot_gate.set_defaults(func=command_pilot_gate)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        return int(args.func(args))
+    except Exception as exc:
+        print(f"loop_engineering_error: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,112 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "properties": {
+    "blocked_reasons": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "business_ready_granted": {
+      "const": false
+    },
+    "business_ready_gate_candidate": {
+      "type": "boolean"
+    },
+    "business_repo_writes_allowed": {
+      "const": false
+    },
+    "business_task_allowed": {
+      "const": false
+    },
+    "mixed_noop_completed": {
+      "type": "boolean"
+    },
+    "mixed_noop_result_valid": {
+      "type": "boolean"
+    },
+    "next_state": {
+      "const": "AWAITING_MIXED_BUSINESS_READINESS_GATE_REVIEW_NO_LIVE"
+    },
+    "plan_kind": {
+      "const": "mixed_business_readiness_gate_no_live"
+    },
+    "readiness_blockers": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "required_next_gates": {
+      "items": {
+        "enum": [
+          "explicit_user_authorization_for_business_readiness",
+          "business_write_scope_contract",
+          "opencode_writer_claude_reviewer_role_split",
+          "dry_run_or_fixture_business_task_first",
+          "tiny_sandbox_business_write_smoke",
+          "reports_diffs_tests_untracked_review",
+          "separate_business_ready_registry_update_gate",
+          "business_repo_index_protection"
+        ]
+      },
+      "type": "array"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "would_execute_live": {
+      "const": false
+    },
+    "would_use_direct_adapter_submit": {
+      "const": false
+    },
+    "would_use_direct_tui": {
+      "const": false
+    },
+    "would_use_raw_tmux": {
+      "const": false
+    },
+    "would_use_rmux": {
+      "const": false
+    },
+    "would_write_business": {
+      "const": false
+    },
+    "would_write_registry": {
+      "const": false
+    },
+    "would_write_state_team": {
+      "const": false
+    },
+    "workers": {
+      "items": {
+        "type": "object"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema_version",
+    "plan_kind",
+    "next_state",
+    "workers",
+    "mixed_noop_result_valid",
+    "mixed_noop_completed",
+    "business_ready_granted",
+    "business_task_allowed",
+    "business_repo_writes_allowed",
+    "would_execute_live",
+    "would_write_registry",
+    "would_write_business",
+    "would_write_state_team",
+    "would_use_raw_tmux",
+    "would_use_direct_tui",
+    "would_use_direct_adapter_submit",
+    "would_use_rmux",
+    "required_next_gates",
+    "blocked_reasons"
+  ],
+  "type": "object"
+}

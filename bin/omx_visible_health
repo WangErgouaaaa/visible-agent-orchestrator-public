@@ -1,0 +1,1234 @@
+#!/usr/bin/env python3
+"""Read-only health aggregation for visible OpenCode TUI control.
+
+This command does not submit tasks, call OpenCode mutating APIs, modify tmux,
+start/stop daemons, rebind workers, or write .omx/state/team. The only write
+surface is .omx/framework/team/health for explicit snapshots.
+"""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import json
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+_THIS_FILE = Path(__file__).resolve()
+for _p in ((_THIS_FILE.parent.parent / "src").resolve(), (_THIS_FILE.parent.parent / "lib").resolve()):
+    if _p.exists() and str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
+
+from visible_agent_orchestrator.runtime.backends import available_backends, default_backend_name
+from visible_agent_orchestrator.runtime.continuation_forensics import analyze_omo_continuation_file
+from visible_agent_orchestrator.runtime.errors import RuntimeAdapterError
+from visible_agent_orchestrator.runtime import registry as runtime_registry
+from visible_agent_orchestrator.runtime.health import (
+    build_all_runtime_health_summary,
+    build_runtime_health_summary,
+)
+from visible_agent_orchestrator.runtime.tmux_capabilities import command_support_report
+from visible_agent_orchestrator.runtime_paths import runtime_root
+from visible_agent_orchestrator.worker.authorization_profiles import authorization_profile_surface_summary
+from visible_agent_orchestrator.worker.opencode_mixed_status import (
+    format_opencode_mixed_status_human,
+    source_opencode_mixed_status_summary,
+)
+from visible_agent_orchestrator.worker.registered_status import source_registered_worker_summary
+
+
+class HealthError(Exception):
+    """Expected operator-facing failure."""
+
+
+DEFAULT_SUMMARY_COMMAND_TIMEOUT_SECONDS = 30
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def stamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def root_path(value: str | None) -> Path:
+    return runtime_root(value)
+
+
+def framework_root(root: Path) -> Path:
+    return root / ".omx" / "framework" / "team"
+
+
+def health_root(root: Path) -> Path:
+    return framework_root(root) / "health"
+
+
+def degraded_registered_worker_summary(root: Path) -> dict[str, Any]:
+    path = (
+        framework_root(root)
+        / "registered-workers"
+        / "registered-workers.json"
+    )
+    return {
+        "present": path.is_file(),
+        "registry_path": str(path),
+        "registry_valid": False,
+        "worker_count": 0,
+        "workers": [],
+        "warnings": [
+            "dispatcher doctor did not return registered worker status"
+        ],
+        "errors": [],
+    }
+
+
+def registry_path(root: Path) -> Path:
+    return framework_root(root) / "opencode_visible_workers.json"
+
+
+def dispatchable_visible_workers(root: Path) -> list[dict[str, Any]]:
+    try:
+        workers = runtime_registry.load_visible_workers(root)
+    except Exception:
+        return []
+    result = []
+    for worker in workers:
+        checked = runtime_registry.validate_worker_for_dispatch(worker)
+        if checked.get("dispatch_allowed"):
+            result.append(checked.get("worker", worker))
+    return result
+
+
+def visible_runs_root(root: Path) -> Path:
+    return framework_root(root) / "visible-runs"
+
+
+def watcher_root(root: Path) -> Path:
+    return visible_runs_root(root) / "_watcher"
+
+
+def rel(path: Path, root: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(root.resolve()))
+    except Exception:
+        return str(path)
+
+
+def run_command(argv: list[str], cwd: Path, timeout: int = 120) -> dict[str, Any]:
+    started = time.time()
+    try:
+        proc = subprocess.run(
+            argv,
+            cwd=str(cwd),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False,
+        )
+        return {
+            "argv": argv,
+            "returncode": proc.returncode,
+            "stdout": proc.stdout,
+            "stderr": proc.stderr,
+            "elapsed_seconds": round(time.time() - started, 3),
+            "timed_out": False,
+        }
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "argv": argv,
+            "returncode": 124,
+            "stdout": exc.stdout or "",
+            "stderr": exc.stderr or "command timed out",
+            "elapsed_seconds": round(time.time() - started, 3),
+            "timed_out": True,
+        }
+    except FileNotFoundError as exc:
+        return {
+            "argv": argv,
+            "returncode": 127,
+            "stdout": "",
+            "stderr": str(exc),
+            "elapsed_seconds": round(time.time() - started, 3),
+            "timed_out": False,
+        }
+
+
+def parse_json_output(result: dict[str, Any]) -> Any:
+    try:
+        return json.loads(str(result.get("stdout") or ""))
+    except Exception:
+        return None
+
+
+def read_json(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def visible_workers(root: Path) -> list[dict[str, Any]]:
+    data = read_json(registry_path(root))
+    workers = data.get("workers", [])
+    return [item for item in workers if isinstance(item, dict)]
+
+
+def infer_worker_role(worker: dict[str, Any]) -> str:
+    status = str(worker.get("status", ""))
+    if bool(worker.get("default_for_new_tasks")) and bool(worker.get("allow_auto_submit")):
+        return "default"
+    if status in {"test_fixed_workers", "agent_created_test_visible_worker"}:
+        return "test"
+    if not bool(worker.get("allow_auto_submit")):
+        return "disabled"
+    return "production_candidate"
+
+
+def worker_is_production(worker: dict[str, Any]) -> bool:
+    return infer_worker_role(worker) in {"default", "production_candidate"}
+
+
+def read_recent_jsonl(path: Path, limit: int = 1) -> list[dict[str, Any]]:
+    if not path.is_file():
+        return []
+    rows: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError:
+            data = {"raw": line}
+        rows.append(data if isinstance(data, dict) else {"value": data})
+    return rows[-limit:]
+
+
+def count_jsonl_rows(path: Path) -> int:
+    if not path.is_file():
+        return 0
+    count = 0
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            if line.strip():
+                count += 1
+    return count
+
+
+def parse_status_value(text: str, name: str) -> int | None:
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith(name + ":"):
+            continue
+        raw = stripped.split(":", 1)[1].strip()
+        try:
+            return int(raw)
+        except ValueError:
+            return None
+    return None
+
+
+def current_alert_state(root: Path) -> dict[str, Any]:
+    current_path = watcher_root(root) / "current_alerts.json"
+    board_path = watcher_root(root) / "visible_board.json"
+    status_path = watcher_root(root) / "visible_status.txt"
+    current = read_json(current_path)
+    if current:
+        return {
+            "source": rel(current_path, root),
+            "active_alerts": int(current.get("active_alerts", 0) or 0),
+            "fixture_alerts_suppressed": int(current.get("fixture_alerts_suppressed", 0) or 0),
+            "suppressed_fixtures": int(current.get("suppressed_fixtures", 0) or 0),
+            "alerts": current.get("alerts", []) if isinstance(current.get("alerts"), list) else [],
+            "suppressed_fixture_alerts": (
+                current.get("suppressed_fixture_alerts", [])
+                if isinstance(current.get("suppressed_fixture_alerts"), list)
+                else []
+            ),
+        }
+    board = read_json(board_path)
+    if board:
+        alerts = board.get("alerts", [])
+        return {
+            "source": rel(board_path, root),
+            "active_alerts": int(board.get("active_alerts", len(alerts) if isinstance(alerts, list) else 0) or 0),
+            "fixture_alerts_suppressed": int(board.get("fixture_alerts_suppressed", 0) or 0),
+            "suppressed_fixtures": int(board.get("suppressed_fixtures", 0) or 0),
+            "alerts": alerts if isinstance(alerts, list) else [],
+            "suppressed_fixture_alerts": board.get("suppressed_alerts", []) if isinstance(board.get("suppressed_alerts"), list) else [],
+        }
+    status_text = status_path.read_text(encoding="utf-8", errors="replace") if status_path.is_file() else ""
+    if status_text:
+        return {
+            "source": rel(status_path, root),
+            "active_alerts": parse_status_value(status_text, "active_alerts"),
+            "fixture_alerts_suppressed": parse_status_value(status_text, "fixture_alerts_suppressed") or 0,
+            "suppressed_fixtures": parse_status_value(status_text, "suppressed_fixtures") or 0,
+            "alerts": [],
+            "suppressed_fixture_alerts": [],
+        }
+    return {
+        "source": "",
+        "active_alerts": None,
+        "fixture_alerts_suppressed": 0,
+        "suppressed_fixtures": 0,
+        "alerts": [],
+        "suppressed_fixture_alerts": [],
+    }
+
+
+def write_json(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp.{Path.cwd().name}.{stamp()}")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def short_result(result: dict[str, Any], *, stdout_limit: int = 1200, stderr_limit: int = 800) -> dict[str, Any]:
+    return {
+        "argv": result.get("argv", []),
+        "returncode": result.get("returncode"),
+        "elapsed_seconds": result.get("elapsed_seconds"),
+        "timed_out": result.get("timed_out", False),
+        "stdout_head": str(result.get("stdout") or "")[:stdout_limit],
+        "stderr_head": str(result.get("stderr") or "")[:stderr_limit],
+    }
+
+
+def command_is_ok(name: str, result: dict[str, Any], parsed: Any) -> bool:
+    if name in {"policy", "rebind", "dispatch", "watcher_daemon_health"}:
+        return result.get("returncode") == 0 and isinstance(parsed, dict) and bool(parsed.get("ok", False))
+    return result.get("returncode") == 0
+
+
+def maybe_retry_readonly_check(
+    name: str,
+    argv: list[str],
+    root: Path,
+    *,
+    timeout: int,
+    allow_retry: bool = True,
+    retry_delay_seconds: float = 1.0,
+) -> tuple[dict[str, Any], Any, dict[str, Any]]:
+    first_result = run_command(argv, root, timeout=timeout)
+    first_parsed = parse_json_output(first_result)
+    first_ok = command_is_ok(name, first_result, first_parsed)
+    second_result: dict[str, Any] | None = None
+    second_parsed: Any = None
+    final_result = first_result
+    final_parsed = first_parsed
+    final_ok = first_ok
+    final_decision = "ok" if first_ok else "error"
+    if allow_retry and not first_ok and name in {"policy", "rebind", "dispatch"}:
+        time.sleep(retry_delay_seconds)
+        second_result = run_command(argv, root, timeout=timeout)
+        second_parsed = parse_json_output(second_result)
+        second_ok = command_is_ok(name, second_result, second_parsed)
+        final_result = second_result
+        final_parsed = second_parsed
+        final_ok = second_ok
+        final_decision = "transient_warning" if second_ok else "error"
+    return final_result, final_parsed, {
+        "first_check": {
+            "ok": first_ok,
+            "command": short_result(first_result),
+        },
+        "second_check": {
+            "ok": command_is_ok(name, second_result or {}, second_parsed) if second_result else None,
+            "command": short_result(second_result) if second_result else None,
+        },
+        "final_decision": final_decision,
+        "final_ok": final_ok,
+    }
+
+
+def latest_visible_run(root: Path, *, timeout: int = 30) -> dict[str, Any]:
+    result = run_command(
+        [str(root / "bin" / "omx_visible_dispatch"), "last", "--root", str(root), "--json"],
+        root,
+        timeout=timeout,
+    )
+    parsed = parse_json_output(result)
+    return {
+        "command": short_result(result),
+        "data": parsed if isinstance(parsed, dict) else {},
+    }
+
+
+def latest_visible_run_summary(root: Path, latest: dict[str, Any]) -> dict[str, Any]:
+    data = latest.get("data", {}) if isinstance(latest, dict) else {}
+    if not isinstance(data, dict):
+        return {}
+    summary_rel = str(data.get("summary_json") or "")
+    if not summary_rel:
+        return {}
+    return read_json(root / summary_rel)
+
+
+def infer_alert_worker_id(root: Path, alert: dict[str, Any]) -> str:
+    if str(alert.get("worker_id") or ""):
+        return str(alert.get("worker_id") or "")
+    run = str(alert.get("run") or "")
+    task = str(alert.get("task") or "")
+    if not run or not task:
+        return ""
+    owner_path = visible_runs_root(root) / run / "tasks" / task / "owner"
+    try:
+        return owner_path.read_text(encoding="utf-8", errors="replace").strip()
+    except Exception:
+        return ""
+
+
+def filter_alert_state_for_worker(root: Path, payload: dict[str, Any], worker_id: str) -> dict[str, Any]:
+    alerts = payload.get("alerts", [])
+    if not isinstance(alerts, list):
+        alerts = []
+    filtered = []
+    for alert in alerts:
+        if not isinstance(alert, dict):
+            continue
+        inferred = infer_alert_worker_id(root, alert)
+        if inferred != worker_id:
+            continue
+        item = dict(alert)
+        if inferred and not item.get("worker_id"):
+            item["inferred_worker_id"] = inferred
+        filtered.append(item)
+    return {
+        **payload,
+        "worker_id": worker_id,
+        "alerts": filtered,
+        "active_alerts": len(filtered),
+    }
+
+
+def build_report(root: Path, *, command_timeout_seconds: int | None = None) -> dict[str, Any]:
+    commands = {
+        "policy": [str(root / "bin" / "omx_visible_policy_check"), "check", "--root", str(root), "--json"],
+        "rebind": [str(root / "bin" / "omx_visible_rebind"), "doctor", "--root", str(root), "--json"],
+        "dispatch": [str(root / "bin" / "omx_visible_dispatch"), "doctor", "--root", str(root), "--json"],
+        "watcher_daemon_status": [str(root / "bin" / "omx_visible_watcher"), "daemon-status", "--root", str(root), "--json"],
+        "watcher_daemon_health": [str(root / "bin" / "omx_visible_watcher"), "daemon-health", "--root", str(root), "--json"],
+    }
+
+    results: dict[str, dict[str, Any]] = {}
+    parsed: dict[str, Any] = {}
+    transient_checks: dict[str, Any] = {}
+
+    def run_named_check(item: tuple[str, list[str]]) -> tuple[str, dict[str, Any], Any, dict[str, Any]]:
+        name, argv = item
+        default_timeout = 180 if name in {"policy", "rebind", "dispatch"} else 60
+        timeout = (
+            min(default_timeout, command_timeout_seconds)
+            if command_timeout_seconds
+            else default_timeout
+        )
+        result, parsed_result, trace = maybe_retry_readonly_check(name, argv, root, timeout=timeout, allow_retry=False)
+        return name, result, parsed_result, trace
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(commands)) as executor:
+        futures = [executor.submit(run_named_check, item) for item in commands.items()]
+        for future in concurrent.futures.as_completed(futures):
+            name, result, parsed_result, trace = future.result()
+            results[name] = result
+            parsed[name] = parsed_result
+            transient_checks[name] = trace
+
+    dispatch_data = parsed.get("dispatch") if isinstance(parsed.get("dispatch"), dict) else {}
+    rebind_data = parsed.get("rebind") if isinstance(parsed.get("rebind"), dict) else {}
+    policy_data = parsed.get("policy") if isinstance(parsed.get("policy"), dict) else {}
+    daemon_status_data = parsed.get("watcher_daemon_status") if isinstance(parsed.get("watcher_daemon_status"), dict) else {}
+    daemon_health_data = parsed.get("watcher_daemon_health") if isinstance(parsed.get("watcher_daemon_health"), dict) else {}
+    alert_state = current_alert_state(root)
+    active_alerts = alert_state.get("active_alerts")
+    history_alerts_path = watcher_root(root) / "alerts.jsonl"
+    history_alerts_count = count_jsonl_rows(history_alerts_path)
+    last_history_alert = (read_recent_jsonl(history_alerts_path, 1) or [{}])[-1] if history_alerts_count else {}
+
+    default_worker = dispatch_data.get("default_worker", {}) if isinstance(dispatch_data, dict) else {}
+    default_worker_readiness = dispatch_data.get("tui_readiness", {}) if isinstance(dispatch_data.get("tui_readiness"), dict) else {}
+    profile_summary = (
+        dispatch_data.get("authorization_profile_summary", {})
+        if isinstance(dispatch_data.get("authorization_profile_summary"), dict)
+        else {}
+    )
+    locks = dispatch_data.get("locks", []) if isinstance(dispatch_data, dict) else []
+    watcher = dispatch_data.get("watcher", {}) if isinstance(dispatch_data, dict) else {}
+    last_timeout = min(30, command_timeout_seconds) if command_timeout_seconds else 30
+    last = latest_visible_run(root, timeout=last_timeout)
+    last_summary = latest_visible_run_summary(root, last)
+    last_tasks = last.get("data", {}).get("tasks", []) if isinstance(last.get("data", {}), dict) and isinstance(last.get("data", {}).get("tasks"), list) else []
+    latest_truth = last_tasks[0] if last_tasks else {}
+
+    errors: list[str] = []
+    warnings: list[str] = []
+    notes: list[str] = []
+    timed_out_checks = sorted(
+        [
+            *[
+                name
+                for name, result in results.items()
+                if result.get("timed_out")
+            ],
+            *(
+                ["last_visible_run"]
+                if last.get("command", {}).get("timed_out")
+                else []
+            ),
+        ]
+    )
+    if timed_out_checks:
+        warnings.append("summary command timed out: " + ", ".join(timed_out_checks))
+
+    required_ok = {
+        "policy": results["policy"].get("returncode") == 0 and bool(policy_data.get("ok", False)),
+        "rebind": results["rebind"].get("returncode") == 0 and bool(rebind_data.get("ok", False)),
+        "dispatch": results["dispatch"].get("returncode") == 0 and bool(dispatch_data.get("ok", False)),
+        "watcher_daemon_health": results["watcher_daemon_health"].get("returncode") == 0 and bool(daemon_health_data.get("ok", False)),
+    }
+    for name, ok in required_ok.items():
+        if not ok:
+            errors.append(f"{name} failed")
+        elif transient_checks.get(name, {}).get("final_decision") == "transient_warning":
+            notes.append(f"transient_warning: {name} first_check_error second_check_ok")
+
+    if results["watcher_daemon_status"].get("returncode") != 0:
+        warnings.append("watcher_daemon_status command failed")
+    if active_alerts is None:
+        warnings.append("watcher current active alerts could not be read")
+    elif active_alerts > 0:
+        warnings.append(f"active watcher alerts: {active_alerts}")
+    if profile_summary and not profile_summary.get("ok", False):
+        errors.append("authorization profile summary failed")
+    if isinstance(locks, list) and locks:
+        active_nonterminal = [
+            item for item in locks
+            if isinstance(item, dict) and item.get("task_truth", {}).get("lock_state") == "active_lock"
+        ]
+        terminal_stale = [
+            item for item in locks
+            if isinstance(item, dict) and item.get("task_truth", {}).get("lock_state") == "stale_terminal_lock"
+        ]
+        invalid_terminal = [
+            item for item in locks
+            if isinstance(item, dict)
+            and item.get("task_truth", {}).get("protocol_terminal_state") in {"invalid_terminal_no_report", "invalid_conflicting_terminal_markers"}
+        ]
+        if invalid_terminal:
+            errors.append(f"invalid terminal task state(s): {len(invalid_terminal)}")
+        elif active_nonterminal:
+            errors.append(f"active nonterminal locks: {len(active_nonterminal)}")
+        elif terminal_stale:
+            warnings.append(
+                f"terminal stale locks: {len(terminal_stale)}; run ./bin/omx_visible_dispatch settle-latest --root . --allow-terminal-archive"
+            )
+    if last["command"].get("returncode") != 0:
+        warnings.append("last visible run could not be read")
+    if not shutil.which("rg"):
+        notes.append("optional_tool_missing: rg")
+    last_terminal = str(
+        last_summary.get("final_protocol_terminal_state")
+        or last_summary.get("protocol_terminal_state")
+        or last_summary.get("terminal_state")
+        or ""
+    )
+    last_truth_state = str(latest_truth.get("protocol_terminal_state") or latest_truth.get("status") or "")
+    if last_terminal and last_truth_state and last_terminal != last_truth_state:
+        warnings.append(
+            f"summary stale for latest run: summary={last_terminal} truth={last_truth_state}; run ./bin/omx_visible_dispatch settle-latest --root . --allow-terminal-archive"
+        )
+    if (
+        last_terminal in {"completed", "failed", "blocked"}
+        and str(last_summary.get("post_terminal_warning") or "") == "post_terminal_tui_busy"
+    ):
+        notes.append("post_terminal_tui_busy is nonfatal session-layer telemetry; protocol terminal state remains authoritative")
+
+    dispatchable = (
+        dispatch_data.get("dispatchable_visible_workers", [])
+        if isinstance(dispatch_data.get("dispatchable_visible_workers"), list)
+        else []
+    )
+    registered = (
+        dispatch_data.get("registered_workers", {})
+        if isinstance(dispatch_data.get("registered_workers"), dict)
+        else {}
+    )
+    if "present" not in registered and command_timeout_seconds is None:
+        registered = source_registered_worker_summary(root)
+    if "present" not in registered:
+        registered = degraded_registered_worker_summary(root)
+    mixed_status = (
+        dispatch_data.get("opencode_mixed_status", {})
+        if isinstance(dispatch_data.get("opencode_mixed_status"), dict)
+        else {}
+    )
+    default_worker_submit_safe = bool(default_worker_readiness.get("submit_safe", False))
+    dispatchable_pool_ready = bool(
+        default_worker_submit_safe
+        and bool(default_worker.get("allow_auto_submit"))
+        and str(default_worker.get("binding_confidence") or "") == "strong"
+        and int(active_alerts or 0) == 0
+    )
+    overall = "ERROR" if errors else ("WARNING" if warnings else "OK")
+    return {
+        "schema_version": 1,
+        "generated_at": utc_now(),
+        "root": str(root),
+        "collection_timeout_seconds": command_timeout_seconds,
+        "timed_out_checks": timed_out_checks,
+        **command_support_report(),
+        "overall": overall,
+        "ok": overall == "OK",
+        "errors": errors,
+        "warnings": warnings,
+        "notes": notes,
+        "transient_checks": transient_checks,
+        "policy": {
+            "ok": required_ok["policy"],
+            "returncode": results["policy"].get("returncode"),
+            "checks": policy_data.get("checks", []) if isinstance(policy_data, dict) else [],
+        },
+        "rebind": {
+            "ok": required_ok["rebind"],
+            "returncode": results["rebind"].get("returncode"),
+            "status": rebind_data.get("rebind_check", {}).get("status") if isinstance(rebind_data, dict) else "",
+        },
+        "dispatch": {
+            "ok": required_ok["dispatch"],
+            "returncode": results["dispatch"].get("returncode"),
+            "ready_for_run_one": bool(dispatch_data.get("ok", False)) if isinstance(dispatch_data, dict) else False,
+        },
+        "watcher_daemon": {
+            "status_ok": results["watcher_daemon_status"].get("returncode") == 0,
+            "health_ok": required_ok["watcher_daemon_health"],
+            "status": daemon_status_data.get("status", ""),
+            "health": daemon_health_data.get("status", ""),
+            "pid": daemon_status_data.get("pid"),
+            "last_scan_age_seconds": daemon_health_data.get("last_scan_age_seconds"),
+        },
+        "active_alerts": active_alerts,
+        "history_alerts_count": history_alerts_count,
+        "last_history_alert": last_history_alert,
+        "fixture_alerts_suppressed": alert_state.get("fixture_alerts_suppressed", 0),
+        "suppressed_fixtures": alert_state.get("suppressed_fixtures", 0),
+        "watcher_current_alerts_source": alert_state.get("source", ""),
+        "watcher_current_alerts": alert_state,
+        "default_worker": {
+            "worker_id": default_worker.get("worker_id", ""),
+            "pane": default_worker.get("pane_id", ""),
+            "port": default_worker.get("port", ""),
+            "binding_confidence": default_worker.get("binding_confidence", ""),
+            "allow_auto_submit": default_worker.get("allow_auto_submit", False),
+        },
+        "default_worker_tui_readiness": str(default_worker_readiness.get("readiness") or ""),
+        "default_worker_submit_safe": default_worker_submit_safe,
+        "default_worker_tui_readiness_reason": str(default_worker_readiness.get("reason") or ""),
+        "dispatchable_pool_ready": dispatchable_pool_ready,
+        "active_locks": len(locks) if isinstance(locks, list) else None,
+        "locks": locks if isinstance(locks, list) else [],
+        "last_run": last.get("data", {}),
+        "last_run_summary": {
+            "protocol_terminal_state": (
+                last_summary.get("final_protocol_terminal_state")
+                or last_summary.get("protocol_terminal_state")
+                or last_summary.get("terminal_state")
+            ),
+            "latest_task_truth": last_truth_state,
+            "post_terminal_tui_readiness": (
+                last_summary.get("post_terminal_tui_readiness", {}).get("readiness")
+                if isinstance(last_summary.get("post_terminal_tui_readiness"), dict)
+                else ""
+            ),
+            "post_terminal_warning": last_summary.get("post_terminal_warning", ""),
+            "summary_json": str(last.get("data", {}).get("summary_json") or ""),
+        },
+        "watcher_summary": watcher.get("summary", {}) if isinstance(watcher, dict) else {},
+        "registered_workers": registered,
+        "dispatchable_visible_workers": dispatchable,
+        "authorization_profile_summary": profile_summary,
+        "opencode_mixed_status": mixed_status,
+        "optional_tools": {"rg": bool(shutil.which("rg"))},
+        "commands": {name: short_result(result) for name, result in results.items()},
+    }
+
+
+def build_worker_report(root: Path, worker_id: str) -> dict[str, Any]:
+    worker_id = str(worker_id)
+    worker = next((item for item in visible_workers(root) if str(item.get("worker_id") or "") == worker_id), {})
+    if not worker:
+        raise HealthError(f"worker not found: {worker_id}")
+    doctor_cmd = run_command(
+        [str(root / "bin" / "omx_visible_dispatch"), "doctor", "--root", str(root), "--worker", worker_id, "--json"],
+        root,
+        timeout=120,
+    )
+    doctor = parse_json_output(doctor_cmd)
+    if not isinstance(doctor, dict):
+        doctor = {"ok": False, "errors": ["doctor json parse failed"], "warnings": []}
+    rebind_cmd = run_command(
+        [str(root / "bin" / "omx_visible_rebind"), "check", "--root", str(root), "--worker", worker_id, "--json"],
+        root,
+        timeout=60,
+    )
+    rebind = parse_json_output(rebind_cmd)
+    if not isinstance(rebind, dict):
+        rebind = {"status": "unknown"}
+    status_cmd = run_command(
+        [str(root / "bin" / "omx_visible_dispatch"), "status", "--root", str(root), "--worker", worker_id, "--json"],
+        root,
+        timeout=60,
+    )
+    status_data = parse_json_output(status_cmd)
+    if not isinstance(status_data, dict):
+        status_data = {}
+    alert_state = filter_alert_state_for_worker(root, current_alert_state(root), worker_id)
+    readiness = doctor.get("tui_readiness", {}) if isinstance(doctor.get("tui_readiness"), dict) else {}
+    locks = doctor.get("locks", []) if isinstance(doctor.get("locks"), list) else []
+    worker_role = infer_worker_role(worker)
+    active_nonterminal = [item for item in locks if item.get("task_truth", {}).get("lock_state") == "active_lock"]
+    terminal_stale = [item for item in locks if item.get("task_truth", {}).get("lock_state") == "stale_terminal_lock"]
+    warnings = list(doctor.get("warnings", []))
+    errors = list(doctor.get("errors", []))
+    if terminal_stale and "terminal stale locks present" not in warnings:
+        warnings.append("terminal stale locks present")
+    if str(readiness.get("readiness")) == "busy":
+        warnings.append("post_terminal_tui_busy is nonfatal session-layer telemetry")
+    if str(readiness.get("readiness")) == "unknown":
+        warnings.append("tui_readiness unknown is nonfatal telemetry")
+    if alert_state.get("active_alerts"):
+        warnings.append(f"worker active alerts: {alert_state.get('active_alerts')}")
+    ok = (not active_nonterminal) and str(rebind.get("status") or "") == "current_binding_ok"
+    if worker_role not in {"default", "production_candidate"}:
+        ok = True
+    return {
+        "schema_version": 1,
+        "generated_at": utc_now(),
+        **command_support_report(),
+        "worker_id": worker_id,
+        "worker_role": worker_role,
+        "worker": {
+            "worker_id": worker_id,
+            "pane": worker.get("pane_id", ""),
+            "port": worker.get("port", ""),
+            "binding_confidence": worker.get("binding_confidence", ""),
+            "allow_auto_submit": worker.get("allow_auto_submit", False),
+            "default_for_new_tasks": worker.get("default_for_new_tasks", False),
+            "status": worker.get("status", ""),
+        },
+        "ok": ok,
+        "errors": errors if worker_is_production(worker) else [],
+        "warnings": warnings,
+        "rebind": rebind,
+        "doctor": doctor,
+        "status": status_data,
+        "active_alerts": alert_state.get("active_alerts", 0),
+        "alerts": alert_state.get("alerts", []),
+        "locks": locks,
+        "readiness": readiness,
+        "dispatchable_visible_workers": dispatchable_visible_workers(root),
+        "opencode_mixed_status": source_opencode_mixed_status_summary(root, worker_id=worker_id),
+    }
+
+
+def print_worker_human(report: dict[str, Any]) -> None:
+    worker = report.get("worker", {})
+    dispatchable = report.get("dispatchable_visible_workers", [])
+    print(f"overall: {'OK' if report.get('ok') else 'ERROR'}")
+    print(f"tmux_live_baseline: {report.get('tmux_live_baseline')}")
+    print(f"active_runtime_substrate: {report.get('active_runtime_substrate')}")
+    features = report.get("blocked_post_baseline_features", [])
+    if isinstance(features, list):
+        print(f"blocked_post_baseline_features: {', '.join(str(item) for item in features) or '-'}")
+    print(f"worker_id: {worker.get('worker_id') or '-'}")
+    print(f"worker_role: {report.get('worker_role') or worker.get('role') or '-'}")
+    print(f"pane: {worker.get('pane') or '-'}")
+    print(f"port: {worker.get('port') or '-'}")
+    print(f"binding_confidence: {worker.get('binding_confidence') or '-'}")
+    print(f"allow_auto_submit: {str(bool(worker.get('allow_auto_submit'))).lower()}")
+    print(f"default_for_new_tasks: {str(bool(worker.get('default_for_new_tasks'))).lower()}")
+    if report.get("registry_binding"):
+        print(f"registry_binding: {report['registry_binding'].get('status') or '-'}")
+    print(f"rebind: {report.get('rebind', {}).get('status') or '-'}")
+    print(f"active_locks: {len(report.get('locks', []))}")
+    print(f"active_alerts: {report.get('active_alerts', 0)}")
+    print(f"dispatchable_visible_worker_count: {len(dispatchable)}")
+    print(f"dispatchable_visible_workers: {', '.join(str(item.get('worker_id') or '') for item in dispatchable) or '-'}")
+    readiness = report.get("readiness", {})
+    print(f"tui_readiness: {readiness.get('readiness', '-')}")
+    print(f"submit_safe: {str(bool(readiness.get('submit_safe', False))).lower()}")
+    if readiness.get("reason"):
+        print(f"tui_readiness_reason: {readiness.get('reason')}")
+    for line in format_opencode_mixed_status_human(report.get("opencode_mixed_status", {})):
+        print(line)
+    if report.get("warnings"):
+        print("Warnings:")
+        for item in report["warnings"]:
+            print(f"  - {item}")
+    if report.get("errors"):
+        print("Errors:")
+        for item in report["errors"]:
+            print(f"  - {item}")
+
+
+def print_human(report: dict[str, Any]) -> None:
+    worker = report.get("default_worker", {})
+    dispatchable = report.get("dispatchable_visible_workers", [])
+    daemon = report.get("watcher_daemon", {})
+    last = report.get("last_run", {})
+    overall = str(report.get("overall") or "ERROR")
+    dispatchable_pool_ready = bool(report.get("dispatchable_pool_ready"))
+    display_overall = "ATTENTION" if overall == "ERROR" and dispatchable_pool_ready else overall
+    if dispatchable_pool_ready:
+        current_pool_status = "READY"
+    elif dispatchable:
+        current_pool_status = "DEGRADED"
+    else:
+        current_pool_status = "UNAVAILABLE"
+    print(f"current_dispatchable_pool: {current_pool_status}")
+    print(f"tmux_live_baseline: {report.get('tmux_live_baseline')}")
+    print(f"active_runtime_substrate: {report.get('active_runtime_substrate')}")
+    features = report.get("blocked_post_baseline_features", [])
+    if isinstance(features, list):
+        print(f"blocked_post_baseline_features: {', '.join(str(item) for item in features) or '-'}")
+    print(
+        "default_worker: "
+        f"{worker.get('worker_id') or '-'} pane={worker.get('pane') or '-'} "
+        f"port={worker.get('port') or '-'} binding={worker.get('binding_confidence') or '-'}"
+    )
+    print(f"default_worker_submit_safe: {str(bool(report.get('default_worker_submit_safe'))).lower()}")
+    print(f"default_worker_tui_readiness: {report.get('default_worker_tui_readiness') or '-'}")
+    if report.get("default_worker_tui_readiness_reason"):
+        print(f"default_worker_tui_readiness_reason: {report.get('default_worker_tui_readiness_reason')}")
+    print(f"dispatchable_pool_ready: {str(dispatchable_pool_ready).lower()}")
+    print(f"dispatchable_visible_worker_count: {len(dispatchable)}")
+    print(f"dispatchable_visible_workers: {', '.join(str(item.get('worker_id') or '') for item in dispatchable) or '-'}")
+    print("recommended_entry: status")
+    print("recommended_scale: run_one")
+    if report.get("collection_timeout_seconds") is not None:
+        print(f"summary_command_timeout_seconds: {report.get('collection_timeout_seconds')}")
+    timed_out_checks = report.get("timed_out_checks", [])
+    if timed_out_checks:
+        print(f"summary_timed_out_checks: {', '.join(str(item) for item in timed_out_checks)}")
+    print(f"overall: {display_overall}")
+    if display_overall == "ATTENTION":
+        print("health_scope_note: default worker is dispatchable; follow-up items below are global or secondary")
+    print(f"policy: {'OK' if report.get('policy', {}).get('ok') else 'ERROR'}")
+    print(f"rebind: {'OK' if report.get('rebind', {}).get('ok') else 'ERROR'} ({report.get('rebind', {}).get('status') or '-'})")
+    print(f"dispatch: {'OK' if report.get('dispatch', {}).get('ok') else 'ERROR'}")
+    print(f"active_alerts: {report.get('active_alerts')}")
+    print(f"active_locks: {report.get('active_locks')}")
+    print(f"watcher_daemon: status={daemon.get('status') or '-'} health={daemon.get('health') or '-'} pid={daemon.get('pid') or '-'}")
+    if isinstance(last, dict) and last:
+        print(f"last_run: {last.get('run') or last.get('run_id') or last.get('path') or '-'}")
+    else:
+        print("last_run: -")
+    if report.get("watcher_summary"):
+        print(f"watcher_summary: {report.get('watcher_summary')}")
+    print(f"history_alerts_count: {report.get('history_alerts_count')}")
+    print(f"fixture_alerts_suppressed: {report.get('fixture_alerts_suppressed')}")
+    print(f"watcher_current_alerts_source: {report.get('watcher_current_alerts_source') or '-'}")
+    registered = report.get("registered_workers", {})
+    if registered:
+        print(
+            "secondary_registered_worker_inventory: "
+            f"present={str(bool(registered.get('present'))).lower()} "
+            f"valid={str(bool(registered.get('registry_valid'))).lower()} "
+            f"count={registered.get('worker_count', 0)}"
+        )
+        print("secondary_registered_worker_inventory_scope: non-visible inventory; separate from dispatchable visible workers")
+        for worker in registered.get("workers", []):
+            print(
+                "  - "
+                f"{worker.get('worker_id') or '-'} backend={worker.get('backend_kind') or '-'} "
+                f"business_ready={str(bool(worker.get('business_ready'))).lower()} "
+                f"mixed_ready={str(bool(worker.get('mixed_ready'))).lower()} "
+                f"last_smoke_ok={str(bool(worker.get('last_smoke_ok'))).lower()}"
+            )
+    for line in format_opencode_mixed_status_human(report.get("opencode_mixed_status", {})):
+        print(line)
+    latest_summary = report.get("last_run_summary", {})
+    if latest_summary:
+        print(f"last_run_protocol_terminal_state: {latest_summary.get('protocol_terminal_state') or '-'}")
+        if latest_summary.get("post_terminal_warning"):
+            print(f"last_run_post_terminal_warning: {latest_summary.get('post_terminal_warning')}")
+    if report.get("warnings"):
+        print("Warnings:")
+        for item in report["warnings"]:
+            print(f"  - {item}")
+    if report.get("notes"):
+        print("Notes:")
+        for item in report["notes"]:
+            print(f"  - {item}")
+    if report.get("errors"):
+        print("Errors:")
+        for item in report["errors"]:
+            print(f"  - {item}")
+
+
+def partition_worker_reports_for_human(reports: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    actionable: list[dict[str, Any]] = []
+    hidden: list[dict[str, Any]] = []
+    for report in reports:
+        if str(report.get("worker_role") or "") in {"default", "production_candidate"}:
+            actionable.append(report)
+        else:
+            hidden.append(report)
+    return actionable, hidden
+
+
+def filter_mixed_status_for_actionable(summary: dict[str, Any], actionable_worker_ids: set[str]) -> tuple[dict[str, Any], list[str]]:
+    workers = summary.get("workers", []) if isinstance(summary.get("workers"), list) else []
+    if not actionable_worker_ids or not workers:
+        return summary, []
+    actionable_workers = [
+        worker for worker in workers
+        if str(worker.get("worker_id") or "") in actionable_worker_ids
+    ]
+    if not actionable_workers:
+        return summary, []
+    hidden_workers = [
+        str(worker.get("worker_id") or "")
+        for worker in workers
+        if str(worker.get("worker_id") or "") not in actionable_worker_ids
+    ]
+    filtered = dict(summary)
+    filtered["workers"] = actionable_workers
+    filtered["worker_count"] = len(actionable_workers)
+    filtered["mixed_ready_workers"] = [
+        worker_id for worker_id in summary.get("mixed_ready_workers", [])
+        if str(worker_id) in actionable_worker_ids
+    ]
+    filtered["mixed_blocked_workers"] = [
+        worker_id for worker_id in summary.get("mixed_blocked_workers", [])
+        if str(worker_id) in actionable_worker_ids
+    ]
+    filtered["evidence_missing_workers"] = [
+        worker_id for worker_id in summary.get("evidence_missing_workers", [])
+        if str(worker_id) in actionable_worker_ids
+    ]
+    filtered["evidence_collected_candidates"] = [
+        worker_id for worker_id in summary.get("evidence_collected_candidates", [])
+        if str(worker_id) in actionable_worker_ids
+    ]
+    return filtered, [worker_id for worker_id in hidden_workers if worker_id]
+
+
+def command_check(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    backend = getattr(args, "runtime_backend", default_backend_name())
+    fixture = Path(args.fixture).resolve() if getattr(args, "fixture", None) else None
+    if getattr(args, "worker", None):
+        worker_id = str(args.worker)
+        report = build_runtime_health_summary(root, worker_id, backend=backend, fixture_dir=fixture)
+        if backend == "tmux-reference" and fixture is None:
+            registry_binding = dict(report.get("rebind", {}))
+            registry_binding["scope"] = "registry"
+            registry_binding["status"] = (
+                "registry_binding_ok"
+                if registry_binding.get("ok")
+                else "registry_binding_invalid"
+            )
+            report["registry_binding"] = registry_binding
+            rebind_command = run_command(
+                [
+                    str(root / "bin" / "omx_visible_rebind"),
+                    "check",
+                    "--root",
+                    str(root),
+                    "--worker",
+                    worker_id,
+                    "--runtime-backend",
+                    backend,
+                    "--json",
+                ],
+                root,
+                timeout=60,
+            )
+            live_rebind = parse_json_output(rebind_command)
+            if not isinstance(live_rebind, dict):
+                live_rebind = {
+                    "status": "rebind_check_unavailable",
+                    "errors": [
+                        str(
+                            rebind_command.get("stderr")
+                            or "current-window rebind JSON unavailable"
+                        )
+                    ],
+                    "warnings": [],
+                }
+            live_rebind["scope"] = "current_window_live"
+            live_rebind["returncode"] = rebind_command.get("returncode")
+            live_rebind["timed_out"] = bool(rebind_command.get("timed_out"))
+            live_ok = bool(
+                rebind_command.get("returncode") == 0
+                and live_rebind.get("status") == "current_binding_ok"
+            )
+            live_rebind["ok"] = live_ok
+            report["rebind"] = live_rebind
+            report["ok"] = bool(report.get("ok")) and live_ok
+            report["overall"] = "OK" if report["ok"] else "ERROR"
+            if not live_ok:
+                error = (
+                    "current-window rebind check failed: "
+                    + str(live_rebind.get("status") or "unknown")
+                )
+                if error not in report["errors"]:
+                    report["errors"].append(error)
+        report["opencode_mixed_status"] = source_opencode_mixed_status_summary(root, worker_id=worker_id)
+        if args.json:
+            print(json.dumps(report, indent=2, sort_keys=True, ensure_ascii=False))
+        else:
+            print_worker_human(report)
+        return 0 if report.get("ok") else 1
+    if backend != default_backend_name() or fixture or args.json:
+        if getattr(args, "all_workers", False):
+            report = build_all_runtime_health_summary(root, backend=backend, fixture_dir=fixture)
+            registered = source_registered_worker_summary(root)
+            report["registered_workers"] = registered
+            report["dispatchable_visible_workers"] = dispatchable_visible_workers(root)
+            profile_summary = authorization_profile_surface_summary(root)
+            report["authorization_profile_summary"] = profile_summary
+            if not profile_summary.get("ok", False):
+                report["ok"] = False
+                report["overall"] = "ERROR"
+            report["opencode_mixed_status"] = source_opencode_mixed_status_summary(root, include_all=True)
+            if args.json:
+                print(json.dumps(report, indent=2, sort_keys=True, ensure_ascii=False))
+            else:
+                print(f"overall: {report.get('overall')}")
+                print(f"runtime_backend: {report.get('runtime_backend')}")
+                print(f"tmux_live_baseline: {report.get('tmux_live_baseline')}")
+                print(f"active_runtime_substrate: {report.get('active_runtime_substrate')}")
+                features = report.get("blocked_post_baseline_features", [])
+                if isinstance(features, list):
+                    print(f"blocked_post_baseline_features: {', '.join(str(item) for item in features) or '-'}")
+                print(f"rmux_default: {str(bool(report.get('rmux_default'))).lower()}")
+                actionable_reports, hidden_reports = partition_worker_reports_for_human(report.get("workers", []))
+                print(f"actionable_worker_count: {len(actionable_reports)}")
+                print(f"hidden_non_actionable_worker_count: {len(hidden_reports)}")
+                for worker_report in actionable_reports:
+                    print("")
+                    print_worker_human(worker_report)
+                if hidden_reports:
+                    print("")
+                    print(
+                        "hidden_non_actionable_workers: "
+                        + (", ".join(str(item.get("worker_id") or "-") for item in hidden_reports) or "-")
+                    )
+                print("")
+                print(
+                    "registered_worker_inventory: "
+                    f"present={str(bool(registered.get('present'))).lower()} "
+                    f"valid={str(bool(registered.get('registry_valid'))).lower()} "
+                    f"count={registered.get('worker_count', 0)}"
+                )
+                print("registered_worker_inventory_scope: non-visible inventory; separate from dispatchable visible workers")
+                dispatchable = report.get("dispatchable_visible_workers", [])
+                print(f"dispatchable_visible_worker_count: {len(dispatchable)}")
+                print(f"dispatchable_visible_workers: {', '.join(str(item.get('worker_id') or '') for item in dispatchable) or '-'}")
+                actionable_ids = {str(item.get("worker_id") or "") for item in actionable_reports if str(item.get("worker_id") or "")}
+                filtered_mixed_status, hidden_mixed_workers = filter_mixed_status_for_actionable(report.get("opencode_mixed_status", {}), actionable_ids)
+                print("recommended_entry: status")
+                print("recommended_scale: run_one")
+                for line in format_opencode_mixed_status_human(filtered_mixed_status):
+                    print(line)
+                if hidden_mixed_workers:
+                    print("hidden_non_actionable_mixed_workers: " + ", ".join(hidden_mixed_workers))
+            return 0 if report.get("ok") else 1
+    if getattr(args, "all_workers", False):
+        worker_ids = [str(worker.get("worker_id") or "") for worker in visible_workers(root) if str(worker.get("worker_id") or "")]
+        reports: list[dict[str, Any]] = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(worker_ids))) as executor:
+            future_map = {
+                executor.submit(build_worker_report, root, worker_id): index
+                for index, worker_id in enumerate(worker_ids)
+            }
+            ordered: dict[int, dict[str, Any]] = {}
+            for future in concurrent.futures.as_completed(future_map):
+                ordered[future_map[future]] = future.result()
+            reports = [ordered[index] for index in sorted(ordered)]
+        overall_ok = all(report.get("ok", False) for report in reports if report.get("worker_role") in {"default", "production_candidate"})
+        registered = source_registered_worker_summary(root)
+        dispatchable = dispatchable_visible_workers(root)
+        mixed_status = source_opencode_mixed_status_summary(root, include_all=True)
+        profile_summary = authorization_profile_surface_summary(root)
+        if args.json:
+            print(json.dumps({
+                "schema_version": 1,
+                "generated_at": utc_now(),
+                "root": str(root),
+                "overall": "OK" if overall_ok else "ERROR",
+                "ok": overall_ok,
+                "workers": reports,
+                "registered_workers": registered,
+                "dispatchable_visible_workers": dispatchable,
+                "authorization_profile_summary": profile_summary,
+                "opencode_mixed_status": mixed_status,
+            }, indent=2, sort_keys=True, ensure_ascii=False))
+            return 0 if overall_ok else 1
+        print(f"overall: {'OK' if overall_ok else 'ERROR'}")
+        actionable_reports, hidden_reports = partition_worker_reports_for_human(reports)
+        print(f"actionable_worker_count: {len(actionable_reports)}")
+        print(f"hidden_non_actionable_worker_count: {len(hidden_reports)}")
+        for report in actionable_reports:
+            print("")
+            print_worker_human(report)
+        if hidden_reports:
+            print("")
+            print(
+                "hidden_non_actionable_workers: "
+                + (", ".join(str(report.get("worker_id") or "-") for report in hidden_reports) or "-")
+            )
+        print("")
+        print(
+            "secondary_registered_worker_inventory: "
+            f"present={str(bool(registered.get('present'))).lower()} "
+            f"valid={str(bool(registered.get('registry_valid'))).lower()} "
+            f"count={registered.get('worker_count', 0)}"
+        )
+        print("secondary_registered_worker_inventory_scope: non-visible inventory; separate from dispatchable visible workers")
+        print(f"dispatchable_visible_worker_count: {len(dispatchable)}")
+        print(f"dispatchable_visible_workers: {', '.join(str(item.get('worker_id') or '') for item in dispatchable) or '-'}")
+        actionable_ids = {str(item.get("worker_id") or "") for item in actionable_reports if str(item.get("worker_id") or "")}
+        filtered_mixed_status, hidden_mixed_workers = filter_mixed_status_for_actionable(mixed_status, actionable_ids)
+        print("recommended_entry: status")
+        print("recommended_scale: run_one")
+        for line in format_opencode_mixed_status_human(filtered_mixed_status):
+            print(line)
+        if hidden_mixed_workers:
+            print("hidden_non_actionable_mixed_workers: " + ", ".join(hidden_mixed_workers))
+        return 0 if overall_ok else 1
+    report = build_report(root)
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True, ensure_ascii=False))
+    else:
+        print_human(report)
+    return 0 if report.get("overall") == "OK" else 1
+
+
+def command_snapshot(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    report = build_report(root)
+    out_dir = health_root(root)
+    snapshot = out_dir / f"health-{stamp()}.json"
+    latest = out_dir / "latest.json"
+    write_json(snapshot, report)
+    write_json(latest, report)
+    print(f"overall: {report.get('overall')}")
+    print(f"wrote: {rel(snapshot, root)}")
+    print(f"wrote: {rel(latest, root)}")
+    return 0 if report.get("overall") == "OK" else 1
+
+
+def command_summary(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    timeout_seconds = int(getattr(args, "timeout_seconds", DEFAULT_SUMMARY_COMMAND_TIMEOUT_SECONDS))
+    if timeout_seconds <= 0:
+        raise HealthError("--timeout-seconds must be greater than zero")
+    latest = health_root(root) / "latest.json"
+    print(f"summary_state: collecting timeout_seconds={timeout_seconds}", flush=True)
+    report = build_report(root, command_timeout_seconds=timeout_seconds)
+    write_json(latest, report)
+    print_human(report)
+    return 0 if report.get("overall") == "OK" else 1
+
+
+def command_continuation_forensics(args: argparse.Namespace) -> int:
+    payload = analyze_omo_continuation_file(Path(args.omo_log), session_id=str(args.session_id or ""))
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
+    else:
+        print(f"session_id: {payload.get('session_id') or '-'}")
+        print(f"omo_log: {payload.get('omo_log') or '-'}")
+        print(f"source: {payload.get('source') or '-'}")
+        print(f"post_terminal_continuation_state: {payload.get('post_terminal_continuation_state') or '-'}")
+        print(f"incomplete_count: {payload.get('incomplete_count') if payload.get('incomplete_count') is not None else '-'}")
+        print(f"message_aborted_seen: {str(bool(payload.get('message_aborted_seen'))).lower()}")
+        print(f"idle_with_incomplete_seen: {str(bool(payload.get('idle_with_incomplete_seen'))).lower()}")
+        print(f"continuation_injected_seen: {str(bool(payload.get('continuation_injected_seen'))).lower()}")
+        print(f"all_todos_complete_seen: {str(bool(payload.get('all_todos_complete_seen'))).lower()}")
+        if payload.get("model"):
+            print(f"model: {payload.get('model')}")
+        if payload.get("idle_with_incomplete_at"):
+            print(f"idle_with_incomplete_at: {payload.get('idle_with_incomplete_at')}")
+        if payload.get("continuation_injected_at"):
+            print(f"continuation_injected_at: {payload.get('continuation_injected_at')}")
+        if payload.get("all_todos_complete_at"):
+            print(f"all_todos_complete_at: {payload.get('all_todos_complete_at')}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="omx_visible_health",
+        description=(
+            "Read-only health aggregator for the visible OpenCode control surface. "
+            "It never submits tasks, calls OpenCode POST APIs, modifies tmux, rebinds workers, "
+            "or writes .omx/state/team."
+        ),
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    check = sub.add_parser("check", help="run read-only health checks and print a summary")
+    check.add_argument("--root", default=".")
+    check.add_argument("--worker")
+    check.add_argument("--all-workers", action="store_true")
+    check.add_argument("--runtime-backend", default=default_backend_name(), choices=[item["name"] for item in available_backends()])
+    check.add_argument("--fixture", help="fixture directory for RuntimeAdapter-backed checks")
+    check.add_argument("--json", action="store_true")
+    check.set_defaults(func=command_check)
+
+    snapshot = sub.add_parser("snapshot", help="run check and write health snapshots under .omx/framework/team/health")
+    snapshot.add_argument("--root", default=".")
+    snapshot.set_defaults(func=command_snapshot)
+
+    summary = sub.add_parser("summary", help="refresh latest health snapshot and print the current operator-first summary")
+    summary.add_argument("--root", default=".")
+    summary.add_argument(
+        "--timeout-seconds",
+        type=int,
+        default=DEFAULT_SUMMARY_COMMAND_TIMEOUT_SECONDS,
+        help="per-command collection deadline for this summary",
+    )
+    summary.set_defaults(func=command_summary)
+
+    continuation = sub.add_parser(
+        "continuation-forensics",
+        help="read-only OMO continuation log forensics for one session id",
+    )
+    continuation.add_argument("--omo-log", required=True, help="path to oh-my-opencode.log")
+    continuation.add_argument("--session-id", required=True, help="session id to inspect inside the OMO log")
+    continuation.add_argument("--json", action="store_true")
+    continuation.set_defaults(func=command_continuation_forensics)
+
+    for command_parser in sub.choices.values():
+        if any(action.dest == "root" for action in command_parser._actions):
+            command_parser.set_defaults(root=None)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return int(args.func(args))
+    except HealthError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    except RuntimeAdapterError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

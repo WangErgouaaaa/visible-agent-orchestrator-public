@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+"""Handoff evidence preparation CLI.
+
+Default is offline: verifies explicitly supplied evidence references against
+actual files and prints a compact, attributable index (JSON, or Markdown with
+--markdown). No network, no API key, no writes: the formal report, the
+evidence files, and all protocol state are left untouched. --jev-live sends
+exactly one bounded claim-support request to the fixed Jev endpoint; any
+failure returns mode "jev-unavailable" with the offline index intact and
+exit code 0, so the optional step never fails an outer task. Local input
+errors exit 1 with a stderr message.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+LIB = ROOT / "lib"
+for package_root in (LIB, SRC):
+    if package_root.is_dir() and str(package_root) not in sys.path:
+        sys.path.insert(0, str(package_root))
+
+from visible_agent_orchestrator.jev_shadow import (  # noqa: E402
+    DEFAULT_TIMEOUT_SECONDS,
+    MAX_TIMEOUT_SECONDS,
+)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="omx_handoff_evidence",
+        description=(
+            "Prepare handoff evidence: verify supplied evidence references "
+            "against actual files and emit a compact attributable index. "
+            "Optional --jev-live adds one bounded claim-support question per "
+            "claim; advisory only, never gates acceptance or terminal state."
+        ),
+    )
+    parser.add_argument("--input", required=True, help="handoff JSON path")
+    parser.add_argument(
+        "--markdown",
+        action="store_true",
+        help="render the index as a Markdown section instead of JSON",
+    )
+    parser.add_argument(
+        "--jev-live",
+        action="store_true",
+        help="send one real claim-support request (default: offline only)",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_TIMEOUT_SECONDS,
+        help=f"request timeout in seconds, at most {MAX_TIMEOUT_SECONDS}",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    from visible_agent_orchestrator.handoff_evidence import (
+        HandoffEvidenceError,
+        execute_handoff,
+        load_handoff_input,
+        render_markdown,
+    )
+
+    args = build_parser().parse_args(argv)
+    try:
+        payload = load_handoff_input(args.input)
+        index = execute_handoff(
+            payload,
+            jev_live=args.jev_live,
+            timeout_seconds=args.timeout,
+        )
+        rendered = render_markdown(index) if args.markdown else json.dumps(
+            index, ensure_ascii=False, indent=2
+        )
+    except HandoffEvidenceError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    print(rendered)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

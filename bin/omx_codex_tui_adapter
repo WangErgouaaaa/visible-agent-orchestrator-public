@@ -1,0 +1,1172 @@
+#!/usr/bin/env python3
+"""Codex TUI worker adapter for the visible-agent-orchestrator codex_tui backend.
+
+Parallel surface to bin/omx_opencode_tui_adapter, scoped to the minimal
+formal worker loop: binding verification (pane -> codex process -> daemon
+socket -> native thread read), read-only preflight, and the real submit
+(deliver the task prompt as ONE turn into the worker's bound Codex thread
+via the app-server WebSocket client, with the stage-1 verified semantics).
+
+The adapter never sends keystrokes to a pane, never answers approvals, never
+observes OpenCode HTTP endpoints, and never requires a port or a ses_ id.
+Codex turn receipts and events are written under <task>/codex_turn/.
+
+Module functions used by bin/omx_visible_dispatch:
+  verify_binding(root, worker_id) -> dict
+  codex_preflight(root, worker_id, run, task) -> dict
+  submit_visible_real_runtime(root, run, task, worker_id, runtime_backend=None)
+
+CLI (diagnostics for Main/registration; read-only except none):
+  codex-identity / thread-read / turn-status
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any
+
+_THIS_FILE = Path(__file__).resolve()
+_CANDIDATE_IMPORT_ROOTS = []
+
+_env_lib = os.environ.get("OMX_VISIBLE_AGENT_ORCHESTRATOR_LIB")
+if _env_lib:
+    _CANDIDATE_IMPORT_ROOTS.append(Path(_env_lib).expanduser().resolve())
+
+_CANDIDATE_IMPORT_ROOTS.append((_THIS_FILE.parent.parent / "src").resolve())
+_CANDIDATE_IMPORT_ROOTS.append((_THIS_FILE.parent.parent / "lib").resolve())
+
+for _p in _CANDIDATE_IMPORT_ROOTS:
+    if _p.exists() and str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
+
+from visible_agent_orchestrator.runtime.registry import resolve_worker_record
+from visible_agent_orchestrator.opencode_visible_registry import (
+    mutate_visible_registry,
+)
+from visible_agent_orchestrator.visible_registry_lock import (
+    is_inactive_stale_visible_worker,
+)
+
+
+def _registry_file(root: Path) -> Path:
+    return root / ".omx" / "framework" / "team" / "opencode_visible_workers.json"
+
+
+def _runtime_fixture_dir() -> Path | None:
+    value = os.environ.get("OMX_RUNTIME_FIXTURE_DIR", "").strip()
+    return Path(value).resolve() if value else None
+
+
+def _resolve_worker(root: Path, worker_id: str) -> dict[str, Any]:
+    return resolve_worker_record(
+        root, worker_id, _runtime_fixture_dir())
+
+
+class CodexAdapterError(RuntimeError):
+    pass
+
+
+AdapterError = CodexAdapterError
+
+
+class CodexInterruptUnknownError(RuntimeError):
+    """The interrupt request was attempted but its outcome is unknown
+    (timeout/disconnect after send). Never treat as a pre-send refusal."""
+
+
+def codex_client_path(root: Path) -> Path:
+    override = os.environ.get("OMX_CODEX_APPSERVER_CLIENT")
+    if override:
+        return Path(override).expanduser().resolve()
+    return root / "bin" / "omx_codex_appserver_client"
+
+
+def codex_python() -> str:
+    return os.environ.get("OMX_CODEX_PYTHON", "/usr/bin/python3")
+
+
+def run_client(root: Path, argv: list[str], timeout: float = 60.0) -> dict[str, Any]:
+    command = [codex_python(), str(codex_client_path(root)), *argv]
+    proc = subprocess.run(command, capture_output=True, text=True,
+                          timeout=timeout)
+    payload: dict[str, Any] = {}
+    parse_error = ""
+    try:
+        parsed = json.loads(proc.stdout or "{}")
+        if isinstance(parsed, dict):
+            payload = parsed
+    except json.JSONDecodeError as exc:
+        parse_error = str(exc)
+    return {
+        "returncode": proc.returncode,
+        "payload": payload,
+        "stdout_tail": (proc.stdout or "")[-2000:],
+        "stderr_tail": (proc.stderr or "")[-1000:],
+        "parse_error": parse_error,
+        "argv": argv,
+    }
+
+
+def _utc_now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def worker_codex_binding(worker: dict[str, Any]) -> dict[str, str]:
+    thread = str(worker.get("codex_thread") or "").strip()
+    if not thread:
+        raise CodexAdapterError(
+            f"worker {worker.get('worker_id')} has no codex_thread binding")
+    socket_path = str(worker.get("codex_socket") or "").strip()
+    return {"thread": thread, "socket": socket_path}
+
+
+def _pane_pid_alive(pid: Any) -> bool:
+    try:
+        return Path(f"/proc/{int(pid)}").exists()
+    except (TypeError, ValueError):
+        return False
+
+
+def _codex_process_in_pane_tree(pane_pid: int, max_depth: int = 4) -> dict[str, Any]:
+    """Bounded /proc walk: find a codex process under the pane's shell."""
+    found: dict[str, Any] = {}
+
+    def children(parent: int) -> list[int]:
+        out: list[int] = []
+        try:
+            for entry in Path("/proc").iterdir():
+                if not entry.name.isdigit():
+                    continue
+                try:
+                    stat = (entry / "stat").read_text(errors="replace")
+                except OSError:
+                    continue
+                close = stat.rfind(")")
+                fields = stat[close + 1:].split()
+                if len(fields) > 1 and int(fields[1]) == parent:
+                    out.append(int(entry.name))
+        except OSError:
+            pass
+        return out
+
+    def visit(pid: int, depth: int) -> None:
+        if found or depth > max_depth:
+            return
+        try:
+            cmdline = (Path(f"/proc/{pid}/cmdline").read_bytes()
+                       .decode("utf-8", "replace"))
+        except OSError:
+            cmdline = ""
+        args = [part for part in cmdline.split("\0") if part]
+        head = [Path(a).name for a in args[:2]]
+        if any("codex" in name for name in head):
+            found["pid"] = pid
+            found["cmdline_head"] = " ".join(args[:6])
+            return
+        for child in children(pid):
+            visit(child, depth + 1)
+
+    visit(pane_pid, 0)
+    return found
+
+
+def _codex_process_details(pane_pid: int) -> dict[str, Any]:
+    """Identity-chain facts for the pane's codex TUI process."""
+    found = _codex_process_in_pane_tree(pane_pid)
+    details = {"pid": found.get("pid"),
+               "start_time_ticks": None,
+               "cwd": None, "codex_home": None,
+               "cmdline_head": found.get("cmdline_head")}
+    pid = found.get("pid")
+    if not pid:
+        return details
+    try:
+        stat = Path(f"/proc/{int(pid)}/stat").read_text(errors="replace")
+        close = stat.rfind(")")
+        details["start_time_ticks"] = int(
+            stat[close + 1:].split()[19])
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        details["cwd"] = os.readlink(f"/proc/{int(pid)}/cwd")
+    except OSError:
+        pass
+    try:
+        environ = Path(f"/proc/{int(pid)}/environ").read_bytes()
+        for entry in environ.split(b"\0"):
+            if entry.startswith(b"CODEX_HOME="):
+                details["codex_home"] = entry.split(b"=", 1)[1].decode(
+                    "utf-8", "replace")
+                break
+    except OSError:
+        pass
+    return details
+
+
+def _tmux_pane_record(pane_id: str) -> dict[str, Any]:
+    argv = ["tmux", "display-message", "-p", "-t", pane_id,
+            "#{pane_pid}\t#{session_name}\t#{window_index}\t#{pane_current_command}"]
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True,
+                              timeout=10.0)
+        if proc.returncode != 0:
+            return {"error": (proc.stderr or "tmux failed").strip()[:200]}
+        parts = (proc.stdout or "").strip().split("\t")
+        return {"pane_pid": int(parts[0]) if parts and parts[0].isdigit() else 0,
+                "tmux_session": parts[1] if len(parts) > 1 else "",
+                "tmux_window": parts[2] if len(parts) > 2 else "",
+                "pane_current_command": parts[3] if len(parts) > 3 else ""}
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"error": repr(exc)[:200]}
+
+
+def _capture_pane_tail(pane_id: str, lines: int = 6) -> list[str]:
+    try:
+        proc = subprocess.run(
+            ["tmux", "capture-pane", "-p", "-t", pane_id, "-S", f"-{lines}"],
+            capture_output=True, text=True, timeout=10.0)
+        if proc.returncode != 0:
+            return []
+        return [ln.rstrip() for ln in (proc.stdout or "").splitlines()]
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+
+
+PLACEHOLDER_PROMPT = "\u203a Ask Codex to do anything"
+
+
+def _pane_input_looks_empty(tail: list[str]) -> tuple[bool, str]:
+    """Empty-input gate based on the real idle input-box position.
+
+    The input line is the "\u203a ..." line above the model/shortcut chrome
+    (see W main-evidence/pane9-idle-chrome-current.txt). Empty means the
+    placeholder prompt line is present verbatim; user input replaces the
+    placeholder; an absent prompt line or failed capture is NOT empty."""
+    lines = [ln.rstrip() for ln in tail]
+    prompt_lines = [ln for ln in lines if "\u203a" in ln]
+    if not prompt_lines:
+        return False, "input_prompt_line_not_observed"
+    prompt = prompt_lines[-1].strip()
+    if prompt == PLACEHOLDER_PROMPT.strip():
+        return True, "placeholder_prompt_empty"
+    if prompt.startswith("\u203a"):
+        return False, f"user_input_present:{prompt[:60]}"
+    return False, f"unrecognized_input_state:{prompt[:60]}"
+
+
+@contextmanager
+def _binding_diagnostic_viewport(pane_id: str):
+    def mux(*args):
+        proc = subprocess.run(["tmux", *args], capture_output=True,
+                              text=True, timeout=10.0)
+        if proc.returncode != 0:
+            raise CodexAdapterError(
+                f"binding diagnostic viewport command failed: {args[0]}")
+        return (proc.stdout or "").strip()
+
+    fmt = ("#{window_id}\t#{window_width}\t#{window_height}\t"
+           "#{window_zoomed_flag}\t#{window_layout}\t#{pane_width}\t#{pane_height}")
+    snapshot = mux("display-message", "-p", "-t", pane_id, fmt).split("\t")
+    if (len(snapshot) != 7 or not snapshot[0].startswith("@")
+            or any(not snapshot[i].isdigit() for i in (1, 2, 3, 5, 6))
+            or snapshot[3] not in {"0", "1"} or not snapshot[4]):
+        raise CodexAdapterError("binding diagnostic viewport snapshot unavailable")
+    window, width, height, zoom, layout, pane_width, pane_height = snapshot
+    if int(pane_height) >= 100 and int(pane_width) >= 100:
+        yield
+        return
+    active = mux("display-message", "-p", "-t", window, "#{pane_id}")
+    if not active.startswith("%"):
+        raise CodexAdapterError("binding diagnostic selected pane unavailable")
+    size_option = mux("show-options", "-w", "-v", "-t", window, "window-size")
+    if size_option not in {"", "largest", "smallest", "manual", "latest"}:
+        raise CodexAdapterError("binding diagnostic window-size option unavailable")
+    try:
+        if zoom == "1":
+            mux("resize-pane", "-Z", "-t", active)
+        mux("resize-window", "-t", window, "-x", str(max(int(width), 120)),
+            "-y", str(max(int(height), 160)))
+        mux("resize-pane", "-Z", "-t", pane_id)
+        time.sleep(0.2)
+        enlarged = mux("display-message", "-p", "-t", pane_id, fmt).split("\t")
+        if (len(enlarged) != 7 or enlarged[0] != window
+                or not enlarged[5].isdigit() or not enlarged[6].isdigit()
+                or int(enlarged[5]) < 100 or int(enlarged[6]) < 100):
+            raise CodexAdapterError("binding diagnostic viewport expansion unconfirmed")
+        yield
+    finally:
+        errors = []
+
+        def restore(*args):
+            try:
+                return mux(*args)
+            except (CodexAdapterError, OSError, subprocess.TimeoutExpired) as exc:
+                errors.append(str(exc))
+                return ""
+
+        current_zoom = restore("display-message", "-p", "-t", window,
+                               "#{window_zoomed_flag}")
+        if current_zoom == "1":
+            restore("resize-pane", "-Z", "-t", pane_id)
+        elif current_zoom != "0":
+            errors.append("cannot observe zoom for restoration")
+        restore("resize-window", "-t", window, "-x", width, "-y", height)
+        restore("select-layout", "-t", window, layout)
+        restore("select-pane", "-t", active)
+        if zoom == "1":
+            restore("resize-pane", "-Z", "-t", active)
+        if size_option:
+            restore("set-option", "-w", "-t", window, "window-size", size_option)
+        else:
+            restore("set-option", "-w", "-u", "-t", window, "window-size")
+        restored = restore("display-message", "-p", "-t", pane_id, fmt).split("\t")
+        selected = restore("display-message", "-p", "-t", window, "#{pane_id}")
+        if restored != snapshot or selected != active:
+            errors.append("viewport/layout/zoom/selection did not restore exactly")
+        if errors:
+            raise CodexAdapterError("binding diagnostic viewport restore failed: "
+                                    + "; ".join(errors))
+
+
+def _native_status_thread(root: Path, pane_id: str) -> str:
+    with _binding_diagnostic_viewport(pane_id):
+        return _status_thread_in_viewport(root, pane_id)
+
+
+def _status_thread_in_viewport(root: Path, pane_id: str) -> str:
+    """Controlled binding diagnostic: read the pane's CURRENT session id
+    from a fresh /status response produced by this run.
+
+    Only called after the current-window, owner-lock, occupancy and
+    empty-input gates passed, in the operator-authorized pane. The
+    keystrokes carry the diagnostic command itself (never a task). A
+    submit-only Enter is sent at most once, and only when the capture
+    strictly shows this run's /status still queued in the input line.
+    Full retained history must contain an additional completed status panel;
+    changing only input or chrome cannot establish a response."""
+    import re
+    session_re = re.compile(
+        r"Session:\s*(01[0-9a-f]{6}-[0-9a-f]{4}-"
+        r"[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})")
+
+    def send(keys):
+        argv = ["tmux", "send-keys", "-t", pane_id, *keys]
+        proc = subprocess.run(argv, capture_output=True, text=True,
+                              timeout=10.0)
+        if proc.returncode != 0:
+            raise CodexAdapterError(
+                f"binding diagnostic keystroke failed: "
+                f"{(proc.stderr or proc.returncode)!r}")
+
+    def capture():
+        proc = subprocess.run(
+            ["tmux", "capture-pane", "-p", "-t", pane_id, "-S", "-"],
+            capture_output=True, text=True, timeout=10.0)
+        if proc.returncode != 0:
+            raise CodexAdapterError("binding diagnostic capture failed")
+        return proc.stdout or ""
+
+    baseline = capture()
+    if not _pane_input_looks_empty(baseline.splitlines())[0]:
+        raise CodexAdapterError("binding diagnostic input is not empty after viewport preparation")
+    previous = session_re.findall(baseline)
+    send(["-l", "/status"])
+    send(["Enter"])
+    time.sleep(1.2)
+    captured = capture()
+    # First /status may remain queued in the input line: submit-only Enter
+    # (never re-typing, never keys against unknown text), then re-capture.
+    prompt_lines = [ln.strip() for ln in captured.splitlines()
+                    if "\u203a" in ln]
+    if prompt_lines and prompt_lines[-1] == "\u203a /status":
+        send(["Enter"])
+        time.sleep(1.2)
+        captured = capture()
+    # Match the CURRENT screen: use the LAST Session line in the fresh
+    # capture, never an older scrollback occurrence.
+    matches = list(session_re.finditer(captured))
+    sessions = [match.group(1) for match in matches]
+    empty, _ = _pane_input_looks_empty(captured.splitlines())
+    if (not empty or len(sessions) <= len(previous)
+            or sessions[:len(previous)] != previous
+            or "Token usage:" not in captured[matches[-1].end():]):
+        raise CodexAdapterError(
+            "binding diagnostic produced no NEW /status response completed "
+            "this run; preserve retained history and queued input")
+    return sessions[-1]
+
+
+def register_visible(
+    root: Path,
+    worker_id: str,
+    pane_id: str,
+    *,
+    socket_arg: str | None = None,
+    thread_arg: str | None = None,
+    allow_auto_submit: bool = True,
+    default_for_new_tasks: bool = False,
+    user_started: bool = True,
+) -> dict[str, Any]:
+    if str(pane_id).startswith("%") is False:
+        raise CodexAdapterError(f"pane id must look like %N: {pane_id}")
+    pane = _tmux_pane_record(pane_id)
+    if pane.get("error"):
+        raise CodexAdapterError(
+            f"pane lookup failed for {pane_id}: {pane['error']}")
+    pane_pid = int(pane.get("pane_pid") or 0)
+    if not pane_pid or not _pane_pid_alive(pane_pid):
+        raise CodexAdapterError(f"pane {pane_id} pid is not alive")
+    codex = _codex_process_details(pane_pid)
+    if not codex.get("pid"):
+        raise CodexAdapterError(
+            f"no codex process found under pane {pane_id}")
+    codex_home = codex.get("codex_home") or os.path.expanduser("~/.codex")
+    socket_path = socket_arg or str(
+        Path(codex_home) / "app-server-control" / "app-server-control.sock")
+    cwd = codex.get("cwd") or ""
+    if not cwd:
+        raise CodexAdapterError(
+            f"codex process {codex.get('pid')} cwd unavailable")
+    tail = _capture_pane_tail(pane_id)
+    empty, input_reason = _pane_input_looks_empty(tail)
+    if not empty:
+        raise CodexAdapterError(
+            f"pane {pane_id} input state not established "
+            f"({input_reason}); refusing to register without pane writes")
+    _require_registration_gates(root, worker_id, pane_id)
+    thread_id = _native_status_thread(root, pane_id)
+    if thread_arg and thread_arg != thread_id:
+        raise CodexAdapterError(
+            f"provided --thread {thread_arg} does not match the pane's "
+            f"native /status session {thread_id}; refusing cwd/hand-typed "
+            "attribution without native proof")
+    read = run_client(root, ["thread-read", "--thread", thread_id,
+                             "--socket", socket_path], timeout=30.0)
+    state = read.get("payload", {}).get("thread_state") or {}
+    runtime = state.get("status")
+    runtime_type = runtime.get("type") if isinstance(runtime, dict) else runtime
+    if read.get("returncode") != 0 or read.get("payload", {}).get("status") != "ok":
+        raise CodexAdapterError(
+            f"native /status session {thread_id} failed thread/read "
+            f"verification: "
+            f"{read.get('payload', {}).get('status') or 'unknown'}")
+    if str((read.get("payload", {}).get("thread_state") or {})
+           .get("cwd") or "") != cwd:
+        raise CodexAdapterError(
+            f"native /status session {thread_id} cwd does not match the "
+            f"pane codex cwd {cwd}; refusing registration")
+    if runtime_type != "idle":
+        raise CodexAdapterError(
+            f"thread {thread_id} is not idle (status={runtime_type}); "
+            "refusing registration against an occupied pane")
+    boot_id = _host_boot_id()
+    record = {
+        "worker_id": worker_id,
+        "backend": "codex_tui",
+        "pane_id": pane_id,
+        "pane_pid": pane_pid,
+        "tmux_session": pane.get("tmux_session", ""),
+        "tmux_window": pane.get("tmux_window", ""),
+        "host": "127.0.0.1",
+        "port": None,
+        "codex_thread": thread_id,
+        "codex_socket": socket_path,
+        "codex_home": codex_home,
+        "codex_pid": int(codex.get("pid")),
+        "codex_start_time_ticks": int(codex.get("start_time_ticks") or 0),
+        "codex_cmdline_head": codex.get("cmdline_head", ""),
+        "codex_cwd": cwd,
+        "host_boot_id": boot_id,
+        "registered_at": _utc_now(),
+        "user_visible": True,
+        "user_started": bool(user_started),
+        "allow_auto_submit": bool(allow_auto_submit),
+        "binding_confidence": "strong",
+        "default_for_new_tasks": bool(default_for_new_tasks),
+        "status": "active",
+        "registration_input_state": input_reason,
+        "registration_pane_tail": tail[-4:],
+        "registration_thread": {
+            k: state.get(k) for k in
+            ("id", "status", "model", "reasoningEffort", "modelProvider",
+             "cwd")},
+        "notes": [
+            "Registered codex_tui worker from pane->process->thread "
+            "identity chain. A controlled binding diagnostic sent the "
+            "'/status' keystrokes (never a task) into the authorized "
+            "idle, empty-input pane; no other pane writes occurred.",
+        ],
+    }
+    registry_path = _registry_file(root)
+
+    def mutator(registry: dict) -> dict:
+        _require_no_other_pane_binding(registry, worker_id, pane_id)
+        workers = registry.setdefault("workers", [])
+        existing = None
+        for entry in workers:
+            if str(entry.get("worker_id")) == worker_id:
+                existing = entry
+                workers.remove(entry)
+                break
+        if existing:
+            identity_changed = any(
+                str(existing.get(f) or "") != str(record.get(f) or "")
+                for f in ("codex_pid", "codex_start_time_ticks",
+                          "codex_thread"))
+            if identity_changed:
+                record["binding_generation"] = int(
+                    existing.get("binding_generation") or 1) + 1
+                record["fencing_generation"] = int(
+                    existing.get("fencing_generation")
+                    or record["binding_generation"]) + 1
+                record["instance_id"] = codex_instance_id(record)
+            else:
+                record["binding_generation"] = int(
+                    existing.get("binding_generation") or 1)
+                record["fencing_generation"] = int(
+                    existing.get("fencing_generation")
+                    or record["binding_generation"])
+                record["instance_id"] = str(
+                    existing.get("instance_id")
+                    or codex_instance_id(record))
+        else:
+            record["binding_generation"] = 1
+            record["fencing_generation"] = 1
+            record["instance_id"] = codex_instance_id(record)
+        record["binding_lease_id"] = codex_lease_token(worker_id)
+        record["binding_expires_at"] = codex_lease_expiry()
+        record["expires_at"] = record["binding_expires_at"]
+        workers.append(record)
+        return registry
+
+    mutate_visible_registry(registry_path, mutator)
+    return record
+
+
+def codex_lease_token(worker_id: str) -> str:
+    import hashlib
+    return hashlib.sha256(
+        f"{worker_id}\0lease\0{time.time_ns()}".encode()).hexdigest()[:24]
+
+
+def codex_lease_expiry() -> str:
+    from datetime import datetime, timedelta, timezone
+    return (datetime.now(timezone.utc) + timedelta(days=1)).replace(
+        microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _require_registration_gates(root: Path, worker_id: str,
+                                pane_id: str) -> None:
+    """Pre-diagnostic gates mirroring the register/rebind perimeter:
+    current-window membership, global mutation gate, and no active owner
+    lock on the target worker."""
+    proc = subprocess.run(
+        ["tmux", "list-panes", "-F", "#{pane_id}"],
+        capture_output=True, text=True, timeout=10.0)
+    if proc.returncode != 0 or pane_id not in {
+            ln.strip() for ln in (proc.stdout or "").splitlines()}:
+        raise CodexAdapterError(
+            f"pane {pane_id} is not in the current tmux window; "
+            "registration diagnostic requires an authorized same-window "
+            "pane")
+    registry_path = _registry_file(root)
+    if registry_path.exists():
+        registry = json.loads(registry_path.read_text(encoding="utf-8"))
+        _require_no_other_pane_binding(registry, worker_id, pane_id)
+    lock = (root / ".omx" / "framework" / "team" / "visible-runs"
+            / "_locks" / f"{worker_id}.lock.json")
+    if lock.is_file():
+        try:
+            data = json.loads(lock.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = {}
+        if str(data.get("status") or "") in {"submitting", "submitted",
+                                             "active"}:
+            raise CodexAdapterError(
+                f"worker {worker_id} has an active owner lock; refuse "
+                "re-registration before lock reconciliation")
+
+
+def _require_no_other_pane_binding(registry: dict, worker_id: str,
+                                  pane_id: str) -> None:
+    for other in registry.get("workers", []):
+        stale = is_inactive_stale_visible_worker(other)
+        if (str(other.get("worker_id")) != worker_id
+                and str(other.get("pane_id") or "") == pane_id
+                and other.get("binding_confidence") == "strong" and not stale):
+            raise CodexAdapterError(
+                f"pane {pane_id} already holds a valid binding for worker "
+                f"{other.get('worker_id')} (backend={other.get('backend')}); refusing")
+
+
+def codex_instance_id(record: dict[str, Any]) -> str:
+    import hashlib
+    seed = "\0".join(str(record.get(k) or "") for k in (
+        "worker_id", "codex_pid", "codex_start_time_ticks",
+        "host_boot_id", "codex_thread"))
+    return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
+
+
+def apply_codex_binding_lease(record: dict[str, Any], root: Path) -> None:
+    import hashlib
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    lease_id = hashlib.sha256(
+        f"{record['worker_id']}\0lease\0{time.time_ns()}".encode()
+    ).hexdigest()[:24]
+    expires = (now + timedelta(days=7)).replace(
+        microsecond=0).isoformat().replace("+00:00", "Z")
+    record.update({
+        "binding_lease_id": lease_id,
+        "binding_created_at": now.replace(microsecond=0).isoformat(
+        ).replace("+00:00", "Z"),
+        "binding_expires_at": expires,
+        "binding_created_by": "omx_codex_tui_adapter:register",
+        "expires_at": expires,
+        "lease_status": "managed",
+    })
+
+
+def _host_boot_id() -> str:
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except OSError:
+        return ""
+
+
+def verify_binding(root: Path, worker_id: str) -> dict[str, Any]:
+    worker = _resolve_worker(root, worker_id)
+    binding = worker_codex_binding(worker)
+    live = _codex_process_details(int(worker.get("pane_pid") or 0))
+    checks: dict[str, Any] = {
+        "pane_pid_alive": _pane_pid_alive(worker.get("pane_pid")),
+        "codex_process_in_pane_tree": bool(live.get("pid")),
+        "codex_pid_matches_registry": bool(
+            live.get("pid")
+            and int(worker.get("codex_pid") or 0) == int(live.get("pid"))),
+        "codex_start_ticks_match": bool(
+            live.get("start_time_ticks") is not None
+            and int(worker.get("codex_start_time_ticks") or 0)
+            == int(live.get("start_time_ticks"))),
+        "codex_cwd_matches_registry": bool(
+            live.get("cwd")
+            and str(worker.get("codex_cwd") or live.get("cwd"))
+            == live.get("cwd")),
+    }
+    read = run_client(root, _client_thread_argv(worker), timeout=30.0)
+    checks["thread_read"] = read.get("payload", {}).get("status")
+    checks["thread_identity_ok"] = bool(
+        read.get("returncode") == 0
+        and read.get("payload", {}).get("status") == "ok"
+        and str((read.get("payload", {}).get("thread_state") or {}).get("id") or "")
+        == binding["thread"])
+    strong = all([checks["pane_pid_alive"],
+                  checks["codex_process_in_pane_tree"],
+                  checks["codex_pid_matches_registry"],
+                  checks["codex_start_ticks_match"],
+                  checks["codex_cwd_matches_registry"],
+                  checks["thread_identity_ok"]])
+    return {
+        "binding_confidence": "strong" if strong else "failed",
+        "worker_id": worker_id,
+        "backend": str(worker.get("backend") or ""),
+        "pane_id": worker.get("pane_id"),
+        "pane_pid": worker.get("pane_pid"),
+        "port": worker.get("port"),
+        "codex_thread": binding["thread"],
+        "codex_pid": live.get("pid"),
+        "codex_start_time_ticks": live.get("start_time_ticks"),
+        "codex_cwd": live.get("cwd"),
+        "checks": checks,
+        "thread_read": read.get("payload", {}),
+        "source": "codex_appserver_binding_verify",
+    }
+
+
+def _client_thread_argv(worker: dict[str, Any]) -> list[str]:
+    binding = worker_codex_binding(worker)
+    argv = ["thread-read", "--thread", binding["thread"]]
+    if binding["socket"]:
+        argv += ["--socket", binding["socket"]]
+    return argv
+
+
+def codex_preflight(root: Path, worker_id: str, run: str, task: str) -> dict[str, Any]:
+    worker = _resolve_worker(root, worker_id)
+    binding = worker_codex_binding(worker)
+    read = run_client(root, _client_thread_argv(worker), timeout=30.0)
+    status = str(read.get("payload", {}).get("status") or "")
+    state = read.get("payload", {}).get("thread_state") or {}
+    doc = {
+        "schema_version": 1,
+        "checked_at": _utc_now(),
+        "worker_id": worker_id,
+        "codex_thread": binding["thread"],
+        "socket": binding["socket"] or "(default control socket)",
+        "client_returncode": read.get("returncode"),
+        "status": status,
+        "thread_state": state,
+    }
+    if read.get("returncode") != 0 or status != "ok":
+        raise CodexAdapterError(
+            f"codex preflight failed for {worker_id}: "
+            f"{status or read.get('stderr_tail') or 'no status'}")
+    runtime_status = state.get("status")
+    runtime_type = (runtime_status or {}).get("type") \
+        if isinstance(runtime_status, dict) else runtime_status
+    if runtime_type != "idle":
+        doc["idle"] = False
+        raise CodexAdapterError(
+            f"codex preflight: thread {binding['thread']} is not idle "
+            f"(status={runtime_type or '-'})")
+    doc["idle"] = True
+    tdir = _task_dir(root, run, task)
+    (tdir / "pre_submit_codex_state.json").write_text(
+        json.dumps(doc, ensure_ascii=False, indent=1), encoding="utf-8")
+    return doc
+
+
+def _task_dir(root: Path, run: str, task: str) -> Path:
+    run_id = str(run)
+    if run_id.startswith("visible-runs/"):
+        run_id = run_id[len("visible-runs/"):]
+    return root / ".omx" / "framework" / "team" / "visible-runs" / run_id / "tasks" / task
+
+
+def submit_visible_real_runtime(
+    root: Path,
+    run: str,
+    task: str,
+    worker_id: str,
+    runtime_backend: str | None = None,
+) -> dict[str, Any]:
+    tdir = _task_dir(root, run, task)
+    prompt_path = tdir / "prompt.txt"
+    if not prompt_path.is_file():
+        raise CodexAdapterError(f"prompt not found: {prompt_path}")
+    worker = _resolve_worker(root, worker_id)
+    binding = worker_codex_binding(worker)
+    out_dir = tdir / "codex_turn"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    wait_seconds = float(worker.get("codex_submit_wait_seconds") or 15.0)
+    argv = [
+        "submit-turn",
+        "--thread", binding["thread"],
+        "--input-file", str(prompt_path),
+        "--out-dir", str(out_dir),
+        "--wait-seconds", str(wait_seconds),
+    ]
+    if binding["socket"]:
+        argv += ["--socket", binding["socket"]]
+    result = run_client(root, argv, timeout=wait_seconds + 90.0)
+    payload = result.get("payload", {})
+    outcome = str(payload.get("outcome") or "")
+    accepted = result.get("returncode") in (0, 3, 4, 5) and payload.get(
+        "turn_id") is not None
+    if not accepted:
+        error_doc = {
+            "schema_version": 1,
+            "failed_at": _utc_now(),
+            "run": run,
+            "task": task,
+            "worker": worker_id,
+            "error": payload.get("outcome")
+            or result.get("stderr_tail")
+            or f"client exit {result.get('returncode')}",
+            "client_result": result,
+        }
+        (tdir / "submit_error.json").write_text(
+            json.dumps(error_doc, ensure_ascii=False, indent=1,
+                       default=str), encoding="utf-8")
+        raise CodexAdapterError(
+            f"codex submit did not reach turn acceptance: {error_doc['error']}")
+    delivery = {
+        "schema_version": 1,
+        "delivered_at": _utc_now(),
+        "run": run,
+        "task": task,
+        "worker": worker_id,
+        "backend": "codex_tui",
+        "transport": "codex_appserver_websocket",
+        "codex_thread": binding["thread"],
+        "turn_id": payload.get("turn_id"),
+        "submit_outcome": outcome,
+        "evidence_dir": "codex_turn",
+        "adapter_writes_only": [".submitted", "delivery.json",
+                                "submit_error.json", "codex_turn/"],
+    }
+    (tdir / ".submitted").write_text(_utc_now() + "\n", encoding="utf-8")
+    (tdir / "delivery.json").write_text(
+        json.dumps(delivery, ensure_ascii=False, indent=1), encoding="utf-8")
+    return delivery
+
+
+def observe_thread_status(root: Path, worker_id: str, *,
+                          run: str = "", task: str = "") -> dict[str, Any]:
+    """Read-only native thread status for stop/observe boundaries."""
+    worker = _resolve_worker(root, worker_id)
+    read = run_client(root, _client_thread_argv(worker), timeout=30.0)
+    payload = read.get("payload", {})
+    state = payload.get("thread_state") or {}
+    runtime = state.get("status")
+    runtime_type = runtime.get("type") if isinstance(runtime, dict) else runtime
+    observed = {
+        "ok": bool(read.get("returncode") == 0
+                   and payload.get("status") == "ok"),
+        "status": str(payload.get("status") or ""),
+        "status_type": str(runtime_type or ""),
+        "thread_state": state,
+    }
+    if run and task:
+        tdir = _task_dir(root, run, task)
+        receipt = json.loads((tdir / "codex_turn" / "turn-receipt.json").read_text())
+        thread = str((receipt.get("intent") or {}).get("thread") or "")
+        turn_id = str((((receipt.get("response") or {}).get("result") or {})
+                       .get("turn") or {}).get("id") or "")
+        if (thread != str(worker.get("codex_thread") or "")
+                or state.get("id") != thread or not turn_id):
+            raise CodexAdapterError("task receipt does not match bound thread/turn")
+        turn = run_client(root, ["turn-status", "--thread", thread,
+                                "--turn", turn_id]
+                          + (["--socket", str(worker["codex_socket"])]
+                             if worker.get("codex_socket") else []), timeout=30.0)
+        turn_state = turn.get("payload", {}).get("turn_state") or {}
+        observed.update(turn_id=turn_id, turn_state=turn_state,
+                        source="codex_appserver_thread_turn_read")
+        observed["ok"] = bool(observed["ok"] and turn.get("returncode") == 0
+                              and turn.get("payload", {}).get("status") == "ok"
+                              and turn_state.get("id") == turn_id)
+        if turn_state.get("status") not in {"completed", "interrupted", "failed"}:
+            observed["status_type"] = "busy"
+    return observed
+
+
+def observe_recovery_stop(root: Path, worker_id: str, *, run: str,
+                          task: str, session_id: str) -> dict[str, Any]:
+    worker = _resolve_worker(root, worker_id)
+    binding = worker_codex_binding(worker)
+    receipt = json.loads((_task_dir(root, run, task) / "codex_turn" / "turn-receipt.json").read_text())
+    thread = str((receipt.get("intent") or {}).get("thread") or "")
+    task_turn = str((((receipt.get("response") or {}).get("result") or {}).get("turn") or {}).get("id") or "")
+    if not task_turn or thread != session_id or thread != binding["thread"] or not binding["socket"]:
+        raise CodexAdapterError("recovery requires the exact bound thread/socket/task turn")
+    result = run_client(root, ["recovery-stop", "--thread", thread,
+                              "--turn", task_turn, "--socket", binding["socket"]], timeout=8.0)
+    observed = result.get("payload")
+    if (result.get("returncode") != 0 or not isinstance(observed, dict)
+            or observed.get("ok") is not True or observed.get("session_id") != thread
+            or observed.get("task_turn_id") != task_turn):
+        raise CodexAdapterError(f"bounded native recovery observation failed: {observed}")
+    return observed
+
+
+def submit_visible_recovery_runtime(root: Path, run: str, task: str,
+                                    worker_id: str, **_kwargs) -> dict[str, Any]:
+    tdir = _task_dir(root, run, task)
+    before = observe_thread_status(root, worker_id, run=run, task=task)
+    if not before.get("ok") or before.get("status_type") != "idle":
+        raise CodexAdapterError("recovery requires the original thread/turn quiet")
+    worker = _resolve_worker(root, worker_id)
+    out_dir = tdir / "codex_recovery_turn"
+    argv = ["submit-turn", "--thread", str(worker["codex_thread"]),
+            "--input-file", str(tdir / "recovery_handshake_prompt.txt"),
+            "--out-dir", str(out_dir), "--wait-seconds", "15"]
+    if worker.get("codex_socket"):
+        argv += ["--socket", str(worker["codex_socket"])]
+    result = run_client(root, argv, timeout=105.0)
+    delivery = {"mode": "codex-native-recovery-handshake", "client_result": result,
+                "delivery_path": str(tdir / "recovery_handshake_delivery.json"),
+                "post_delivery_session_observation_ok": False}
+    (tdir / "recovery_handshake_delivery.json").write_text(json.dumps(delivery))
+    payload = result.get("payload", {})
+    if not payload.get("turn_id") or result.get("returncode") not in {0, 3, 4, 5}:
+        raise CodexInterruptUnknownError("recovery delivery not confirmed; never resend")
+    after = observe_thread_status(root, worker_id)
+    delivery["post_delivery_session_observation_ok"] = bool(
+        after.get("ok") and (after.get("thread_state") or {}).get("id")
+        == worker.get("codex_thread"))
+    (tdir / "recovery_handshake_delivery.json").write_text(json.dumps(delivery))
+    return delivery
+
+
+def supplement_selection_guard(*, original_selection: dict[str, Any],
+                               selection_evidence: str) -> dict[str, Any]:
+    model = original_selection.get("model") or {}
+    if (not original_selection.get("agent") or not isinstance(model, dict)
+            or not model.get("providerID") or not model.get("modelID")
+            or not original_selection.get("variant") or not selection_evidence):
+        raise CodexAdapterError("native supplement requires complete original selection evidence")
+    return {"selection_evidence": selection_evidence}
+
+
+def deliver_visible_supplement_runtime(
+    root: Path, run: str, task: str, worker_id: str, *, supplement_id: str,
+    text: str, request_hash: str, reservation_path: Path,
+    original_selection: dict[str, Any], selection_evidence: str,
+    runtime_backend: str | None = None,
+) -> dict[str, Any]:
+    import hashlib
+    def read_evidence(path: Path) -> dict[str, Any]:
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise CodexAdapterError(f"supplement evidence unreadable: {path.name}") from exc
+        if not isinstance(value, dict):
+            raise CodexAdapterError(f"supplement evidence is not an object: {path.name}")
+        return value
+
+    supplement_selection_guard(original_selection=original_selection,
+                               selection_evidence=selection_evidence)
+    tdir = _task_dir(root, run, task)
+    if reservation_path != tdir / f"supplement-{supplement_id}.json":
+        raise CodexAdapterError("supplement reservation path mismatch")
+    reservation = read_evidence(reservation_path)
+    fence = read_evidence(tdir / "acceptance_fence.json")
+    fence_hash = "sha256:" + hashlib.sha256(json.dumps(
+        fence, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")).hexdigest()
+    if (reservation.get("status") != "reserved"
+            or reservation.get("supplement_id") != supplement_id
+            or reservation.get("worker_id") != worker_id
+            or reservation.get("task") != task
+            or reservation.get("attempt_id") != fence.get("attempt_id")
+            or reservation.get("fence_hash") != fence_hash
+            or reservation.get("request_hash") != request_hash
+            or request_hash != "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+            or reservation.get("text") != text
+            or reservation.get("original_selection") != original_selection
+            or reservation.get("selection_evidence") != selection_evidence):
+        raise CodexAdapterError("supplement reservation/fence/request mismatch")
+    worker = _resolve_worker(root, worker_id)
+    binding = worker_codex_binding(worker)
+    receipt = read_evidence(tdir / "codex_turn/turn-receipt.json")
+    turn = (((receipt.get("response") or {}).get("result") or {}).get("turn") or {}).get("id")
+    delivery = read_evidence(tdir / "delivery.json")
+    if (not worker.get("allow_auto_submit") or not turn
+            or not binding["socket"]
+            or binding["socket"] != (receipt.get("intent") or {}).get("socket")
+            or reservation.get("turn_id") != turn
+            or binding["thread"] != fence.get("session_id")
+            or binding["thread"] != (receipt.get("intent") or {}).get("thread")
+            or delivery.get("codex_thread") != binding["thread"]
+            or delivery.get("turn_id") != turn):
+        raise CodexAdapterError("supplement original thread/turn binding mismatch")
+    from visible_agent_orchestrator.progress_checkpoints import read_checkpoint_access
+    if not read_checkpoint_access(root, tdir).get("ok"):
+        raise CodexAdapterError("supplement current owner/fence guard failed")
+    if any((tdir / f".{name}").exists() for name in ("done", "fail", "blocked")):
+        raise CodexAdapterError("supplement task already terminal")
+    live = verify_binding(root, worker_id)
+    if (live.get("binding_confidence") != "strong"
+            or live.get("codex_thread") != binding["thread"]):
+        raise CodexAdapterError("supplement live native binding is not strong")
+    selection = read_evidence(tdir / "codex_turn/resume-state.json")
+    effective = selection.get("resume_effective") or {}
+    resume_thread = selection.get("resume_thread") or {}
+    expected = {"model": original_selection["model"]["modelID"],
+                "modelProvider": original_selection["model"]["providerID"],
+                "reasoningEffort": original_selection["variant"]}
+    for field, value in expected.items():
+        known = [state[field] for state in (effective, resume_thread) if state.get(field)]
+        if not known or any(item != value for item in known):
+            raise CodexAdapterError(f"supplement original {field} evidence mismatch")
+    out_dir = tdir / f"codex_supplement-{supplement_id}"
+    if out_dir.exists():
+        raise CodexAdapterError("supplement evidence directory already exists; never resend")
+    out_dir.mkdir(exist_ok=False)
+    input_path = out_dir / "input.txt"
+    input_path.write_text(text, encoding="utf-8")
+    argv = ["steer-turn", "--thread", binding["thread"], "--turn", str(turn),
+            "--input-file", str(input_path), "--out-dir", str(out_dir)]
+    if binding["socket"]:
+        argv += ["--socket", binding["socket"]]
+    result = run_client(root, argv, timeout=90.0)
+    (out_dir / "client-result.json").write_text(json.dumps(result), encoding="utf-8")
+    payload = result.get("payload") or {}
+    state = str(payload.get("delivery") or "ambiguous")
+    if state not in {"sent", "refused", "backend_rejected", "ambiguous"}:
+        state = "ambiguous"
+    if state == "sent" and (result.get("returncode") != 0
+                             or payload.get("turn_id") != turn):
+        state = "ambiguous"
+    return {"delivery": state, "backend_accepted": state == "sent",
+            "transport": "codex_appserver_websocket", "endpoint": "turn/steer",
+            "selection_binding": {"sent_fields": [], "preserved_same_turn": True,
+                                  "original_selection": original_selection,
+                                  "selection_evidence": selection_evidence},
+            "response": payload, "consumption": "unknown"}
+
+
+def interrupt_turn(root: Path, run: str, task: str, worker_id: str) -> dict[str, Any]:
+    """Interrupt the EXACT recorded turn for this task (controlled stop).
+
+    Refuses (CodexAdapterError, nothing sent) when the task has no turn
+    receipt or the recorded turn is already terminal."""
+    tdir = _task_dir(root, run, task)
+    receipt_path = tdir / "codex_turn" / "turn-receipt.json"
+    if not receipt_path.is_file():
+        raise CodexAdapterError(
+            f"no turn receipt for task {task}; refusing blind interrupt")
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    response = receipt.get("response") or {}
+    turn = ((response.get("result") or {}).get("turn") or {}).get("id")
+    intent = receipt.get("intent") or {}
+    thread = str(intent.get("thread") or "")
+    if not turn or not thread:
+        raise CodexAdapterError(
+            "turn receipt lacks thread/turn identity; interrupt refused")
+    worker = _resolve_worker(root, worker_id)
+    status = run_client(root, ["turn-status", "--thread", thread,
+                               "--turn", str(turn)]
+                        + (["--socket", str(worker.get("codex_socket"))]
+                           if worker.get("codex_socket") else []),
+                        timeout=30.0)
+    turn_state = status.get("payload", {}).get("turn_state") or {}
+    if str(turn_state.get("status") or "") in ("completed", "interrupted",
+                                               "failed"):
+        raise CodexAdapterError(
+            f"recorded turn {turn} already terminal "
+            f"({turn_state.get('status')}); nothing to interrupt")
+    out_dir = tdir / "codex_turn"
+    argv = ["interrupt-turn", "--thread", thread, "--turn", str(turn),
+            "--out-dir", str(out_dir)]
+    if worker.get("codex_socket"):
+        argv += ["--socket", str(worker["codex_socket"])]
+    result = run_client(root, argv, timeout=45.0)
+    code = result.get("returncode")
+    payload = result.get("payload", {})
+    (out_dir / "interrupt-client-result.json").write_text(json.dumps(result))
+    phase = str(payload.get("phase") or "")
+    outcome = str(payload.get("outcome") or "")
+    if code != 0 and (phase == "interrupt" and outcome != "rpc_error"
+                      or code in (4, 5) and phase not in {"connect", "handshake", "resume"}):
+        raise CodexInterruptUnknownError(
+            "interrupt outcome unknown after send: "
+            + str(result.get("payload", {}).get("outcome") or code))
+    if code != 0:
+        if phase == "interrupt" and outcome == "rpc_error":
+            return {"delivery": "rejected", "backend_accepted": False,
+                    "transport": "codex_appserver_websocket", "response": payload}
+        raise CodexAdapterError(
+            f"interrupt-turn refused before send: "
+            f"{result.get('payload', {}).get('outcome')
+            or result.get('stderr_tail') or code}")
+    return {
+        "delivery": "sent",
+        "transport": "codex_appserver_websocket",
+        "backend_accepted": True,
+        "endpoint": "turn/interrupt",
+        "response": result.get("payload", {}),
+        "interrupted_turn": turn,
+        "thread": thread,
+        "result": result.get("payload", {}),
+    }
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="codex_tui worker adapter")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("codex-identity")
+    p.add_argument("--root", required=True)
+    p.add_argument("--socket", default=None)
+    p.set_defaults(mode="identity")
+
+    p = sub.add_parser("thread-read")
+    p.add_argument("--root", required=True)
+    p.add_argument("--worker", required=True)
+    p.set_defaults(mode="thread-read")
+
+    p = sub.add_parser("turn-status")
+    p.add_argument("--root", required=True)
+    p.add_argument("--worker", required=True)
+    p.add_argument("--turn", required=True)
+    p.set_defaults(mode="turn-status")
+
+    p = sub.add_parser("verify-binding")
+    p.add_argument("--root", required=True)
+    p.add_argument("--worker", required=True)
+    p.set_defaults(mode="verify-binding")
+
+    p = sub.add_parser("register")
+    p.add_argument("--root", required=True)
+    p.add_argument("--worker", required=True)
+    p.add_argument("--pane", required=True)
+    p.add_argument("--socket", default=None)
+    p.add_argument("--thread", default=None)
+    p.add_argument("--allow-auto-submit", action="store_true", default=True)
+    p.add_argument("--default-for-new-tasks", action="store_true")
+    p.set_defaults(mode="register")
+
+    p = sub.add_parser("submit-visible-real")
+    p.add_argument("--root", required=True)
+    p.add_argument("--run", required=True)
+    p.add_argument("--task", required=True)
+    p.add_argument("--worker", required=True)
+    p.add_argument("--allow-real", action="store_true", required=True)
+    p.set_defaults(mode="submit-visible-real")
+
+    args = ap.parse_args()
+    root = Path(args.root).expanduser().resolve()
+    if args.mode == "identity":
+        argv = ["identity"]
+        if args.socket:
+            argv += ["--socket", args.socket]
+        result = run_client(root, argv, timeout=45.0)
+        print(json.dumps(result.get("payload", {}),
+                         ensure_ascii=False, indent=1, default=str))
+        return 0 if result.get("returncode") == 0 else 1
+    if args.mode == "thread-read":
+        worker = resolve_worker_record(root, args.worker)
+        result = run_client(root, _client_thread_argv(worker), timeout=30.0)
+        print(json.dumps(result.get("payload", {}),
+                         ensure_ascii=False, indent=1, default=str))
+        return 0 if result.get("returncode") == 0 else 1
+    if args.mode == "turn-status":
+        worker = resolve_worker_record(root, args.worker)
+        binding = worker_codex_binding(worker)
+        argv = ["turn-status", "--thread", binding["thread"],
+                "--turn", args.turn]
+        if binding["socket"]:
+            argv += ["--socket", binding["socket"]]
+        result = run_client(root, argv, timeout=30.0)
+        print(json.dumps(result.get("payload", {}),
+                         ensure_ascii=False, indent=1, default=str))
+        return 0 if result.get("returncode") == 0 else 1
+    if args.mode == "verify-binding":
+        print(json.dumps(verify_binding(root, args.worker),
+                         ensure_ascii=False, indent=1, default=str))
+        return 0
+    if args.mode == "register":
+        try:
+            record = register_visible(
+                root, args.worker, args.pane,
+                socket_arg=args.socket, thread_arg=args.thread,
+                default_for_new_tasks=args.default_for_new_tasks)
+        except CodexAdapterError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
+        print(json.dumps(record, ensure_ascii=False, indent=1,
+                         default=str))
+        return 0
+    if args.mode == "submit-visible-real":
+        try:
+            delivery = submit_visible_real_runtime(
+                root, args.run, args.task, args.worker)
+        except CodexAdapterError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
+        print(json.dumps(delivery, ensure_ascii=False, indent=1,
+                         default=str))
+        return 0
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

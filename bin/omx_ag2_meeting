@@ -1,0 +1,316 @@
+#!/usr/bin/env python3
+"""Thin no-live wrapper for preset AG2-style mock meetings."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+_THIS_FILE = Path(__file__).resolve()
+for _p in ((_THIS_FILE.parent.parent / "src").resolve(), (_THIS_FILE.parent.parent / "lib").resolve()):
+    if _p.exists() and str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
+
+from visible_agent_orchestrator.meeting import MEETING_PRESET_NAMES, MeetingRequestProfile, load_meeting_request_profile
+from visible_agent_orchestrator.runtime_paths import workspace_root
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="omx_ag2_meeting",
+        description="Run a mock/no-live AG2-style meeting through omx_meeting_plan ag2-run.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+Supported presets: idea-review, code-design-review
+
+Artifacts: meeting-result.json, meeting-synthesis.json, meeting-audit.json, transcript.md
+
+This wrapper always delegates to omx_meeting_plan ag2-run --runtime mock and
+reports would_execute_live=false. Phase 28B real runtime remains blocked until
+explicit host-local approval and provider policy exist.
+
+Optional control_plane_dry_run proposals are advisory only. They are written
+into meeting-result.json and can be executed only through the separate
+omx_meeting_plan bridge-dry-run command, which always passes --dry-run.
+
+No provider/model/base_url/api_key config, no v4-pro, no tmux, no /tui/*, and
+no visible worker dispatch are available through this wrapper.
+""",
+    )
+    parser.add_argument("--root", default=None, help="Workspace root where meeting artifacts are written.")
+    parser.add_argument("--task", required=True, help="Task or question for the preset meeting.")
+    target = parser.add_mutually_exclusive_group(required=True)
+    target.add_argument(
+        "--preset",
+        choices=MEETING_PRESET_NAMES,
+        help="Built-in mock meeting preset.",
+    )
+    target.add_argument(
+        "--profile",
+        default="",
+        help="Worker-safe named profile from plugins/ag2-meeting-runtime/profiles.",
+    )
+    parser.add_argument("--thread-id", default="", help="Optional deterministic meeting thread id.")
+    parser.add_argument("--max-rounds", type=int, default=None, help="Optional preset round limit, not above preset default.")
+    parser.add_argument(
+        "--propose-control-plane-dry-run-worker",
+        action="append",
+        default=[],
+        help="append a visible worker id to a deterministic no-live control_plane_dry_run proposed action",
+    )
+    parser.add_argument("--propose-control-plane-dry-run-title", default="")
+    parser.add_argument("--propose-control-plane-dry-run-body", default="")
+    parser.add_argument("--propose-control-plane-dry-run-timeout", type=int, default=300)
+    parser.add_argument("--json", action="store_true", help="Print JSON summary.")
+    return parser
+
+
+def default_profile_dir() -> Path:
+    return Path(__file__).resolve().parents[1] / "plugins" / "ag2-meeting-runtime" / "profiles"
+
+
+def resolve_request_profile(args: argparse.Namespace) -> MeetingRequestProfile | None:
+    if not args.profile:
+        return None
+    if args.max_rounds is not None:
+        raise ValueError("--max-rounds cannot be supplied in profile mode")
+    profile = load_meeting_request_profile(args.profile, profile_dir=default_profile_dir())
+    proposed_workers = list(args.propose_control_plane_dry_run_worker or [])
+    dry_run_requested = bool(
+        proposed_workers or args.propose_control_plane_dry_run_title or args.propose_control_plane_dry_run_body
+    )
+    if dry_run_requested and not profile.allow_dry_run_proposal:
+        raise ValueError(f"profile {profile.name} does not allow control-plane dry-run proposals")
+    allowed = set(profile.allowed_workers)
+    for worker in proposed_workers:
+        if worker not in allowed:
+            raise ValueError(f"worker {worker} is not allowed by profile {profile.name}")
+    if dry_run_requested and args.propose_control_plane_dry_run_timeout > profile.timeout_seconds:
+        raise ValueError(f"dry-run timeout exceeds profile {profile.name} timeout_seconds")
+    return profile
+
+
+def run_delegated_ag2_run(args: argparse.Namespace, profile: MeetingRequestProfile | None) -> subprocess.CompletedProcess[str]:
+    meeting_plan = Path(__file__).resolve().with_name("omx_meeting_plan")
+    root = workspace_root(args.root)
+    preset = profile.preset if profile is not None else args.preset
+    max_rounds = profile.max_rounds if profile is not None else args.max_rounds
+    command = [
+        str(meeting_plan),
+        "ag2-run",
+        "--root",
+        str(root),
+        "--task",
+        args.task,
+        "--runtime",
+        "mock",
+        "--preset",
+        preset,
+        "--json",
+    ]
+    if args.thread_id:
+        command.extend(["--thread-id", args.thread_id])
+    if max_rounds is not None:
+        command.extend(["--max-rounds", str(max_rounds)])
+    for worker in args.propose_control_plane_dry_run_worker:
+        command.extend(["--propose-control-plane-dry-run-worker", worker])
+    if args.propose_control_plane_dry_run_title:
+        command.extend(["--propose-control-plane-dry-run-title", args.propose_control_plane_dry_run_title])
+    if args.propose_control_plane_dry_run_body:
+        command.extend(["--propose-control-plane-dry-run-body", args.propose_control_plane_dry_run_body])
+    if args.propose_control_plane_dry_run_timeout != 300:
+        command.extend(["--propose-control-plane-dry-run-timeout", str(args.propose_control_plane_dry_run_timeout)])
+    timeout = profile.timeout_seconds if profile is not None else None
+    env = {**os.environ, **visible_task_scope_env(root)}
+    return subprocess.run(
+        command,
+        cwd=str(Path(__file__).resolve().parents[1]),
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+        check=False,
+    )
+
+
+def visible_task_scope_env(root: Path) -> dict[str, str]:
+    if os.environ.get("OMX_VISIBLE_WORKER_ID") and os.environ.get("OMX_VISIBLE_RUN_ID"):
+        return {}
+    lock = infer_visible_task_scope_from_active_lock(root)
+    if not lock:
+        return {}
+    result: dict[str, str] = {}
+    worker_id = str(lock.get("worker_id") or "").strip()
+    run = str(lock.get("run") or "").strip()
+    task = str(lock.get("task") or lock.get("task_id") or "").strip()
+    if worker_id and not os.environ.get("OMX_VISIBLE_WORKER_ID"):
+        result["OMX_VISIBLE_WORKER_ID"] = worker_id
+    if run and not os.environ.get("OMX_VISIBLE_RUN_ID"):
+        result["OMX_VISIBLE_RUN_ID"] = run
+    if task and not os.environ.get("OMX_VISIBLE_TASK_ID"):
+        result["OMX_VISIBLE_TASK_ID"] = task
+    return result
+
+
+def infer_visible_task_scope_from_active_lock(root: Path) -> dict[str, object]:
+    locks_dir = root / ".omx" / "framework" / "team" / "visible-runs" / "_locks"
+    if not locks_dir.is_dir():
+        return {}
+    active: list[dict[str, object]] = []
+    try:
+        lock_paths = sorted(locks_dir.glob("*.lock.json"))
+    except OSError:
+        return {}
+    for path in lock_paths:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        status = str(payload.get("status") or "").strip().lower()
+        if status and status not in {"active", "running", "submitted"}:
+            continue
+        if not str(payload.get("worker_id") or "").strip() or not str(payload.get("run") or "").strip():
+            continue
+        active.append(payload)
+    return active[0] if len(active) == 1 else {}
+
+
+def build_wrapper_payload(
+    root: Path,
+    delegated_payload: dict[str, object],
+    *,
+    profile: MeetingRequestProfile | None,
+) -> dict[str, object]:
+    result = delegated_payload.get("result")
+    if not isinstance(result, dict):
+        raise ValueError("delegated ag2-run payload missing result object")
+    messages = result.get("messages")
+    participants = result.get("participants")
+    if not isinstance(messages, list) or not isinstance(participants, list):
+        raise ValueError("delegated ag2-run payload has invalid result shape")
+    participant_names: list[str] = []
+    for participant in participants:
+        if not isinstance(participant, dict) or not isinstance(participant.get("name"), str):
+            raise ValueError("delegated ag2-run payload has invalid participant shape")
+        participant_names.append(participant["name"])
+    artifacts = dict(delegated_payload["artifacts"])
+    thread_id = str(delegated_payload["thread_id"])
+    request_mode = "profile" if profile is not None else "preset"
+    payload = {
+        "ok": True,
+        "command": "ag2-meeting",
+        "delegated_command": "omx_meeting_plan ag2-run",
+        "root": str(root.resolve()),
+        "request_mode": request_mode,
+        "runtime": "mock",
+        "preset": delegated_payload["preset"],
+        "thread_id": thread_id,
+        "would_execute_live": False,
+        "artifacts": artifacts,
+        "summary": {
+            "task": result.get("task", ""),
+            "message_count": len(messages),
+            "participant_names": participant_names,
+            "termination_reason": result.get("termination_reason", ""),
+            "verdict": result.get("verdict", ""),
+        },
+        "meeting_plan": delegated_payload,
+    }
+    if profile is not None:
+        payload["profile"] = profile.to_payload()
+        audit_path = Path(artifacts["result_json"]).resolve().parent / "meeting-request-audit.json"
+        audit_payload = build_request_audit_payload(profile=profile, thread_id=thread_id, delegated_payload=delegated_payload)
+        audit_path.write_text(json.dumps(audit_payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        artifacts["request_audit_json"] = str(audit_path)
+    return payload
+
+
+def build_request_audit_payload(
+    *,
+    profile: MeetingRequestProfile,
+    thread_id: str,
+    delegated_payload: dict[str, object],
+) -> dict[str, object]:
+    result = delegated_payload.get("result")
+    result_payload = result if isinstance(result, dict) else {}
+    return {
+        "schema_version": 1,
+        "audit_kind": "ag2_profile_request_audit",
+        "profile_name": profile.name,
+        "preset": profile.preset,
+        "thread_id": thread_id,
+        "caller": os.environ.get("OMX_VISIBLE_WORKER_ID", "unknown"),
+        "audit_level": profile.audit_level,
+        "would_execute_live": False,
+        "limits": {
+            "timeout_seconds": profile.timeout_seconds,
+            "max_cost_usd": profile.max_cost_usd,
+            "empty_response_retries": profile.empty_response_retries,
+        },
+        "result_summary": {
+            "termination_reason": str(result_payload.get("termination_reason", "")),
+            "verdict": str(result_payload.get("verdict", "")),
+            "message_count": len(result_payload.get("messages", [])) if isinstance(result_payload.get("messages"), list) else 0,
+        },
+        "redaction": {
+            "provider_values_recorded": False,
+            "secret_values_recorded": False,
+            "host_local_paths_recorded": False,
+        },
+    }
+
+
+def print_text_summary(payload: dict[str, object]) -> None:
+    summary = payload["summary"]
+    artifacts = payload["artifacts"]
+    if not isinstance(summary, dict) or not isinstance(artifacts, dict):
+        raise ValueError("invalid wrapper payload")
+    print("command: ag2-meeting")
+    print("delegated_command: omx_meeting_plan ag2-run")
+    print("runtime: mock")
+    print(f"preset: {payload['preset']}")
+    print("would_execute_live: false")
+    print(f"message_count: {summary['message_count']}")
+    print(f"participants: {', '.join(summary['participant_names'])}")
+    print(f"result_json: {artifacts['result_json']}")
+    print(f"synthesis_json: {artifacts['synthesis_json']}")
+    print(f"audit_json: {artifacts['audit_json']}")
+    print(f"transcript_md: {artifacts['transcript_md']}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        profile = resolve_request_profile(args)
+        delegated = run_delegated_ag2_run(args, profile)
+    except (subprocess.TimeoutExpired, ValueError) as exc:
+        print(f"omx_ag2_meeting: error: {exc}", file=sys.stderr)
+        return 2
+    if delegated.returncode != 0:
+        if delegated.stdout:
+            print(delegated.stdout, end="")
+        if delegated.stderr:
+            print(delegated.stderr, end="", file=sys.stderr)
+        return delegated.returncode
+    try:
+        delegated_payload = json.loads(delegated.stdout)
+        payload = build_wrapper_payload(workspace_root(args.root), delegated_payload, profile=profile)
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+        print(f"omx_ag2_meeting: error: {exc}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        print_text_summary(payload)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,3018 @@
+#!/usr/bin/env python3
+"""Rebind the registered visible OpenCode worker to the live port/pane.
+
+This tool is intentionally narrow:
+- scans only the current tmux session/window
+- uses read-only process/socket inspection plus GET-only OpenCode probes
+- never sends tmux input
+- never starts/stops workers
+- writes only framework rebind reports and, with --allow-rebind, the visible
+  worker registry plus project-local prompt/AGENTS managed block.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlencode
+
+_THIS_FILE = Path(__file__).resolve()
+for _p in ((_THIS_FILE.parent.parent / "src").resolve(), (_THIS_FILE.parent.parent / "lib").resolve()):
+    if _p.exists() and str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
+
+from visible_agent_orchestrator.runtime.backends import available_backends, default_backend_name
+from visible_agent_orchestrator._linux_observation import process_record, process_tree as proc_tree, target_listeners, process_instance_state
+from visible_agent_orchestrator.runtime.errors import RuntimeAdapterError
+from visible_agent_orchestrator.runtime.rebind import (
+    binding_lease_rebind_required,
+    build_rebind_check_summary,
+    explain_rebind_plan,
+)
+from visible_agent_orchestrator.runtime.registry import (
+    validate_worker_for_dispatch,
+)
+from visible_agent_orchestrator.runtime.tmux_capabilities import command_shape_supported, command_support_report
+from visible_agent_orchestrator.runtime_paths import runtime_root
+from visible_agent_orchestrator.global_mutation_gate import global_mutation_gate
+from visible_agent_orchestrator.companion_skill_admission import AdmissionError, invoke_cli_handler
+from visible_agent_orchestrator.opencode_visible_registry import (
+    advance_binding_generations,
+    derive_process_instance,
+    mutate_visible_registry,
+    replace_visible_worker_binding,
+)
+from visible_agent_orchestrator.visible_registry_lock import (
+    visible_binding_alias_conflicts,
+    write_json_atomic,
+    write_visible_registry_mutation_audit,
+)
+
+
+BEGIN = "<!-- OMX_VISIBLE_CONTROL_BEGIN -->"
+END = "<!-- OMX_VISIBLE_CONTROL_END -->"
+REQUIRED_TUI_PATHS = {
+    "/tui/clear-prompt",
+    "/tui/append-prompt",
+    "/tui/submit-prompt",
+}
+POLLUTION_DIRS = {"_framework", "demo-run", "dispatch-demo"}
+BINDING_LEASE_SECONDS = 86_400
+
+
+def unique_worker_ids(values: list[str] | tuple[str, ...] | None) -> list[str]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for item in values or []:
+        worker_id = str(item or "")
+        if not worker_id or worker_id in seen:
+            continue
+        seen.add(worker_id)
+        ordered.append(worker_id)
+    return ordered
+
+
+class RebindError(Exception):
+    """Expected operator-facing failure."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        worker_id: str = "",
+        status: str | None = None,
+        conflicting_worker_ids: list[str] | None = None,
+        result_path: str | None = None,
+        facts: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.worker_id = str(worker_id or "")
+        self.status = status
+        self.conflicting_worker_ids = unique_worker_ids(conflicting_worker_ids)
+        self.result_path = result_path
+        self.facts = dict(facts or {})
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def stamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def root_path(value: str | None) -> Path:
+    return runtime_root(value)
+
+
+def guarded_tmux_argv(substrate: str, command: str, *args: str) -> list[str]:
+    supported, reason = command_shape_supported(command, list(args))
+    if not supported:
+        raise RebindError(reason)
+    return [substrate, command, *args]
+
+
+def caller_pane_target_args(substrate: str) -> list[str]:
+    pane_id = str(os.environ.get("TMUX_PANE") or "").strip()
+    if substrate == "tmux" and re.fullmatch(r"%[0-9]+", pane_id):
+        return ["-t", pane_id]
+    return []
+
+
+def framework_root(root: Path) -> Path:
+    return root / ".omx" / "framework" / "team"
+
+
+def rebind_root(root: Path) -> Path:
+    return framework_root(root) / "rebind"
+
+
+def backup_root(root: Path) -> Path:
+    return framework_root(root) / "backups"
+
+
+def registry_path(root: Path) -> Path:
+    return framework_root(root) / "opencode_visible_workers.json"
+
+
+def binding_pid_set(record: dict[str, Any]) -> set[int]:
+    values: list[Any] = []
+    for field in ("pane_pid", "opencode_pid"):
+        values.append(record.get(field))
+    for field in ("listener_pids", "opencode_pids", "strong_pid_matches"):
+        raw = record.get(field)
+        if isinstance(raw, list):
+            values.extend(raw)
+    result: set[int] = set()
+    for value in values:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0:
+            result.add(parsed)
+    return result
+
+
+def process_instance_is_alive(pid: int, expected_start_time_ticks: int) -> bool:
+    if int(pid or 0) <= 0 or int(expected_start_time_ticks or 0) <= 0:
+        return False
+    return (
+        process_start_time_ticks(int(pid))
+        == int(expected_start_time_ticks)
+    )
+
+
+def cross_boot_row_lost_port_ownership(
+    root: Path,
+    item: dict[str, Any],
+    old_port: int,
+) -> dict[str, Any] | None:
+    """Positive evidence that a cross-boot registry row's recorded binding no
+    longer owns its old port (#934). A reachable endpoint proves
+    availability, not ownership: after a reboot a different fresh service
+    can occupy the old port number while the row's own processes are gone.
+    Proven only by a positive observation - the row's recorded OpenCode
+    instance is positively absent or its pid was recycled (differing
+    start-time ticks), or a successful port scan shows current listeners
+    that exclude every pid the row recorded. Unknown observations (unreadable
+    /proc, failed scan) prove nothing and keep the alias conflict."""
+    recorded_pids: set[int] = set()
+    pid_values: list[Any] = []
+    if item.get("opencode_pid") is not None:
+        pid_values.append(item.get("opencode_pid"))
+    for key in ("opencode_pids", "listener_pids"):
+        values = item.get(key)
+        if isinstance(values, list):
+            pid_values.extend(values)
+    for value in pid_values:
+        try:
+            pid = int(value)
+        except (TypeError, ValueError):
+            continue
+        if pid > 0:
+            recorded_pids.add(pid)
+    if not recorded_pids:
+        return None
+    try:
+        opencode_pid = int(item.get("opencode_pid") or 0)
+        opencode_ticks = int(item.get("opencode_start_time_ticks") or 0)
+    except (TypeError, ValueError):
+        opencode_pid = 0
+        opencode_ticks = 0
+    if (
+        opencode_pid > 0
+        and opencode_ticks > 0
+        and process_instance_state(opencode_pid, opencode_ticks) == "dead"
+    ):
+        return {
+            "old_opencode_process_dead": True,
+            "recorded_opencode_pid": opencode_pid,
+        }
+    listeners = socket_discovery(root, old_port)
+    listener_pids = {
+        int(pid)
+        for pid in listeners.get("listener_pids") or []
+        if int(pid) > 0
+    }
+    if (
+        not listeners.get("errors")
+        and listeners.get("scan_succeeded")
+        and listener_pids
+        and listener_pids.isdisjoint(recorded_pids)
+    ):
+        # Only complete, unambiguous ownership evidence (a finished scan with
+        # exactly one observed listener, errors empty) proves the old port is
+        # now owned by different processes; a partial or ambiguous scan -
+        # hidden or malformed listener lines - stays unknown and keeps the
+        # conflict (#934).
+        return {
+            "old_opencode_process_dead": False,
+            "current_listener_pids": sorted(listener_pids),
+            "recorded_pids": sorted(recorded_pids),
+        }
+    return None
+
+
+def ensure_target_quiescence(
+    root: Path,
+    worker_id: str,
+    *,
+    candidate: dict[str, Any] | None = None,
+) -> list[Path]:
+    lock_root = framework_root(root) / "visible-runs" / "_locks"
+    locks = sorted(path for path in lock_root.glob("*.lock.json") if path.is_file())
+    registry = read_json(registry_path(root))
+    registry_workers = {
+        str(item.get("worker_id") or ""): item
+        for item in registry.get("workers", [])
+        if isinstance(item, dict) and str(item.get("worker_id") or "")
+    }
+    target_locks = []
+    collision_details: list[str] = []
+    for path in locks:
+        filename_worker_id = path.name.removesuffix(".lock.json")
+        payload = read_json(path)
+        payload_worker_id = payload.get("worker_id")
+        if (
+            filename_worker_id == worker_id
+            or payload_worker_id == worker_id
+            or not isinstance(payload_worker_id, str)
+            or not payload_worker_id
+            or payload_worker_id != filename_worker_id
+        ):
+            target_locks.append(path)
+            continue
+        if candidate is None:
+            continue
+
+        lock_binding = {
+            **registry_workers.get(str(payload_worker_id), {}),
+            **payload,
+        }
+        lock_boot = str(lock_binding.get("host_boot_id") or "")
+        candidate_boot = str(candidate.get("host_boot_id") or "")
+        if lock_boot and candidate_boot and lock_boot != candidate_boot:
+            continue
+        lock_server_pid = 0
+        candidate_server_pid = 0
+        try:
+            lock_server_pid = int(lock_binding.get("tmux_server_pid") or 0)
+        except (TypeError, ValueError):
+            lock_server_pid = 0
+        try:
+            candidate_server_pid = int(candidate.get("tmux_server_pid") or 0)
+        except (TypeError, ValueError):
+            candidate_server_pid = 0
+        # Same boot but a different tmux server generation means the pane
+        # NUMBER may simply have been reused; only the pane-number reason is
+        # exempt. Shared ports or processes are still real collisions.
+        cross_server_generation = bool(
+            lock_boot
+            and candidate_boot
+            and lock_boot == candidate_boot
+            and lock_server_pid > 0
+            and candidate_server_pid > 0
+            and lock_server_pid != candidate_server_pid
+        )
+        reasons: list[str] = []
+        lock_pane = str(lock_binding.get("pane_id") or "")
+        candidate_pane = str(candidate.get("pane_id") or "")
+        if (
+            lock_pane
+            and candidate_pane
+            and lock_pane == candidate_pane
+            and not cross_server_generation
+        ):
+            reasons.append(f"same pane {candidate_pane}")
+        try:
+            lock_port = int(lock_binding.get("port") or 0)
+        except (TypeError, ValueError):
+            lock_port = 0
+        try:
+            candidate_port = int(candidate.get("port") or 0)
+        except (TypeError, ValueError):
+            candidate_port = 0
+        if lock_port and candidate_port and lock_port == candidate_port:
+            reasons.append(f"same port {candidate_port}")
+        shared_pids = binding_pid_set(lock_binding) & binding_pid_set(candidate)
+        if shared_pids:
+            reasons.append(
+                "same binding pid " + ",".join(str(pid) for pid in sorted(shared_pids))
+            )
+        if reasons:
+            target_locks.append(path)
+            collision_details.append(f"{path.name}: {', '.join(reasons)}")
+    if target_locks:
+        names = ", ".join(path.name for path in target_locks)
+        if collision_details:
+            raise RebindError(
+                f"target binding collision; refusing registry mutation: "
+                + "; ".join(collision_details)
+                + "; rebind the worker that currently holds the shared "
+                "pane/port first; for a conflicting worker proven gone, run "
+                "ITS OWN `omx_visible_rebind check --root <control-root> "
+                "--worker <that-worker> --json` (accepted when status is "
+                "binding_failed with errors, or port_not_live with no "
+                "active owner lock) and then `omx_worker_backend "
+                "opencode-visible-worker-disable --root <control-root> "
+                "--worker-id <that-worker> --opencode-visible-registry "
+                "<registry.json> --rebind-check <its-check.json> "
+                "--allow-framework-registry --allow-worker-disable`",
+                worker_id=worker_id,
+                facts={"refusal_reason": "target_owner_lock"},
+            )
+        raise RebindError(
+            f"target worker {worker_id} has an owner lock; refusing registry mutation: {names}",
+            worker_id=worker_id,
+            facts={"refusal_reason": "target_owner_lock"},
+        )
+    return locks
+
+
+def global_owner_lock_paths(root: Path) -> list[Path]:
+    lock_root = framework_root(root) / "visible-runs" / "_locks"
+    return sorted(path for path in lock_root.glob("*.lock.json") if path.is_file())
+
+
+def usage_policy_path(root: Path) -> Path:
+    return framework_root(root) / "opencode_worker_usage_policy.json"
+
+
+def prompt_current_path(root: Path) -> Path:
+    return framework_root(root) / "VISIBLE_LEADER_PROMPT_CURRENT.md"
+
+
+def prompt_legacy_path(root: Path) -> Path:
+    return framework_root(root) / "VISIBLE_LEADER_PROMPT.md"
+
+
+def hard_rules_path(root: Path) -> Path:
+    return framework_root(root) / "VISIBLE_CONTROL_HARD_RULES.md"
+
+
+def framework_surface_paths(root: Path) -> dict[str, Path]:
+    base = framework_root(root)
+    return {
+        "legacy_prompt": base / "VISIBLE_LEADER_PROMPT.md",
+        "current_prompt": base / "VISIBLE_LEADER_PROMPT_CURRENT.md",
+        "hard_rules": base / "VISIBLE_CONTROL_HARD_RULES.md",
+        "control_protocol": base / "VISIBLE_CONTROL_PROTOCOL.md",
+        "install_readme": base / "VISIBLE_CONTROL_INSTALL_README.md",
+        "prompt_snippet": base / "VISIBLE_CONTROL_PROMPT_SNIPPET.md",
+        "dispatch_readme": base / "VISIBLE_DISPATCH_README.md",
+        "tui_auto_submit": base / "VISIBLE_TUI_AUTO_SUBMIT.md",
+        "rebind_readme": base / "VISIBLE_REBIND_README.md",
+        "daily_usage": base / "DAILY_USAGE_RUNBOOK.md",
+        "multiworker_readiness": base / "MULTIWORKER_READINESS.md",
+        "recovery_playbook": base / "RECOVERY_PLAYBOOK.md",
+    }
+
+
+def framework_surface_source_paths() -> dict[str, Path]:
+    source_base = _THIS_FILE.parent.parent / "docs" / "framework-team"
+    return {
+        "legacy_prompt": source_base / "VISIBLE_LEADER_PROMPT.md",
+        "current_prompt": source_base / "VISIBLE_LEADER_PROMPT_CURRENT.md",
+        "hard_rules": source_base / "VISIBLE_CONTROL_HARD_RULES.md",
+        "control_protocol": source_base / "VISIBLE_CONTROL_PROTOCOL.md",
+        "install_readme": source_base / "VISIBLE_CONTROL_INSTALL_README.md",
+        "prompt_snippet": source_base / "VISIBLE_CONTROL_PROMPT_SNIPPET.md",
+        "dispatch_readme": source_base / "VISIBLE_DISPATCH_README.md",
+        "tui_auto_submit": source_base / "VISIBLE_TUI_AUTO_SUBMIT.md",
+        "rebind_readme": source_base / "VISIBLE_REBIND_README.md",
+        "daily_usage": source_base / "DAILY_USAGE_RUNBOOK.md",
+        "multiworker_readiness": source_base / "MULTIWORKER_READINESS.md",
+        "recovery_playbook": source_base / "RECOVERY_PLAYBOOK.md",
+    }
+
+
+def agents_path(root: Path) -> Path:
+    return root / "AGENTS.md"
+
+
+def rel(path: Path, root: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(root.resolve()))
+    except Exception:
+        return str(path)
+
+
+def read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def process_start_time_ticks(pid: int) -> int:
+    try:
+        text = Path(f"/proc/{int(pid)}/stat").read_text(
+            encoding="utf-8",
+            errors="replace",
+        )
+    except (OSError, TypeError, ValueError):
+        return 0
+    close = text.rfind(")")
+    if close < 0:
+        return 0
+    fields = text[close + 1 :].strip().split()
+    try:
+        return int(fields[19])
+    except (IndexError, TypeError, ValueError):
+        return 0
+
+
+def host_boot_id() -> str:
+    return read_text(Path("/proc/sys/kernel/random/boot_id")).strip()
+
+
+def tmux_server_pid(root: Path) -> int:
+    result = run_command(["tmux", "display-message", "-p", "#{pid}"], root, timeout=5)
+    try:
+        return int(result.get("stdout", "").strip()) if result.get("returncode") == 0 else 0
+    except ValueError:
+        return 0
+
+
+def write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+
+
+def read_json(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def read_process_environment(pid: int) -> dict[str, str]:
+    if pid <= 0:
+        return {}
+    try:
+        raw = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError:
+        return {}
+    environment: dict[str, str] = {}
+    for item in raw.split(b"\0"):
+        if b"=" not in item:
+            continue
+        key, value = item.split(b"=", 1)
+        environment[key.decode(errors="replace")] = value.decode(errors="replace")
+    return environment
+
+
+def write_json(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def binding_token(worker_id: str, action: str) -> str:
+    seed = (
+        f"{worker_id}\0{action}\0{time.time_ns()}\0{os.getpid()}\0"
+        f"{os.environ.get('TMUX_PANE', '')}"
+    )
+    return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:24]
+
+
+def binding_expiration() -> str:
+    raw = str(os.environ.get("OMX_VISIBLE_BINDING_LEASE_SECONDS") or "").strip()
+    try:
+        seconds = max(300, int(raw)) if raw else BINDING_LEASE_SECONDS
+    except ValueError:
+        seconds = BINDING_LEASE_SECONDS
+    expires = datetime.now(timezone.utc) + timedelta(seconds=seconds)
+    return expires.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def safe_id(value: str, label: str) -> str:
+    if not value or value in {".", ".."} or "/" in value or "\\" in value or "\x00" in value:
+        raise RebindError(f"{label} must be a simple id, got: {value!r}")
+    return value
+
+
+
+def run_command(argv: list[str], cwd: Path, timeout: int = 10) -> dict[str, Any]:
+    try:
+        proc = subprocess.run(
+            argv,
+            cwd=str(cwd),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False,
+        )
+        return {
+            "argv": argv,
+            "returncode": proc.returncode,
+            "stdout": proc.stdout,
+            "stderr": proc.stderr,
+            "timed_out": False,
+        }
+    except FileNotFoundError as exc:
+        return {"argv": argv, "returncode": 127, "stdout": "", "stderr": str(exc), "timed_out": False}
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "argv": argv,
+            "returncode": 124,
+            "stdout": exc.stdout or "",
+            "stderr": exc.stderr or "timed out",
+            "timed_out": True,
+        }
+
+
+def http_get(host: str, port: int, path: str, *, timeout: float = 2.0, max_bytes: int = 512_000) -> dict[str, Any]:
+    if host not in {"127.0.0.1", "localhost"}:
+        return {
+            "ok": False,
+            "status": None,
+            "timed_out": False,
+            "connection_refused": False,
+            "error": f"host not allowed: {host}",
+            "url": "",
+        }
+    url = f"http://{host}:{int(port)}{path}"
+    req = urllib.request.Request(url, method="GET", headers={"User-Agent": "omx-visible-rebind/1"})
+    started = time.time()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            body = response.read(max_bytes + 1)
+            truncated = len(body) > max_bytes
+            if truncated:
+                body = body[:max_bytes]
+            text = body.decode("utf-8", errors="replace")
+            return {
+                "ok": 200 <= int(response.status) < 300,
+                "status": int(response.status),
+                "url": url,
+                "elapsed_seconds": round(time.time() - started, 3),
+                "body": text,
+                "truncated": truncated,
+                "timed_out": False,
+                "connection_refused": False,
+                "error": "",
+            }
+    except urllib.error.HTTPError as exc:
+        return {
+            "ok": False,
+            "status": int(exc.code),
+            "url": url,
+            "elapsed_seconds": round(time.time() - started, 3),
+            "body": "",
+            "truncated": False,
+            "timed_out": False,
+            "connection_refused": False,
+            "error": str(exc),
+        }
+    except Exception as exc:
+        reason = getattr(exc, "reason", exc)
+        return {
+            "ok": False,
+            "status": None,
+            "url": url,
+            "elapsed_seconds": round(time.time() - started, 3),
+            "body": "",
+            "truncated": False,
+            "timed_out": isinstance(reason, TimeoutError),
+            "connection_refused": isinstance(reason, ConnectionRefusedError),
+            "error": str(exc),
+        }
+
+
+def summarize_doc(doc_text: str) -> dict[str, Any]:
+    paths: set[str] = set()
+    title = ""
+    version = ""
+    openapi_version = ""
+    try:
+        data = json.loads(doc_text)
+        if isinstance(data, dict):
+            openapi_version = str(data.get("openapi") or data.get("swagger") or "")
+            info = data.get("info", {})
+            if isinstance(info, dict):
+                title = str(info.get("title") or "")
+                version = str(info.get("version") or "")
+            raw_paths = data.get("paths", {})
+            if isinstance(raw_paths, dict):
+                paths.update(str(path) for path in raw_paths.keys())
+    except Exception:
+        pass
+    if not paths:
+        for match in re.finditer(r'/(?:tui|session|global)/[A-Za-z0-9_.:/{}-]+', doc_text):
+            paths.add(match.group(0).rstrip('", '))
+    return {
+        "doc_available": bool(doc_text),
+        "openapi_version": openapi_version,
+        "title": title,
+        "version": version,
+        "detected_paths": sorted(paths),
+        "required_tui": {path: path in paths or path in doc_text for path in sorted(REQUIRED_TUI_PATHS)},
+        "all_required_tui_present": all(path in paths or path in doc_text for path in REQUIRED_TUI_PATHS),
+    }
+
+
+def tmux_current_panes(root: Path) -> dict[str, Any]:
+    substrate = ""
+    if os.environ.get("RMUX") or str(os.environ.get("TERM_PROGRAM", "")).lower() == "rmux":
+        substrate = "rmux"
+    elif os.environ.get("TMUX"):
+        substrate = "tmux"
+    result: dict[str, Any] = {
+        "inside_tmux": substrate == "tmux",
+        "inside_rmux": substrate == "rmux",
+        "runtime_substrate": substrate,
+        "display": {},
+        "panes": [],
+        "errors": [],
+    }
+    if not substrate:
+        result["errors"].append("not inside tmux/rmux")
+        return result
+    target_args = caller_pane_target_args(substrate)
+    if substrate == "tmux" and not target_args:
+        result["errors"].append("TMUX_PANE is required for scoped tmux discovery")
+        return result
+    display = run_command(
+        guarded_tmux_argv(
+            substrate,
+            "display-message",
+            *target_args,
+            "-p",
+            "#S:#I.#P #{pane_id}",
+        ),
+        root,
+        timeout=5,
+    )
+    result["display"] = display
+    if substrate == "tmux" and display["returncode"] != 0:
+        result["errors"].append(
+            display["stderr"] or display["stdout"] or "tmux display-message failed"
+        )
+        return result
+    fmt = "#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_id}\t#{pane_current_command}\t#{pane_title}\t#{pane_active}\t#{pane_pid}\t#{pane_current_path}"
+    panes = run_command(
+        guarded_tmux_argv(substrate, "list-panes", *target_args, "-F", fmt),
+        root,
+        timeout=5,
+    )
+    result["list_panes"] = {k: panes[k] for k in ("returncode", "stderr", "timed_out") if k in panes}
+    if panes["returncode"] != 0:
+        result["errors"].append(panes["stderr"] or panes["stdout"] or f"{substrate} list-panes failed")
+        return result
+    parsed: list[dict[str, Any]] = []
+    for line in panes["stdout"].splitlines():
+        parts = line.split("\t")
+        if len(parts) != 9:
+            continue
+        session, window, pane_index, pane_id, command, title, active, pane_pid, current_path = parts
+        try:
+            pid_value = int(pane_pid)
+        except ValueError:
+            pid_value = 0
+        parsed.append({
+            "session": session,
+            "window_index": window,
+            "pane_index": pane_index,
+            "pane_id": pane_id,
+            "pane_current_command": command,
+            "pane_title": title,
+            "pane_active": active == "1",
+            "pane_pid": pid_value,
+            "pane_current_path": current_path,
+        })
+    if substrate == "tmux":
+        caller_pane_id = target_args[1]
+        if not any(pane["pane_id"] == caller_pane_id for pane in parsed):
+            result["errors"].append(
+                f"TMUX_PANE {caller_pane_id} is not present in the targeted tmux window"
+            )
+            return result
+    result["panes"] = parsed
+    return result
+
+
+def proc_cmdline(pid: int) -> str:
+    try:
+        raw = Path(f"/proc/{int(pid)}/cmdline").read_bytes()
+        return raw.replace(b"\x00", b" ").decode("utf-8", errors="replace").strip()
+    except Exception:
+        return ""
+
+
+def ps_info(pid: int, root: Path) -> dict[str, Any]:
+    record = process_record(pid)
+    record["stdout"] = record.pop("ps")
+    return record
+
+
+def process_tree(root: Path, panes: list[dict[str, Any]], max_depth: int = 5) -> dict[str, Any]:
+    trees: dict[str, Any] = {}
+    for pane in panes:
+        root_pid = int(pane.get("pane_pid") or 0)
+        if root_pid <= 0:
+            continue
+        tree = proc_tree(root_pid, max_depth)
+        nodes = list(tree["nodes"].values())
+        for info in nodes:
+            info["stdout"] = info.pop("ps")
+        trees[str(pane.get("pane_id"))] = {
+            "pane_id": pane.get("pane_id"),
+            "pane_pid": root_pid,
+            "pids": sorted(map(int, tree["nodes"])),
+            "processes": nodes,
+        }
+    return trees
+
+
+def command_available(name: str) -> bool:
+    return shutil.which(name) is not None
+
+
+def socket_discovery(root: Path, port: int) -> dict[str, Any]:
+    probes: dict[str, Any] = {}
+    listener_pids: set[int] = set()
+    commands = {
+        "ss": ["ss", "-H", "-ltnp", f"sport = :{int(port)}"],
+        "lsof": ["lsof", "-nP", f"-iTCP:{int(port)}", "-sTCP:LISTEN"],
+        "netstat": ["netstat", "-ltnp"],
+    }
+    complete = False
+    scan_succeeded = False
+    listener_lines = 0
+    for tool, argv in commands.items():
+        if not command_available(tool):
+            probes[tool] = {"available": False, "pids": [], "stdout_head": "", "stderr": "unavailable"}
+            continue
+        result = run_command(argv, root, timeout=8)
+        successful = result["returncode"] == 0 and not result.get("timed_out")
+        if successful:
+            scan_succeeded = True
+        matches, tool_complete = target_listeners(tool, result["stdout"], port) if successful else ([], False)
+        if successful:
+            listener_lines += len(matches)
+        pids = sorted({pid for match in matches for pid in match["pids"]}) if successful else []
+        listener_pids.update(pids)
+        complete = complete or successful and tool_complete
+        probes[tool] = {
+            "available": True,
+            "returncode": result["returncode"],
+            "pids": pids,
+            "stdout_head": "\n".join(
+                match["line"] for match in matches
+            )[:4000],
+            "stderr": str(result.get("stderr", ""))[:1000],
+        }
+        if tool == "ss" and successful and tool_complete:
+            break
+    return {"listener_pids": sorted(listener_pids), "tools": probes,
+            "scan_succeeded": scan_succeeded,
+            "listener_lines": listener_lines,
+            "errors": [] if complete and len(listener_pids) == 1 else ["listener ownership incomplete or ambiguous"]}
+
+
+def port_arg_present(cmdline: str, port: int) -> bool:
+    return f"--port {int(port)}" in cmdline or f"--port={int(port)}" in cmdline
+
+
+def host_arg_present(cmdline: str) -> bool:
+    return (
+        "--hostname 127.0.0.1" in cmdline
+        or "--hostname=127.0.0.1" in cmdline
+        or "--hostname localhost" in cmdline
+        or "--hostname=localhost" in cmdline
+    )
+
+
+def discover_binding(root: Path, port: int, *, write_report: bool = False) -> dict[str, Any]:
+    port = int(port)
+    generated_at = utc_now()
+    tmux = tmux_current_panes(root)
+    if tmux.get("inside_tmux") and tmux.get("errors"):
+        raise RebindError(
+            "scoped tmux discovery failed: " + "; ".join(tmux["errors"])
+        )
+    panes = tmux.get("panes", [])
+    trees = process_tree(root, panes)
+    sockets = socket_discovery(root, port)
+
+    health = http_get("127.0.0.1", port, "/global/health", timeout=2.0, max_bytes=64_000)
+    doc = http_get("127.0.0.1", port, "/doc", timeout=2.0, max_bytes=512_000)
+    session_status = http_get("127.0.0.1", port, "/session/status", timeout=2.0, max_bytes=128_000)
+    doc_summary = summarize_doc(doc.get("body", "") if doc.get("ok") else "")
+
+    listener_pids = sockets.get("listener_pids", [])
+    for tree in trees.values():
+        nodes = {node["pid"]: node for node in tree["processes"]}
+        checked = set()
+        for pid in listener_pids:
+            while pid in nodes and pid not in checked:
+                checked.add(pid)
+                node = nodes[pid]
+                fresh = process_record(pid)
+                if (fresh.get("start_time_ticks"), fresh.get("ppid"), fresh.get("cmdline")) != (node["start_time_ticks"], node["ppid"], node["cmdline"]):
+                    sockets.setdefault("errors", []).append(f"process identity changed during binding: {pid}")
+                pid = node["ppid"]
+    opencode_pids: list[int] = []
+    opencode_pid_details: list[dict[str, Any]] = []
+    for pid in listener_pids:
+        info = ps_info(int(pid), root)
+        haystack = f"{info.get('stdout', '')}\n{info.get('cmdline', '')}".lower()
+        if info["returncode"] == 0 and "opencode" in haystack:
+            opencode_pids.append(int(pid))
+            opencode_pid_details.append(info)
+
+    pane_candidate: dict[str, Any] = {}
+    opencode_pid = opencode_pids[0] if opencode_pids else 0
+    if opencode_pid:
+        for pane in panes:
+            tree = trees.get(str(pane.get("pane_id")), {})
+            if opencode_pid in set(tree.get("pids", [])):
+                pane_candidate = pane
+                break
+
+    cmdline = proc_cmdline(opencode_pid) if opencode_pid else ""
+    checks = {
+        "port_live": bool(health.get("ok") or doc.get("ok") or session_status.get("ok")),
+        "health_ok": bool(health.get("ok")),
+        "doc_ok": bool(doc.get("ok")),
+        "session_status_ok": bool(session_status.get("ok")),
+        "required_tui_present": bool(doc_summary.get("all_required_tui_present")),
+        "listener_pid_found": bool(listener_pids),
+        "listener_pid_is_opencode": bool(opencode_pids),
+        "cmdline_contains_port": bool(cmdline and port_arg_present(cmdline, port)),
+        "cmdline_contains_hostname": bool(cmdline and host_arg_present(cmdline)),
+        "opencode_pid_in_current_window_pane_tree": bool(pane_candidate),
+    }
+    strong = len(listener_pids) == len(opencode_pids) == 1 and not sockets.get("errors") and all(
+        checks[name]
+        for name in (
+            "port_live",
+            "doc_ok",
+            "required_tui_present",
+            "listener_pid_found",
+            "listener_pid_is_opencode",
+            "cmdline_contains_port",
+            "opencode_pid_in_current_window_pane_tree",
+        )
+    )
+    warnings: list[str] = []
+    errors: list[str] = list(sockets.get("errors", []))
+    if not checks["cmdline_contains_hostname"]:
+        warnings.append("opencode cmdline did not explicitly include --hostname 127.0.0.1/localhost")
+    for key, value in checks.items():
+        if key == "cmdline_contains_hostname":
+            continue
+        if not value:
+            errors.append(f"{key}=false")
+
+    result = {
+        "schema_version": 1,
+        "generated_at": generated_at,
+        "root": str(root),
+        "port": port,
+        "host": "127.0.0.1",
+        "tmux": tmux,
+        "process_tree": trees,
+        "socket_discovery": sockets,
+        "probe_results": {
+            "/global/health": {k: v for k, v in health.items() if k != "body"},
+            "/doc": {k: v for k, v in doc.items() if k != "body"},
+            "/session/status": {k: v for k, v in session_status.items() if k != "body"},
+        },
+        "doc_summary": doc_summary,
+        "listener_pids": listener_pids,
+        "opencode_pids": opencode_pids,
+        "opencode_pid_details": opencode_pid_details,
+        "pane_id": pane_candidate.get("pane_id", ""),
+        "pane_pid": pane_candidate.get("pane_pid", 0),
+        "pane_start_time_ticks": process_start_time_ticks(
+            int(pane_candidate.get("pane_pid") or 0)
+        ),
+        "tmux_session": pane_candidate.get("session", ""),
+        "tmux_window": (
+            f"{pane_candidate.get('session')}:{pane_candidate.get('window_index')}"
+            if pane_candidate.get("session") not in {None, ""}
+            and pane_candidate.get("window_index") not in {None, ""}
+            else ""
+        ),
+        "tmux_pane_index": pane_candidate.get("pane_index", ""),
+        "pane_title": pane_candidate.get("pane_title", ""),
+        "pane_current_command": pane_candidate.get("pane_current_command", ""),
+        "host_boot_id": host_boot_id(),
+        "tmux_server_pid": tmux_server_pid(root),
+        "opencode_pid": opencode_pid,
+        "opencode_start_time_ticks": process_start_time_ticks(opencode_pid),
+        "cmdline": cmdline,
+        "checks": checks,
+        "binding_confidence": "strong" if strong else "failed",
+        "status": "binding_candidate" if strong else "binding_failed",
+        "errors": errors,
+        "warnings": warnings,
+    }
+    if write_report:
+        out = rebind_root(root) / f"rebind_discovery_{port}.json"
+        write_json(out, result)
+        result["discovery_path"] = rel(out, root)
+    else:
+        result["discovery_path"] = ""
+    return result
+
+
+def load_worker(root: Path, worker_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    data = read_json(registry_path(root))
+    workers = data.get("workers", [])
+    if not isinstance(workers, list):
+        raise RebindError("opencode_visible_workers.json has no workers array")
+    for worker in workers:
+        if isinstance(worker, dict) and str(worker.get("worker_id")) == worker_id:
+            return data, worker
+    raise RebindError(f"worker not found in registry: {worker_id}")
+
+
+def default_worker_from_registry(root: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    data = read_json(registry_path(root))
+    workers = data.get("workers", [])
+    if not isinstance(workers, list):
+        raise RebindError("opencode_visible_workers.json has no workers array")
+    defaults = [
+        worker
+        for worker in workers
+        if isinstance(worker, dict) and bool(worker.get("default_for_new_tasks"))
+    ]
+    if len(defaults) != 1:
+        ids = [str(worker.get("worker_id") or "") for worker in defaults]
+        raise RebindError(f"expected exactly one default visible worker, found {len(defaults)}: {ids}")
+    return data, defaults[0]
+
+
+def resolve_worker_arg(root: Path, worker_id: str | None) -> str:
+    requested = str(worker_id or "").strip()
+    if requested:
+        safe_id(requested, "worker")
+        return requested
+    _, worker = default_worker_from_registry(root)
+    resolved = str(worker.get("worker_id") or "").strip()
+    if not resolved:
+        raise RebindError("default visible worker has no worker_id")
+    safe_id(resolved, "worker")
+    return resolved
+
+
+def resolve_port_arg(root: Path, worker_id: str, port: int | None) -> int:
+    if port is not None:
+        if int(port) <= 0:
+            raise RebindError(f"port must be positive, got: {port}")
+        return int(port)
+    _, worker = load_worker(root, worker_id)
+    resolved = int(worker.get("port") or 0)
+    if resolved <= 0:
+        raise RebindError(f"worker {worker_id} has invalid port: {worker.get('port')}")
+    return resolved
+
+
+def dispatch_policy_next_action(
+    dispatch_policy_errors: list[str],
+    *,
+    root: str = "",
+    worker_id: str = "",
+    registry: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Authorization-aware next action for a current binding whose dispatch
+    policy still blocks submission (#762).
+
+    Binding recovery and policy restoration stay separate: this never
+    auto-enables a worker, never asks for a repeated rebind, and never
+    suggests fabricating a historical launch nonce. A stale-binding
+    quarantine is distinguished from other operator disablement so the
+    supported admission surface is named with an executable argv filled
+    from this check's own observed identity instead of discovered from
+    implementation code.
+    """
+    if not dispatch_policy_errors:
+        return {}
+    quarantined = any(
+        "status=stale_binding_disabled" in item
+        for item in dispatch_policy_errors
+    )
+    observation = registry if isinstance(registry, dict) else {}
+    expected_fields = (
+        ("--expected-pane-pid", "pane_pid"),
+        ("--expected-opencode-pid", "opencode_pid"),
+        ("--expected-host-boot-id", "host_boot_id"),
+        ("--expected-tmux-session", "tmux_session"),
+        ("--expected-tmux-window", "tmux_window"),
+        ("--expected-tmux-server-pid", "tmux_server_pid"),
+    )
+    argv: list[str] = []
+    missing: list[str] = []
+    if root:
+        argv.extend(["--root", str(root)])
+    else:
+        missing.append("--root")
+    if worker_id:
+        argv.extend(["--worker", str(worker_id)])
+    else:
+        missing.append("--worker")
+    pane = str(observation.get("pane_id") or "")
+    port = observation.get("port")
+    if pane:
+        argv.extend(["--pane", pane])
+    else:
+        missing.append("--pane")
+    if port not in (None, ""):
+        argv.extend(["--port", str(int(port))])
+    else:
+        missing.append("--port")
+    argv.extend(["--user-started", "--allow-auto-submit", "--status", "active"])
+    for flag, key in expected_fields:
+        value = observation.get(key)
+        if value in (None, ""):
+            missing.append(flag)
+        else:
+            argv.extend([flag, str(value)])
+    if quarantined:
+        action = {
+            "policy_state": "stale_binding_quarantine",
+            "next_safe_action": (
+                "binding recovery is complete and valid; do not roll it back "
+                "and do not rebind again. Restore submission policy through "
+                "the supported same-worker register-visible admission in "
+                "next_action_argv (expected identity fields filled from this "
+                "check's observed registry identity). It requires the user's "
+                "existing reassignment authorization for this worker as a "
+                "precondition - if that authorization was already given, "
+                "proceed without asking again. If a surviving historical "
+                "nonce-backed launch record refuses this same alias, "
+                "register a new alias for the same current pane/port "
+                "instead of reusing the old nonce."
+            ),
+            "operator_authorization_required": True,
+        }
+        if argv and not missing:
+            adapter = str(Path(root) / "bin" / "omx_opencode_tui_adapter")
+            action["next_action_argv"] = [
+                adapter,
+                "register-visible",
+                *argv,
+            ]
+        else:
+            action["next_action_argv_missing_fields"] = missing
+        return action
+    return {
+        "policy_state": "dispatch_policy_blocked",
+        "next_safe_action": (
+            "binding is current; the dispatch policy block is separate "
+            "operator state (role/status/auto-submit). Review the worker's "
+            "disablement with its author before any change; rebind again "
+            "will not restore submission."
+        ),
+        "operator_authorization_required": True,
+    }
+
+
+def discover_codex_binding(
+    root: Path,
+    worker: dict[str, Any],
+    *,
+    write_report: bool = False,
+) -> dict[str, Any]:
+    """Pane→codex-process→native-thread discovery for codex_tui workers.
+
+    Produces the discover_binding result shape so the generic
+    status/identity/lease/lock logic in check_binding runs unchanged. For
+    codex workers the `port_live` check carries the native thread
+    readability result (no HTTP port exists to probe).
+    """
+    generated_at = utc_now()
+    tmux = tmux_current_panes(root)
+    if tmux.get("inside_tmux") and tmux.get("errors"):
+        raise RebindError(
+            "scoped tmux discovery failed: " + "; ".join(tmux["errors"])
+        )
+    panes = tmux.get("panes", [])
+    trees = process_tree(root, panes)
+    registry_pane = str(worker.get("pane_id") or "")
+    pane_record = next(
+        (p for p in panes if str(p.get("pane_id")) == registry_pane), {}
+    )
+    pane_pid = int(pane_record.get("pane_pid") or 0)
+    tree = trees.get(registry_pane, {}) if registry_pane else {}
+    thread = str(worker.get("codex_thread") or "")
+    verified: dict[str, Any] = {}
+    adapter = root / "bin" / "omx_codex_tui_adapter"
+    if pane_pid and thread and adapter.is_file():
+        result = run_command([
+            os.environ.get("OMX_CODEX_PYTHON", "/usr/bin/python3"),
+            str(adapter), "verify-binding", "--root", str(root),
+            "--worker", str(worker["worker_id"]),
+        ], root, timeout=40)
+        if result["returncode"] == 0:
+            try:
+                payload = json.loads(result["stdout"])
+                if isinstance(payload, dict):
+                    verified = payload
+            except ValueError:
+                pass
+    native_checks = verified.get("checks") or {}
+    codex_pid = int(verified.get("codex_pid") or 0)
+    codex_start_time_ticks = verified.get("codex_start_time_ticks")
+    thread_read_ok = native_checks.get("thread_identity_ok") is True
+    process_in_tree = bool(codex_pid and codex_pid in tree.get("pids", []))
+    pane_pid_matches = bool(pane_pid and pane_pid == int(worker.get("pane_pid") or 0))
+    checks = {
+        "port_live": thread_read_ok,
+        "pane_pid_found": bool(pane_pid),
+        "pane_pid_matches_registry": pane_pid_matches,
+        "codex_process_in_pane_tree": process_in_tree,
+        "codex_thread_read_ok": thread_read_ok,
+        "thread_read_status": native_checks.get("thread_read", "not_attempted"),
+        "codex_binding_verified": verified.get("binding_confidence") == "strong",
+    }
+    strong = bool(
+        pane_pid_matches and process_in_tree and thread_read_ok
+        and checks["codex_binding_verified"]
+    )
+    return {
+        "generated_at": generated_at,
+        "binding_confidence": "strong" if strong else "failed",
+        "pane_id": registry_pane if pane_record else "",
+        "pane_pid": pane_pid or None,
+        "pane_start_time_ticks": process_start_time_ticks(pane_pid) if pane_pid else None,
+        "opencode_pid": 0,
+        "opencode_start_time_ticks": None,
+        "codex_pid": codex_pid or None,
+        "codex_start_time_ticks": codex_start_time_ticks or None,
+        "codex_thread": verified.get("codex_thread"),
+        "port": None,
+        "tmux_session": pane_record.get("session"),
+        "tmux_window": pane_record.get("window_index"),
+        "host_boot_id": host_boot_id(),
+        "tmux_server_pid": tmux_server_pid(root),
+        "checks": checks,
+        "discovery_path": "codex_appserver_binding",
+        "tmux": {"panes": panes},
+    }
+
+
+def check_binding(root: Path, worker_id: str, *, write_report: bool = False) -> dict[str, Any]:
+    safe_id(worker_id, "worker")
+    registry, worker = load_worker(root, worker_id)
+    worker = dict(worker)
+    conflicting_worker_ids: list[str] = []
+    ignored_cross_tmux_server_aliases: list[str] = []
+    alias_conflicts = visible_binding_alias_conflicts(
+        list(registry.get("workers", [])),
+        worker,
+        ignore_inactive_stale_aliases=True,
+        ignore_cross_tmux_server_pane_reuse=True,
+        ignored_cross_tmux_server_aliases=(
+            ignored_cross_tmux_server_aliases
+        ),
+        conflicting_worker_ids=conflicting_worker_ids,
+    )
+    conflicting_worker_ids = unique_worker_ids(conflicting_worker_ids)
+    if alias_conflicts:
+        worker["binding_alias_quarantined"] = True
+        worker["binding_alias_conflicts"] = alias_conflicts
+    if ignored_cross_tmux_server_aliases:
+        worker["ignored_cross_tmux_server_aliases"] = sorted(
+            set(ignored_cross_tmux_server_aliases)
+        )
+    port = 0
+    if str(worker.get("backend") or "") == "codex_tui":
+        discovery = discover_codex_binding(
+            root, worker, write_report=write_report
+        )
+    else:
+        port = int(worker.get("port") or 0)
+        if port <= 0:
+            raise RebindError(f"worker {worker_id} has invalid port: {worker.get('port')}")
+        discovery = discover_binding(root, port, write_report=write_report)
+    panes = discovery.get("tmux", {}).get("panes", [])
+    pane_ids = {str(pane.get("pane_id")) for pane in panes}
+    registry_pane = str(worker.get("pane_id") or "")
+    discovered_pane = str(discovery.get("pane_id") or "")
+    registry_pane_exists = registry_pane in pane_ids
+    strong = discovery.get("binding_confidence") == "strong"
+    registry_session = str(worker.get("tmux_session") or "")
+    live_session = str(discovery.get("tmux_session") or "")
+    registry_window = str(worker.get("tmux_window") or "")
+    live_window = str(discovery.get("tmux_window") or "")
+    session_mismatch = bool(
+        registry_session
+        and live_session
+        and registry_session != live_session
+    )
+    window_mismatch = bool(
+        registry_window
+        and live_window
+        and registry_window != live_window
+    )
+    status = "binding_failed"
+    port_live = bool(
+        discovery.get("checks", {}).get("port_live", strong)
+    )
+    if not port_live:
+        status = "port_not_live"
+    elif strong and (session_mismatch or window_mismatch):
+        status = "registry_session_mismatch_rebind_available"
+    elif strong and discovered_pane == registry_pane:
+        status = "current_binding_ok"
+    elif strong and not registry_pane_exists:
+        status = "stale_pane_rebind_available"
+    elif strong and discovered_pane and discovered_pane != registry_pane:
+        status = "rebind_available"
+
+    registry_host_boot_id = str(worker.get("host_boot_id") or "")
+    live_host_boot_id = str(discovery.get("host_boot_id") or "")
+    registry_tmux_server_pid = int(
+        worker.get("tmux_server_pid") or 0
+    )
+    live_tmux_server_pid = int(
+        discovery.get("tmux_server_pid") or 0
+    )
+    identity_mismatches: list[str] = []
+    if (
+        registry_host_boot_id
+        and live_host_boot_id
+        and registry_host_boot_id != live_host_boot_id
+    ):
+        identity_mismatches.append("host_boot_id")
+    if (
+        registry_tmux_server_pid
+        and live_tmux_server_pid
+        and registry_tmux_server_pid != live_tmux_server_pid
+    ):
+        identity_mismatches.append("tmux_server_pid")
+    if registry_pane and discovered_pane and registry_pane != discovered_pane:
+        identity_mismatches.append("pane_id")
+    registry_pane_pid = int(worker.get("pane_pid") or 0)
+    live_pane_pid = int(discovery.get("pane_pid") or 0)
+    if (
+        registry_pane_pid
+        and live_pane_pid
+        and registry_pane_pid != live_pane_pid
+    ):
+        identity_mismatches.append("pane_pid")
+    registry_opencode_pid = int(worker.get("opencode_pid") or 0)
+    live_opencode_pid = int(discovery.get("opencode_pid") or 0)
+    if (
+        registry_opencode_pid
+        and live_opencode_pid
+        and registry_opencode_pid != live_opencode_pid
+    ):
+        identity_mismatches.append("opencode_pid")
+    registry_codex_pid = int(worker.get("codex_pid") or 0)
+    live_codex_pid = int(discovery.get("codex_pid") or 0)
+    if (
+        registry_codex_pid
+        and live_codex_pid
+        and registry_codex_pid != live_codex_pid
+    ):
+        identity_mismatches.append("codex_pid")
+    registry_stale_after_reboot = bool(
+        "host_boot_id" in identity_mismatches
+        or "tmux_server_pid" in identity_mismatches
+    )
+    lifecycle_mismatch = any(
+        field in identity_mismatches
+        for field in (
+            "host_boot_id",
+            "tmux_server_pid",
+            "pane_pid",
+            "opencode_pid",
+            "codex_pid",
+        )
+    )
+    if strong and status == "current_binding_ok" and lifecycle_mismatch:
+        status = "registry_identity_mismatch_rebind_available"
+    if strong and status == "current_binding_ok" and alias_conflicts:
+        status = "binding_alias_conflict"
+    binding_ok = bool(
+        strong and status == "current_binding_ok"
+    )
+    dispatch_policy = validate_worker_for_dispatch(worker)
+    dispatch_policy_errors = [
+        str(item)
+        for item in dispatch_policy.get("errors", [])
+    ]
+    lease_rebind_required = binding_lease_rebind_required(
+        worker,
+        discovery,
+        dispatch_policy_errors,
+    )
+    if (
+        strong
+        and status == "current_binding_ok"
+        and lease_rebind_required
+    ):
+        status = "binding_lease_rebind_available"
+    dispatch_allowed = bool(
+        dispatch_policy.get("dispatch_allowed")
+    )
+    live_checks = dict(discovery.get("checks", {}))
+    live_checks["runtime_adapter_verify_ok"] = binding_ok
+
+    target_owner_lock: dict[str, Any] = {}
+    unrelated_locked_workers: list[str] = []
+    lock_root = framework_root(root) / "visible-runs" / "_locks"
+    for lock_file in sorted(lock_root.glob("*.lock.json")):
+        if not lock_file.is_file():
+            continue
+        lock_data = read_json(lock_file)
+        lock_worker_id = str(
+            lock_data.get("worker_id")
+            or lock_file.name.removesuffix(".lock.json")
+        )
+        if lock_worker_id == worker_id:
+            target_owner_lock = {
+                **lock_data,
+                "path": rel(lock_file, root),
+            }
+        elif lock_worker_id:
+            unrelated_locked_workers.append(lock_worker_id)
+    unrelated_locked_workers = sorted(set(unrelated_locked_workers))
+    target_lock_boot_id = str(
+        target_owner_lock.get("host_boot_id") or ""
+    )
+    target_owner_instance_gone = bool(
+        target_owner_lock
+        and target_lock_boot_id
+        and live_host_boot_id
+        and target_lock_boot_id != live_host_boot_id
+    )
+    if target_owner_lock:
+        target_owner_lock["diagnosis"] = (
+            "nonterminal_owner_instance_gone_candidate"
+            if target_owner_instance_gone
+            else "target_owner_lock_present"
+        )
+    target_worker_rebind_available = bool(
+        strong
+        and status not in {
+            "current_binding_ok",
+            "binding_alias_conflict",
+        }
+    )
+    rebind_command = ""
+    if target_worker_rebind_available:
+        rebind_command = (
+            f"./bin/omx_visible_rebind rebind --root . --worker {worker_id} "
+            f"--port {port} --allow-rebind"
+            + (
+                " --allow-cross-session-move"
+                if session_mismatch
+                else ""
+            )
+        )
+    recovery_sequence: list[str] = []
+    if target_owner_instance_gone and target_worker_rebind_available:
+        recovery_sequence = [
+            (
+                "./bin/omx_visible_dispatch quarantine-lock --root . "
+                f"--worker {worker_id} "
+                f"--run {target_owner_lock.get('run')} "
+                f"--task {target_owner_lock.get('task')} "
+                "--allow-nonterminal-quarantine "
+                "--reason reviewed_reboot_stale_owner_instance"
+            ),
+            rebind_command,
+            (
+                "./bin/omx_visible_dispatch doctor --root . "
+                f"--worker {worker_id}"
+            ),
+        ]
+
+    result = {
+        "schema_version": 1,
+        "generated_at": utc_now(),
+        "root": str(root),
+        "worker_id": worker_id,
+        "status": status,
+        "ok": binding_ok,
+        "conflicting_worker_ids": conflicting_worker_ids,
+        "dispatch_policy_status": (
+            "allowed" if dispatch_allowed else "blocked"
+        ),
+        "dispatch_policy_errors": dispatch_policy_errors,
+        "ready_for_dispatch": bool(
+            status == "current_binding_ok"
+            and dispatch_allowed
+            and not target_owner_lock
+        ),
+        "binding_confidence": discovery.get(
+            "binding_confidence"
+        ) or worker.get("binding_confidence"),
+        "registry": {
+            "instance_id": worker.get("instance_id"),
+            "identity_strength": worker.get("identity_strength"),
+            "pane_id": registry_pane,
+            "pane_pid": worker.get("pane_pid"),
+            "pane_start_time_ticks": worker.get(
+                "pane_start_time_ticks"
+            ),
+            "opencode_pid": worker.get("opencode_pid"),
+            "opencode_start_time_ticks": worker.get(
+                "opencode_start_time_ticks"
+            ),
+            "port": worker.get("port"),
+            "tmux_session": registry_session,
+            "tmux_window": registry_window,
+            "host_boot_id": registry_host_boot_id,
+            "tmux_server_pid": registry_tmux_server_pid,
+            "binding_generation": worker.get("binding_generation"),
+            "fencing_generation": worker.get(
+                "fencing_generation"
+            ),
+            "binding_transaction_id": worker.get(
+                "binding_transaction_id"
+            ),
+            "binding_lease_id": worker.get("binding_lease_id"),
+            "binding_confidence": worker.get("binding_confidence"),
+            "allow_auto_submit": worker.get("allow_auto_submit"),
+            "default_for_new_tasks": worker.get("default_for_new_tasks"),
+        },
+        "registry_pane_exists_in_current_window": registry_pane_exists,
+        "port_listener_observation": {
+            "scan_succeeded": bool(
+                (
+                    discovery.get("socket_discovery")
+                    or {}
+                ).get("scan_succeeded")
+            ),
+            "listener_pids": list(
+                (
+                    discovery.get("socket_discovery")
+                    or {}
+                ).get("listener_pids")
+                or []
+            ),
+            "listener_lines": int(
+                (
+                    discovery.get("socket_discovery")
+                    or {}
+                ).get("listener_lines")
+                or 0
+            ),
+        },
+        "live": {
+            "pane_id": discovered_pane,
+            "pane_pid": discovery.get("pane_pid"),
+            "pane_start_time_ticks": discovery.get(
+                "pane_start_time_ticks"
+            ),
+            "opencode_pid": discovery.get("opencode_pid"),
+            "opencode_start_time_ticks": discovery.get(
+                "opencode_start_time_ticks"
+            ),
+            "port": discovery.get("port"),
+            "tmux_session": live_session,
+            "tmux_window": live_window,
+            "host_boot_id": live_host_boot_id,
+            "tmux_server_pid": live_tmux_server_pid,
+            "binding_confidence": discovery.get("binding_confidence"),
+            "checks": live_checks,
+            "discovery_path": discovery.get("discovery_path"),
+        },
+        "identity_mismatches": identity_mismatches,
+        "registry_stale_after_reboot": registry_stale_after_reboot,
+        "target_worker_rebind_available": target_worker_rebind_available,
+        "target_owner_lock": target_owner_lock,
+        "unrelated_locks_present": bool(unrelated_locked_workers),
+        "unrelated_locked_workers": unrelated_locked_workers,
+        "global_surface_refresh_deferred": bool(
+            target_owner_lock or unrelated_locked_workers
+        ),
+        "candidate_map": {
+            "stale_registry_worker": (
+                worker_id
+                if status != "current_binding_ok"
+                else ""
+            ),
+            "registry": {
+                "pane_id": registry_pane,
+                "pane_pid": registry_pane_pid,
+                "opencode_pid": registry_opencode_pid,
+                "port": port,
+                "host_boot_id": registry_host_boot_id,
+            },
+            "live": {
+                "pane_id": discovered_pane,
+                "pane_pid": live_pane_pid,
+                "opencode_pid": discovery.get("opencode_pid"),
+                "port": discovery.get("port"),
+                "host_boot_id": live_host_boot_id,
+            },
+            "safe_action": (
+                "review_binding_alias_conflict"
+                if status == "binding_alias_conflict"
+                else (
+                    "reviewed_quarantine_then_target_scoped_rebind"
+                    if target_owner_instance_gone
+                    else "target_scoped_rebind"
+                )
+            ),
+            "blocked_action": (
+                "rebind_while_target_owner_lock_exists"
+                if target_owner_lock
+                else ""
+            ),
+            "unrelated_locked_workers": unrelated_locked_workers,
+        },
+        "recovery_sequence": recovery_sequence,
+        "rebind_command": rebind_command,
+        "errors": [],
+        "warnings": [],
+    }
+    if status == "current_binding_ok":
+        pass
+    elif status == "registry_identity_mismatch_rebind_available":
+        result["errors"].append(
+            "registry process lifecycle identity is stale; "
+            f"strong live binding differs in {', '.join(identity_mismatches)}"
+        )
+    elif status == "stale_pane_rebind_available":
+        result["errors"].append("registry pane is stale; strong live binding is available")
+    elif status == "registry_session_mismatch_rebind_available":
+        if session_mismatch:
+            result["errors"].append(
+                "registry tmux_session does not match the live binding: "
+                f"{registry_session} != {live_session}"
+            )
+        if window_mismatch:
+            result["errors"].append(
+                "registry tmux_window does not match the live binding: "
+                f"{registry_window} != {live_window}"
+            )
+    elif status == "rebind_available":
+        result["warnings"].append("port is strongly bound to a different current-window pane")
+    elif status == "port_not_live":
+        result["errors"].append(f"port {port} is not live")
+    elif status == "binding_alias_conflict":
+        result["errors"].extend(dispatch_policy_errors)
+    elif status == "binding_lease_rebind_available":
+        result["errors"].extend(dispatch_policy_errors)
+        if not dispatch_policy_errors:
+            result["warnings"].append(
+                "worker binding lease requires sanctioned rebind"
+            )
+    else:
+        result["errors"].extend(discovery.get("errors", []) or ["binding could not be verified"])
+    if target_owner_instance_gone:
+        result["errors"].append(
+            "target owner lock belongs to a previous host boot; "
+            "reviewed quarantine is required before rebind"
+        )
+    if status == "current_binding_ok" and not dispatch_allowed:
+        result["warnings"].append(
+            "worker physical binding is current but dispatch policy blocks "
+            "task submission"
+        )
+        result["policy_next_action"] = dispatch_policy_next_action(
+            dispatch_policy_errors,
+            root=str(root),
+            worker_id=str(worker_id),
+            registry=(
+                result.get("registry")
+                if isinstance(result.get("registry"), dict)
+                else None
+            ),
+        )
+
+    if write_report:
+        out = rebind_root(root) / f"rebind_check_{worker_id}.json"
+        write_json(out, result)
+        result["check_path"] = rel(out, root)
+    else:
+        result["check_path"] = ""
+    return result
+
+
+def backup_file(path: Path, root: Path) -> str:
+    backup_root(root).mkdir(parents=True, exist_ok=True)
+    backup = backup_root(root) / f"{path.name}.{stamp()}.bak"
+    if path.is_file():
+        shutil.copy2(path, backup)
+    return rel(backup, root)
+
+
+def render_agents_block(root: Path, worker_id: str, pane_id: str, port: int) -> str:
+    control_root = Path(root).resolve()
+    quoted_root = shlex.quote(str(control_root))
+    orchestrate_cli = shlex.quote(str(control_root / "bin" / "omx_visible_orchestrate"))
+    rebind_cli = shlex.quote(str(control_root / "bin" / "omx_visible_rebind"))
+    dispatch_cli = shlex.quote(str(control_root / "bin" / "omx_visible_dispatch"))
+    health_cli = shlex.quote(str(control_root / "bin" / "omx_visible_health"))
+    watcher_cli = shlex.quote(str(control_root / "bin" / "omx_visible_watcher"))
+    adapter_cli = shlex.quote(str(control_root / "bin" / "omx_opencode_tui_adapter"))
+    return f"""<!-- OMX_VISIBLE_CONTROL_BEGIN -->
+# OMX visible OpenCode TUI control rules
+
+- Ordinary dispatch is leader-authorized public `run` with an explicit worker, session-action, and task authorization. That call performs binding, current-window, doctor, and target-lock gates; do not pre-run check/doctor/locks. To target the OpenCode worker listening on a port in the caller's current tmux window, pass `--current-window-worker-port <port>` instead of `--worker`; that same run resolves the unique worker before authorization.
+  `{orchestrate_cli} run --root {quoted_root} --worker {worker_id} --title "..." --body "..." --timeout <seconds> --session-action keep --session-action-reason same_domain_continuation --authorize-leader --task-id <task-id> --attempt-id <attempt-id> --event-id <event-id> --allow-real --json`
+- Authorized single-target recovery uses `omx_visible_rebind rebind --json`. Rebind eligibility is a strong live current-window candidate with a repairable status; it does not require `current_binding_ok` or `ready_for_dispatch`. Inspect the exit code first, then the top-level `ok`, `status`, `ready_for_dispatch`, and `conflicting_worker_ids` array. `ok` means the transaction finished; `ok=true` / `status=current_binding_ok` / `ready_for_dispatch=false` is valid and must not be rolled back. After `ok=true` and `ready_for_dispatch=true`, continue the original authorized `run`. If `conflicting_worker_ids` is non-empty and those workers are already authorized, repair them first with the same single-worker command.
+  `{rebind_cli} rebind --root {quoted_root} --worker {worker_id} --port {int(port)} --allow-rebind --json`
+- Diagnosis and low-level surfaces keep their own gates. `omx_visible_dispatch run-one` is not the ordinary unique entrypoint. Use `check`, `doctor`, and `locks` for diagnosis and uncovered entries, not after a successful ready rebind to re-prove that repair.
+  `{dispatch_cli} run-one --root {quoted_root}`
+  `{dispatch_cli} status --root {quoted_root}`
+  `{dispatch_cli} doctor --root {quoted_root}`
+  `{dispatch_cli} locks --root {quoted_root}`
+  `{rebind_cli} check --root {quoted_root} --worker {worker_id}`
+- Status/telemetry may use:
+  `{health_cli} check --root {quoted_root}`
+  `{watcher_cli} once --root {quoted_root}`
+  `{watcher_cli} status --root {quoted_root}`
+  `{watcher_cli} alerts --root {quoted_root}`
+  `{dispatch_cli} status --root {quoted_root}`
+- Do not use `tmux send-keys`, `tmux paste-buffer`, `C-c`, `exit`, `kill-pane`, `kill-window`, or `kill-session` for task delegation.
+- Do not directly call `{adapter_cli} submit-visible-real --root {quoted_root}` for normal task delegation.
+- Do not directly call `curl` or any HTTP client against `/tui/clear-prompt`, `/tui/append-prompt`, or `/tui/submit-prompt`.
+- Do not submit work to current test/background workers, including `vw1/%40/4201`.
+- The default visible worker comes from the registry/default-worker:
+  `.omx/framework/team/opencode_visible_workers.json`
+- Stable visible worker identity:
+  `{worker_id}`, port `{int(port)}`.
+- The registry may contain a pane snapshot such as `{pane_id}`, but tmux pane ids
+  are runtime-discovered values. Verify with
+  `{rebind_cli} check --root {quoted_root} --worker {worker_id}` or
+  `{rebind_cli} discover --root {quoted_root} --port {int(port)}` before low-level submit.
+- A task is complete only when `report.md` is non-empty and exactly one of `.done`, `.fail`, or `.blocked` exists.
+- `.submitted` is not `.received`; `idle` is not `completed`; a quiet pane is not proof of completion.
+- If public `run` or low-level `run-one` fails or times out, use `collect`, `status`, and watcher alerts. Do not blindly press Enter or resubmit while an owner lock is active.
+<!-- OMX_VISIBLE_CONTROL_END -->"""
+
+
+def update_agents_block(root: Path, worker_id: str, pane_id: str, port: int) -> dict[str, Any]:
+    path = agents_path(root)
+    text = read_text(path)
+    start = text.find(BEGIN)
+    end = text.find(END)
+    if start < 0 or end < 0 or end < start:
+        raise RebindError("AGENTS.md managed block not found")
+    block = text[start : end + len(END)]
+    new_block = render_agents_block(root, worker_id, pane_id, int(port))
+    if new_block == block:
+        return {"changed": False, "backup": ""}
+    backup = backup_file(path, root)
+    write_text(path, text[:start] + new_block + text[end + len(END):])
+    return {"changed": True, "backup": backup}
+
+
+def update_prompt_current(root: Path, worker_id: str, pane_id: str, port: int) -> dict[str, Any]:
+    path = prompt_current_path(root)
+    text = read_text(path)
+    if not text:
+        raise RebindError("VISIBLE_LEADER_PROMPT_CURRENT.md missing or empty")
+    new_text = text
+    new_text = re.sub(r"(- worker_id: `)[^`]+(`)", rf"\g<1>{worker_id}\g<2>", new_text, count=1)
+    new_text = re.sub(
+        r"- pane: `%[^`]+`",
+        "- pane: runtime-discovered by `omx_visible_rebind check` / `discover`",
+        new_text,
+        count=1,
+    )
+    new_text = re.sub(r"(- port: `)\d+(`)", rf"\g<1>{int(port)}\g<2>", new_text, count=1)
+    new_text = re.sub(r"(- current_snapshot_pane: )%[^\n]+", rf"\g<1>{pane_id}", new_text, count=1)
+    new_text = re.sub(r"(- current_snapshot_port: )\d+", rf"\g<1>{int(port)}", new_text, count=1)
+    new_text = re.sub(r"(./bin/omx_visible_rebind check --root \. --worker )\S+", rf"\g<1>{worker_id}", new_text)
+    new_text = re.sub(
+        r"(\./bin/omx_visible_rebind rebind --root \. --worker )\S+(\s+--port\s+)\d+",
+        rf"\g<1>{worker_id}\g<2>{int(port)}",
+        new_text,
+    )
+    new_text = re.sub(r"(pane=)%\d+", rf"\g<1>{pane_id}", new_text)
+    new_text = re.sub(r"(port=)\d+", rf"\g<1>{int(port)}", new_text)
+    if new_text == text:
+        return {"changed": False}
+    write_text(path, new_text)
+    return {"changed": True}
+
+
+def rewrite_surface_text(text: str, worker_id: str, pane_id: str, port: int) -> str:
+    new_text = str(text or "")
+    new_text = re.sub(r"(- worker_id: `)[^`]+(`)", rf"\g<1>{worker_id}\g<2>", new_text)
+    new_text = re.sub(r"(worker_id: )\S+", rf"\g<1>{worker_id}", new_text)
+    new_text = re.sub(r"(visible worker `)[^`\s]+(`)", rf"\g<1>{worker_id}\g<2>", new_text)
+    new_text = re.sub(r"(formal default worker is `)[^`\s]+(`)", rf"\g<1>{worker_id}\g<2>", new_text)
+    new_text = re.sub(r"(Current formal default worker.*\n- `)[^`\s]+(`)", rf"\g<1>{worker_id}\g<2>", new_text)
+    new_text = re.sub(r"(./bin/omx_visible_rebind check --root \. --worker )\S+", rf"\g<1>{worker_id}", new_text)
+    new_text = re.sub(
+        r"(\./bin/omx_visible_rebind rebind --root \. --worker )\S+(\s+--port\s+)\d+",
+        rf"\g<1>{worker_id}\g<2>{int(port)}",
+        new_text,
+    )
+    new_text = re.sub(r"(\./bin/omx_visible_rebind discover --root \. --port )\d+", rf"\g<1>{int(port)}", new_text)
+    new_text = re.sub(
+        r"(opencode\s+(?:\"[^\"]+\"|'[^']+'|\S+)\s+--hostname\s+127\.0\.0\.1\s+--port\s+)\d+",
+        rf"\g<1>{int(port)}",
+        new_text,
+    )
+    new_text = re.sub(r"(127\.0\.0\.1:)\d+", rf"\g<1>{int(port)}", new_text)
+    new_text = re.sub(r"(contains `--port )\d+(`)", rf"\g<1>{int(port)}\g<2>", new_text)
+    new_text = re.sub(
+        r"- pane: `%[^`]+`",
+        "- pane: runtime-discovered by `omx_visible_rebind check` / `discover`",
+        new_text,
+    )
+    new_text = re.sub(
+        r"(pane: )%[^\s`]+",
+        r"\g<1>runtime-discovered by omx_visible_rebind check/discover",
+        new_text,
+    )
+    new_text = re.sub(r"(- port: `)\d+(`)", rf"\g<1>{int(port)}\g<2>", new_text)
+    new_text = re.sub(r"(port: )\d+", rf"\g<1>{int(port)}", new_text)
+    new_text = re.sub(r"(- current_snapshot_pane: )%[^\n]+", rf"\g<1>{pane_id}", new_text)
+    new_text = re.sub(r"(- current_snapshot_port: )\d+", rf"\g<1>{int(port)}", new_text)
+    new_text = re.sub(r"(pane=)%\d+", rf"\g<1>{pane_id}", new_text)
+    new_text = re.sub(r"(port=)\d+", rf"\g<1>{int(port)}", new_text)
+    return new_text
+
+
+def update_surface_doc(path: Path, worker_id: str, pane_id: str, port: int, *, source_text: str = "") -> dict[str, Any]:
+    existing_text = read_text(path)
+    base_text = str(source_text or "") or existing_text
+    if not base_text:
+        return {"changed": False, "missing": True}
+    new_text = rewrite_surface_text(base_text, worker_id, pane_id, port)
+    if new_text == existing_text:
+        return {"changed": False, "missing": False}
+    write_text(path, new_text)
+    return {"changed": True, "missing": False}
+
+
+def update_surface_docs(root: Path, worker_id: str, pane_id: str, port: int) -> dict[str, dict[str, Any]]:
+    updates: dict[str, dict[str, Any]] = {}
+    source_paths = framework_surface_source_paths()
+    for key, path in framework_surface_paths(root).items():
+        source_text = ""
+        source_path = source_paths.get(key)
+        if isinstance(source_path, Path) and source_path.is_file():
+            source_text = read_text(source_path)
+        updates[key] = update_surface_doc(path, worker_id, pane_id, port, source_text=source_text)
+    return updates
+
+
+def update_usage_policy(root: Path, worker_id: str, pane_id: str, port: int) -> dict[str, Any]:
+    path = usage_policy_path(root)
+    data = read_json(path)
+    changed = False
+    for item in data.get("visible_workers", []):
+        if isinstance(item, dict) and str(item.get("worker_id")) == worker_id:
+            if item.get("pane_id") != pane_id:
+                item["pane_id"] = pane_id
+                changed = True
+            if int(item.get("port") or 0) != int(port):
+                item["port"] = int(port)
+                changed = True
+    if changed:
+        data["updated_at"] = utc_now()
+        write_json(path, data)
+    return {"changed": changed}
+
+
+def rebind_binding_snapshot(record: dict[str, Any]) -> dict[str, Any]:
+    """Project a worker row onto its identity-normalized binding form.
+
+    Only fields that are exactly missing are filled from the canonical
+    derivation, so the normalization another worker's commit injects does not
+    trip the target CAS while any existing identity, generation, lease, or
+    policy value change stays a real binding change.
+    """
+    instance = derive_process_instance(record, observed_at="")
+    snapshot = dict(record)
+    for field in (
+        "instance_id",
+        "identity_strength",
+        "host_boot_id",
+        "tmux_server_pid",
+        "pane_start_time_ticks",
+        "opencode_pid",
+        "opencode_start_time_ticks",
+    ):
+        existing = snapshot.get(field)
+        if existing is None or existing == "":
+            snapshot[field] = instance[field]
+    return snapshot
+
+
+REBIND_POSTCHECK_TUPLE_FIELDS = (
+    "binding_transaction_id",
+    "binding_generation",
+    "fencing_generation",
+    "binding_lease_id",
+    "instance_id",
+)
+
+
+def rebind_postcheck_superseded_fields(
+    rebound_worker: dict[str, Any],
+    observation: Any,
+    post_worker: Any,
+) -> list[str]:
+    """Identity tuple fields that changed or went missing after this commit.
+
+    Per plan section 10.2 the post-check binds both the health observation's
+    registry view and the subsequently loaded current target to this rebound
+    record: a missing or changed transaction, generation, lease, or instance
+    supersedes the rebind. Generation 0 is a valid value and is not treated
+    as missing.
+    """
+    changed: list[str] = []
+    if not isinstance(observation, dict):
+        return ["missing registry observation"]
+    if not isinstance(post_worker, dict) or not post_worker:
+        return ["missing current target row"]
+    for field in REBIND_POSTCHECK_TUPLE_FIELDS:
+        expected = rebound_worker.get(field)
+        expected_text = "" if expected is None else str(expected)
+        for label, source in (
+            ("observed", observation),
+            ("current", post_worker),
+        ):
+            if field not in source:
+                changed.append(f"missing {label} {field}")
+                continue
+            value = source.get(field)
+            value_text = "" if value is None else str(value)
+            if value_text != expected_text:
+                changed.append(f"{label} {field}")
+    return changed
+
+
+def do_rebind(
+    root: Path,
+    worker_id: str,
+    port: int,
+    *,
+    allow_rebind: bool,
+    allow_cross_session_move: bool = False,
+    require_global_quiescence: bool = False,
+) -> dict[str, Any]:
+    safe_id(worker_id, "worker")
+    if not allow_rebind:
+        raise RebindError(
+            "rebind requires --allow-rebind",
+            worker_id=worker_id,
+        )
+    require_global_quiescence = bool(require_global_quiescence)
+    with global_mutation_gate(root, exclusive=False):
+        strict_owner_locks = global_owner_lock_paths(root)
+        if require_global_quiescence and strict_owner_locks:
+            raise RebindError(
+                "global owner lock present; refusing strict rebind: "
+                + ", ".join(path.name for path in strict_owner_locks)
+            )
+        owner_locks = ensure_target_quiescence(root, worker_id)
+        initial_registry, initial_worker = load_worker(root, worker_id)
+        expected_worker = dict(initial_worker)
+        discovery = discover_binding(root, int(port), write_report=True)
+        if discovery.get("binding_confidence") != "strong":
+            raise RebindError("refusing to update registry: binding_confidence is not strong")
+        previous_pane_pid = int(initial_worker.get("pane_pid") or 0)
+        current_pane_pid = int(discovery.get("pane_pid") or 0)
+        pane_process_changed = bool(
+            previous_pane_pid
+            and current_pane_pid
+            and previous_pane_pid != current_pane_pid
+        )
+        respawn_transition = pane_process_changed and (
+            initial_worker.get("pane_id") == discovery.get("pane_id")
+        )
+        previous_binding_pids = binding_pid_set(initial_worker)
+        current_listener_pids = binding_pid_set(
+            {
+                "opencode_pid": discovery.get("opencode_pid"),
+                "opencode_pids": discovery.get("opencode_pids", []),
+                "listener_pids": discovery.get("listener_pids", []),
+                "strong_pid_matches": discovery.get(
+                    "strong_pid_matches",
+                    [],
+                ),
+            }
+        )
+        old_listener_overlap = sorted(
+            previous_binding_pids & current_listener_pids
+        )
+        if pane_process_changed and old_listener_overlap:
+            raise RebindError(
+                "old listener still owns port after respawn: "
+                + ",".join(str(pid) for pid in old_listener_overlap)
+            )
+        previous_pane_start_time_ticks = int(
+            initial_worker.get("pane_start_time_ticks") or 0
+        )
+        if pane_process_changed and process_instance_is_alive(
+            previous_pane_pid,
+            previous_pane_start_time_ticks,
+        ):
+            if respawn_transition:
+                raise RebindError(
+                    "old pane process is still alive after respawn: "
+                    f"pid={previous_pane_pid} "
+                    f"start_time_ticks={previous_pane_start_time_ticks}"
+                )
+            # A different pane's shell may remain after its OpenCode exits.
+            old_pid = int(initial_worker.get("opencode_pid") or 0)
+            old_ticks = int(initial_worker.get("opencode_start_time_ticks") or 0)
+            if not old_pid or not old_ticks or process_instance_is_alive(old_pid, old_ticks):
+                raise RebindError(
+                    "pane move requires the previous OpenCode instance to have exited"
+                )
+        previous_tmux_session = str(initial_worker.get("tmux_session") or "")
+        current_tmux_session = str(discovery.get("tmux_session") or "")
+        cross_session_move = bool(
+            previous_tmux_session
+            and current_tmux_session
+            and previous_tmux_session != current_tmux_session
+        )
+        if cross_session_move and not allow_cross_session_move:
+            raise RebindError(
+                "cross-session move requires --allow-cross-session-move: "
+                f"{previous_tmux_session} -> {current_tmux_session}; "
+                "prefer a session-scoped worker id for a new independent "
+                "assignment, while an explicit current-task grant may "
+                "instead authorize moving this named worker (#901)"
+            )
+        owner_locks = ensure_target_quiescence(
+            root,
+            worker_id,
+            candidate={
+                **discovery,
+                "worker_id": worker_id,
+                "port": int(port),
+            },
+        )
+        strict_owner_locks = global_owner_lock_paths(root)
+        if require_global_quiescence and strict_owner_locks:
+            raise RebindError(
+                "global owner lock present; refusing strict rebind: "
+                + ", ".join(path.name for path in strict_owner_locks)
+            )
+        pane_id = str(discovery.get("pane_id"))
+        pane_pid = int(discovery.get("pane_pid") or 0)
+        opencode_pid = int(discovery.get("opencode_pid") or 0)
+        now = utc_now()
+        cross_boot_liveness_probes: dict[str, dict[str, Any]] = {}
+        for item in initial_registry.get("workers", []):
+            if not isinstance(item, dict):
+                continue
+            alias_worker_id = str(item.get("worker_id") or "")
+            existing_boot = str(item.get("host_boot_id") or "").strip()
+            incoming_boot = str(discovery.get("host_boot_id") or "").strip()
+            host = str(item.get("host") or "127.0.0.1").strip()
+            try:
+                old_port = int(item.get("port") or 0)
+            except (TypeError, ValueError):
+                continue
+            if (
+                not alias_worker_id
+                or alias_worker_id == worker_id
+                or not existing_boot
+                or not incoming_boot
+                or existing_boot == incoming_boot
+                or str(item.get("pane_id") or "") != pane_id
+                or host not in {"127.0.0.1", "localhost"}
+                or old_port <= 0
+                or old_port == int(port)
+                or not (
+                    bool(item.get("server_live"))
+                    or bool(item.get("doc_available"))
+                )
+            ):
+                continue
+            # ponytail: point-in-time localhost probe; add a lifecycle token if
+            # port-revival races ever need a stronger guarantee.
+            probe = http_get(
+                host,
+                old_port,
+                "/global/health",
+                timeout=2.0,
+                max_bytes=64_000,
+            )
+            ownership_evidence: dict[str, Any] | None = None
+            answered = (
+                probe.get("status") is not None
+                and not probe.get("timed_out")
+            )
+            if probe.get("connection_refused"):
+                pass
+            elif answered:
+                # An answered endpoint proves availability, not that this
+                # old row still owns the port (#934): a different fresh
+                # service may now occupy the old port number. Only positive
+                # lost-ownership evidence (recorded process positively
+                # dead/recycled, or a successful scan showing listeners that
+                # exclude every recorded pid) lets the row be ignored.
+                ownership_evidence = cross_boot_row_lost_port_ownership(
+                    root,
+                    item,
+                    old_port,
+                )
+                if ownership_evidence is None:
+                    continue
+            else:
+                # Timeout or unknown transport result: no truthful
+                # reachability claim and no suppression without proof.
+                continue
+            cross_boot_liveness_probes[alias_worker_id] = {
+                "record": dict(item),
+                "checked_at": utc_now(),
+                "port": old_port,
+                "reachable": bool(answered),
+                "ownership_evidence": ownership_evidence or {},
+            }
+        mutation_records: dict[str, dict[str, Any]] = {}
+
+        def apply_rebind(registry: dict[str, Any]) -> dict[str, Any]:
+            ensure_target_quiescence(
+                root,
+                worker_id,
+                candidate={
+                    **discovery,
+                    "worker_id": worker_id,
+                    "port": int(port),
+                },
+            )
+            workers = registry.get("workers", [])
+            if not isinstance(workers, list):
+                raise RebindError("opencode_visible_workers.json has no workers array")
+            worker = next(
+                (
+                    item
+                    for item in workers
+                    if isinstance(item, dict) and str(item.get("worker_id")) == worker_id
+                ),
+                None,
+            )
+            if worker is None:
+                raise RebindError(f"worker not found in registry: {worker_id}")
+            if rebind_binding_snapshot(worker) != rebind_binding_snapshot(
+                expected_worker
+            ):
+                raise RebindError(
+                    f"worker {worker_id} binding changed during discovery; refusing stale rebind"
+                )
+            current_instance_id = derive_process_instance(worker)["instance_id"]
+            replacement = {
+                **worker,
+                "worker_id": worker_id,
+                "host": "127.0.0.1",
+                "base_url": f"http://127.0.0.1:{int(port)}",
+                "port": int(port),
+                "pane_id": pane_id,
+                "pane_pid": pane_pid,
+                "pane_start_time_ticks": int(
+                    discovery.get("pane_start_time_ticks") or 0
+                ),
+                "tmux_session": str(discovery.get("tmux_session") or ""),
+                "tmux_window": str(discovery.get("tmux_window") or ""),
+                "tmux_pane_index": str(discovery.get("tmux_pane_index") or ""),
+                "pane_title": discovery.get("pane_title", ""),
+                "pane_current_command": discovery.get("pane_current_command", ""),
+                "opencode_pids": [opencode_pid] if opencode_pid else [],
+                "opencode_pid": opencode_pid,
+                "opencode_start_time_ticks": int(
+                    discovery.get("opencode_start_time_ticks") or 0
+                ),
+                "host_boot_id": str(discovery.get("host_boot_id") or ""),
+                "tmux_server_pid": int(discovery.get("tmux_server_pid") or 0),
+                "listener_pids": discovery.get("listener_pids", []),
+                "strong_pid_matches": [opencode_pid] if opencode_pid else [],
+                "binding_confidence": "strong",
+                "server_live": True,
+                "doc_available": True,
+                "detected_tui_methods": sorted(REQUIRED_TUI_PATHS),
+                "opencode_cmdline_contains_port": True,
+                "last_verified_at": now,
+                "rebind_at": now,
+                "rebind_discovery_path": discovery.get("discovery_path", ""),
+            }
+            advance_binding_generations(replacement)
+            replacement.update(
+                {
+                    "binding_lease_id": binding_token(worker_id, "lease"),
+                    "binding_created_at": now,
+                    "binding_expires_at": binding_expiration(),
+                    "binding_created_by": "omx_visible_rebind:rebind",
+                    "binding_owner_run_id": str(
+                        os.environ.get("OMX_RUN_ID") or ""
+                    ),
+                    "binding_owner_task_id": str(
+                        os.environ.get("OMX_TASK_ID") or ""
+                    ),
+                    "binding_owner_tmux_pane": str(
+                        os.environ.get("TMUX_PANE") or ""
+                    ),
+                    "binding_transaction_id": binding_token(
+                        worker_id,
+                        "rebind",
+                    ),
+                    "binding_transaction_state": "committed",
+                }
+            )
+            ignored_inactive_aliases: list[str] = []
+            ignored_cross_boot_aliases: list[str] = []
+            ignored_cross_tmux_server_aliases: list[str] = []
+            alias_candidates: list[Any] = []
+            for item in workers:
+                probe = cross_boot_liveness_probes.get(
+                    str(item.get("worker_id") or "")
+                    if isinstance(item, dict)
+                    else ""
+                )
+                if probe and item == probe["record"]:
+                    alias_candidates.append(
+                        {**item, "server_live": False, "doc_available": False}
+                    )
+                else:
+                    alias_candidates.append(item)
+            conflict_ids: list[str] = []
+            alias_conflicts = visible_binding_alias_conflicts(
+                alias_candidates,
+                replacement,
+                ignore_worker_id=worker_id,
+                ignore_inactive_stale_aliases=True,
+                ignored_inactive_aliases=ignored_inactive_aliases,
+                ignore_cross_boot_pane_reuse=True,
+                ignored_cross_boot_aliases=ignored_cross_boot_aliases,
+                ignore_cross_tmux_server_pane_reuse=True,
+                ignored_cross_tmux_server_aliases=(
+                    ignored_cross_tmux_server_aliases
+                ),
+                conflicting_worker_ids=conflict_ids,
+            )
+            if alias_conflicts:
+                guidance = (
+                    "; rebind the worker that currently holds the shared "
+                    "pane/port first; for a conflicting worker proven gone, "
+                    "run ITS OWN `omx_visible_rebind check --root "
+                    "<control-root> --worker <that-worker> --json` "
+                    "(accepted when status is binding_failed with errors, "
+                    "or port_not_live with no active owner lock) and then "
+                    "`omx_worker_backend opencode-visible-worker-disable "
+                    "--root <control-root> --worker-id <that-worker> "
+                    "--opencode-visible-registry <registry.json> "
+                    "--rebind-check <its-check.json> "
+                    "--allow-framework-registry --allow-worker-disable`"
+                )
+                raise RebindError(
+                    "physical binding alias conflict: "
+                    + "; ".join(alias_conflicts)
+                    + guidance,
+                    worker_id=worker_id,
+                    status="binding_alias_conflict",
+                    conflicting_worker_ids=conflict_ids,
+                    facts={"registry_mutation": "not_written"},
+                )
+            ignored_inactive_aliases = sorted(
+                set(ignored_inactive_aliases)
+            )
+            ignored_cross_boot_aliases = sorted(
+                set(ignored_cross_boot_aliases)
+            )
+            if ignored_cross_boot_aliases:
+                cross_boot_ids = set(ignored_cross_boot_aliases)
+                for item in workers:
+                    if (
+                        isinstance(item, dict)
+                        and str(item.get("worker_id") or "") in cross_boot_ids
+                    ):
+                        update = {
+                            "allow_auto_submit": False,
+                            "default_for_new_tasks": False,
+                            "status": "stale_binding_disabled",
+                            "stale_binding_disabled_at": now,
+                            "stale_binding_disabled_reason": (
+                                "cross_boot_pane_id_reused"
+                            ),
+                        }
+                        probe = cross_boot_liveness_probes.get(
+                            str(item.get("worker_id") or "")
+                        )
+                        if probe and item == probe["record"]:
+                            update.update(
+                                {
+                                    "server_live": False,
+                                    "doc_available": False,
+                                    "stale_binding_liveness_checked_at": (
+                                        probe["checked_at"]
+                                    ),
+                                    "stale_binding_liveness_probe_port": (
+                                        probe["port"]
+                                    ),
+                                    "stale_binding_liveness_probe_reachable": (
+                                        bool(probe.get("reachable"))
+                                    ),
+                                    "stale_binding_liveness_probe_timed_out": False,
+                                    "stale_binding_liveness_ownership_evidence": (
+                                        probe.get("ownership_evidence") or {}
+                                    ),
+                                }
+                            )
+                        item.update(update)
+            mutation_records["old"] = dict(worker)
+            mutation_records["replacement"] = dict(replacement)
+            mutation_records["ignored_inactive_aliases"] = (
+                ignored_inactive_aliases
+            )
+            mutation_records["ignored_cross_boot_aliases"] = (
+                ignored_cross_boot_aliases
+            )
+            mutation_records["ignored_cross_tmux_server_aliases"] = sorted(
+                set(ignored_cross_tmux_server_aliases)
+            )
+            mutation_records["previous_binding"] = {
+                "pane_id": str(worker.get("pane_id") or ""),
+                "pane_pid": worker.get("pane_pid"),
+                "port": worker.get("port"),
+                "tmux_session": str(worker.get("tmux_session") or ""),
+                "tmux_window": str(worker.get("tmux_window") or ""),
+                "binding_generation": worker.get("binding_generation"),
+            }
+            rebound = replace_visible_worker_binding(
+                registry,
+                worker_id=worker_id,
+                replacement_record=replacement,
+                expected_instance_id=current_instance_id,
+                controller_id=str(discovery.get("tmux_session") or ""),
+                observed_at=now,
+            )
+            rebound["updated_at"] = now
+            return rebound
+
+        def create_registry_backup(path: Path) -> Path:
+            return root / backup_file(path, root)
+
+        mutation = mutate_visible_registry(
+            registry_path(root),
+            apply_rebind,
+            backup_factory=create_registry_backup,
+        )
+        registry_backup = rel(Path(mutation["backup_path"]), root)
+        rebound_worker = next(
+            (
+                item
+                for item in mutation["after"].get("workers", [])
+                if isinstance(item, dict)
+                and str(item.get("worker_id") or "") == worker_id
+            ),
+            {},
+        )
+        post_rebind_check = check_binding(
+            root,
+            worker_id,
+            write_report=True,
+        )
+        observation = post_rebind_check.get("registry")
+        _post_registry, post_worker = load_worker(root, worker_id)
+        superseded_fields = rebind_postcheck_superseded_fields(
+            rebound_worker,
+            observation,
+            post_worker,
+        )
+        if superseded_fields:
+            post_status = post_rebind_check.get("status")
+            raise RebindError(
+                "rebind superseded by a concurrent registry update; "
+                f"post-check for {worker_id} changed: "
+                + ", ".join(superseded_fields),
+                worker_id=worker_id,
+                status=str(post_status) if post_status else None,
+                facts={
+                    "post_rebind_check": post_rebind_check,
+                    "registry_backup": registry_backup,
+                    "registry_mutation": "superseded",
+                },
+            )
+        if post_rebind_check.get("status") != "current_binding_ok":
+            rollback_error = ""
+            try:
+                mutate_visible_registry(
+                    registry_path(root),
+                    lambda _current: mutation["before"],
+                    expected_pre_hash=str(
+                        mutation.get("post_hash") or ""
+                    ),
+                )
+            except Exception as exc:
+                rollback_error = str(exc)
+            failure = {
+                "schema_version": 1,
+                "failed_at": utc_now(),
+                "worker_id": worker_id,
+                "port": int(port),
+                "operation": "post_rebind_current_binding_check",
+                "post_rebind_check": post_rebind_check,
+                "registry_rolled_back": not rollback_error,
+                "rollback_error": rollback_error,
+                "registry_backup": registry_backup,
+            }
+            failure_path = (
+                rebind_root(root)
+                / (
+                    "rebind_postcheck_failure_"
+                    f"{worker_id}_{int(port)}_{stamp()}.json"
+                )
+            )
+            write_json(failure_path, failure)
+            detail = str(post_rebind_check.get("status") or "unknown")
+            if rollback_error:
+                detail += f"; registry rollback failed: {rollback_error}"
+            post_status = post_rebind_check.get("status")
+            raise RebindError(
+                "post-rebind current_binding_ok required: " + detail,
+                worker_id=worker_id,
+                status=str(post_status) if post_status else None,
+                result_path=rel(failure_path, root),
+                facts={
+                    "post_rebind_check": post_rebind_check,
+                    "registry_rolled_back": not rollback_error,
+                    "rollback_error": rollback_error,
+                    "registry_backup": registry_backup,
+                    "registry_mutation": (
+                        "rolled_back" if not rollback_error else "rollback_failed"
+                    ),
+                },
+            )
+        binding_generation = int(
+            rebound_worker.get("binding_generation") or 0
+        )
+        binding_lease_id = str(
+            rebound_worker.get("binding_lease_id") or ""
+        )
+        binding_transaction_id = str(
+            rebound_worker.get("binding_transaction_id") or ""
+        )
+        previous_binding = mutation_records.get("previous_binding", {})
+        ignored_inactive_aliases = list(
+            mutation_records.get("ignored_inactive_aliases", [])
+        )
+        ignored_cross_boot_aliases = list(
+            mutation_records.get("ignored_cross_boot_aliases", [])
+        )
+        ignored_aliases = sorted(
+            set(ignored_inactive_aliases)
+            | set(ignored_cross_boot_aliases)
+        )
+        previous_instance = derive_process_instance(initial_worker)
+        current_instance = derive_process_instance(rebound_worker)
+        sidecar_path = (
+            framework_root(root)
+            / f"opencode_visible_binding_{worker_id}.json"
+        )
+        sidecar = {
+            "schema_version": 1,
+            "verified_at": now,
+            "worker_id": worker_id,
+            "host": rebound_worker.get("host"),
+            "port": rebound_worker.get("port"),
+            "pane_id": rebound_worker.get("pane_id"),
+            "pane_pid": rebound_worker.get("pane_pid"),
+            "tmux_session": rebound_worker.get("tmux_session"),
+            "tmux_window": rebound_worker.get("tmux_window"),
+            "tmux_pane_index": rebound_worker.get("tmux_pane_index"),
+            "opencode_pids": rebound_worker.get("opencode_pids", []),
+            "listener_pids": rebound_worker.get("listener_pids", []),
+            "binding_confidence": rebound_worker.get("binding_confidence"),
+            "binding_generation": binding_generation,
+            "binding_lease_id": binding_lease_id,
+            "binding_expires_at": rebound_worker.get(
+                "binding_expires_at"
+            ),
+            "transaction_id": binding_transaction_id,
+            "transaction_state": "committed",
+            "canonical_registry": (
+                ".omx/framework/team/opencode_visible_workers.json"
+            ),
+            "checks": discovery.get("checks", {}),
+        }
+        sidecar_warning = ""
+        try:
+            write_json_atomic(sidecar_path, sidecar)
+        except OSError as exc:
+            sidecar_warning = str(exc)
+        audit_path = ""
+        audit_warning = ""
+        try:
+            audit_path = str(
+                write_visible_registry_mutation_audit(
+                    registry_path(root),
+                    worker_id=worker_id,
+                    action="rebind",
+                    old_record=mutation_records.get("old", {}),
+                    new_record=rebound_worker,
+                    cas_result="locked_plan_revalidated",
+                    reason="sanctioned visible worker rebind applied",
+                    result="applied",
+                    transaction_id=binding_transaction_id,
+                )
+            )
+        except OSError as exc:
+            audit_warning = str(exc)
+
+        defaults = [
+            worker
+            for worker in mutation["after"].get("workers", [])
+            if isinstance(worker, dict)
+            and bool(worker.get("default_for_new_tasks"))
+        ]
+        default_worker_ids = [
+            str(worker.get("worker_id") or "")
+            for worker in defaults
+        ]
+        broad_updates_deferred_reason = "deferred_from_rebind_transaction"
+        surface_worker_id = ""
+        surface_pane_id = ""
+        surface_port = 0
+        agents_update = {"changed": False, "deferred": True}
+        prompt_update = {"changed": False, "deferred": True}
+        surface_updates = {}
+        usage_update = {"changed": False, "deferred": True}
+
+        result = {
+            "schema_version": 1,
+            "rebound_at": now,
+            "root": str(root),
+            "worker_id": worker_id,
+            "pane_id": pane_id,
+            "pane_pid": pane_pid,
+            "opencode_pid": opencode_pid,
+            "port": int(port),
+            "binding_confidence": "strong",
+            "binding_generation": binding_generation,
+            "binding_lease_id": binding_lease_id,
+            "binding_transaction_id": binding_transaction_id,
+            "binding_audit": audit_path,
+            "binding_sidecar": rel(sidecar_path, root),
+            "binding_sidecar_warning": sidecar_warning,
+            "binding_audit_warning": audit_warning,
+            "registry_compare_and_swap": "matched",
+            "operation_id": binding_transaction_id,
+            "respawn_transition": respawn_transition,
+            "old_listener_overlap": old_listener_overlap,
+            "previous_instance": previous_instance,
+            "current_instance": current_instance,
+            "post_rebind_check": post_rebind_check,
+            "cross_session_move": cross_session_move,
+            "cross_session_move_authorized": bool(
+                cross_session_move and allow_cross_session_move
+            ),
+            "ignored_inactive_binding_aliases": (
+                ignored_inactive_aliases
+            ),
+            "ignored_cross_boot_binding_aliases": (
+                ignored_cross_boot_aliases
+            ),
+            "binding_alias_cleanup_commands": [
+                "./bin/omx_opencode_tui_adapter unregister-visible "
+                f"--root . --worker {alias_worker_id}"
+                for alias_worker_id in ignored_aliases
+            ],
+            "previous_binding": previous_binding,
+            "current_binding": {
+                "pane_id": pane_id,
+                "pane_pid": pane_pid,
+                "port": int(port),
+                "tmux_session": str(discovery.get("tmux_session") or ""),
+                "tmux_window": str(discovery.get("tmux_window") or ""),
+                "binding_generation": binding_generation,
+            },
+            "broad_updates_deferred": bool(
+                broad_updates_deferred_reason
+            ),
+            "broad_updates_deferred_reason": (
+                broad_updates_deferred_reason
+            ),
+            "default_worker_count": len(defaults),
+            "default_worker_ids": default_worker_ids,
+            "unrelated_owner_locks": [path.name for path in owner_locks],
+            "registry_backup": registry_backup,
+            "surface_worker_id": surface_worker_id,
+            "surface_pane_id": surface_pane_id,
+            "surface_port": surface_port,
+            "agents_update": agents_update,
+            "prompt_update": prompt_update,
+            "surface_updates": surface_updates,
+            "usage_policy_update": usage_update,
+            "discovery_path": discovery.get("discovery_path", ""),
+        }
+        apply_rebind_success_projection(result)
+        out = (
+            rebind_root(root)
+            / (
+                f"rebind_result_{worker_id}_{int(port)}"
+                f"_{binding_transaction_id}.json"
+            )
+        )
+        result["result_path"] = rel(out, root)
+        write_json(out, result)
+    return result
+
+
+def refresh_surface_from_registry(root: Path, worker_id: str) -> dict[str, Any]:
+    registry, worker = load_worker(root, worker_id)
+    pane_id = str(worker.get("pane_id") or "")
+    port = int(worker.get("port") or 0)
+    if not pane_id.startswith("%"):
+        raise RebindError(f"worker {worker_id} has invalid pane_id: {pane_id or '-'}")
+    if port <= 0:
+        raise RebindError(f"worker {worker_id} has invalid port: {worker.get('port')}")
+    agents_update = update_agents_block(root, worker_id, pane_id, port)
+    prompt_update = update_prompt_current(root, worker_id, pane_id, port)
+    surface_updates = update_surface_docs(root, worker_id, pane_id, port)
+    usage_update = update_usage_policy(root, worker_id, pane_id, port)
+    result = {
+        "schema_version": 1,
+        "refreshed_at": utc_now(),
+        "root": str(root),
+        "worker_id": worker_id,
+        "pane_id": pane_id,
+        "port": port,
+        "agents_update": agents_update,
+        "prompt_update": prompt_update,
+        "surface_updates": surface_updates,
+        "usage_policy_update": usage_update,
+        "registry_snapshot": {
+            "pane_id": pane_id,
+            "port": port,
+            "default_for_new_tasks": bool(worker.get("default_for_new_tasks")),
+            "allow_auto_submit": bool(worker.get("allow_auto_submit")),
+        },
+    }
+    out = rebind_root(root) / f"refresh_surface_{worker_id}_{stamp()}.json"
+    write_json(out, result)
+    result["result_path"] = rel(out, root)
+    return result
+
+
+def print_discovery(result: dict[str, Any]) -> None:
+    print(f"status: {result.get('status')}")
+    print(f"pane_id: {result.get('pane_id') or '-'}")
+    print(f"pane_pid: {result.get('pane_pid') or '-'}")
+    print(f"opencode_pid: {result.get('opencode_pid') or '-'}")
+    print(f"port: {result.get('port')}")
+    print(f"binding_confidence: {result.get('binding_confidence')}")
+    print(f"discovery_path: {result.get('discovery_path')}")
+    if result.get("warnings"):
+        print("Warnings:")
+        for item in result["warnings"]:
+            print(f"  - {item}")
+    if result.get("errors"):
+        print("Errors:")
+        for item in result["errors"]:
+            print(f"  - {item}")
+
+
+def command_discover(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    result = discover_binding(root, int(args.port), write_report=False)
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True, ensure_ascii=False))
+    else:
+        print_discovery(result)
+    return 0 if result.get("binding_confidence") == "strong" else 1
+
+
+def command_check(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    backend = getattr(args, "runtime_backend", default_backend_name())
+    fixture = Path(args.fixture).resolve() if getattr(args, "fixture", None) else None
+    worker_id = resolve_worker_arg(root, getattr(args, "worker", None))
+    if backend == "tmux-reference" and fixture is None:
+        result = check_binding(root, worker_id, write_report=False)
+        live = result.get("live", {}) if isinstance(result.get("live"), dict) else {}
+        registry = result.get("registry", {}) if isinstance(result.get("registry"), dict) else {}
+        result.setdefault("runtime_backend", backend)
+        result.setdefault("backend_type", "tmux")
+        result.setdefault("default_backend", default_backend_name())
+        result.setdefault("rmux_default", False)
+        result.setdefault("fixture_mode", False)
+        result.setdefault("live_enabled", True)
+        result.setdefault("real_rebind_allowed", True)
+        result.setdefault("binding_confidence", live.get("binding_confidence") or registry.get("binding_confidence"))
+        result.setdefault("ok", result.get("status") == "current_binding_ok")
+        result.setdefault("dispatch_policy_errors", [])
+        result.setdefault(
+            "dispatch_policy_status",
+            (
+                "allowed"
+                if not result.get("dispatch_policy_errors")
+                else "blocked"
+            ),
+        )
+        result.setdefault(
+            "ready_for_dispatch",
+            bool(
+                result.get("status") == "current_binding_ok"
+                and result.get("dispatch_policy_status") == "allowed"
+            ),
+        )
+        result.setdefault("registry_evidence", [{"source": "registry", "detail": {"path": "opencode_visible_workers.json"}}])
+        result.setdefault("substrate_evidence", [{"source": "live-port-discovery", "detail": {"worker_id": worker_id}}])
+        result.update(command_support_report())
+        result["rebind_plan"] = explain_rebind_plan(result)
+    else:
+        result = build_rebind_check_summary(root, worker_id, backend=backend, fixture_dir=fixture)
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True, ensure_ascii=False))
+    else:
+        live = result.get("live", {}) if isinstance(result.get("live"), dict) else {}
+        registry = result.get("registry", {}) if isinstance(result.get("registry"), dict) else {}
+        print(f"status: {result.get('status')}")
+        print(f"worker_id: {result.get('worker_id')}")
+        print(f"runtime_backend: {result.get('runtime_backend')}")
+        print(f"backend_type: {result.get('backend_type')}")
+        print(f"tmux_live_baseline: {result.get('tmux_live_baseline')}")
+        print(f"active_runtime_substrate: {result.get('active_runtime_substrate')}")
+        features = result.get("blocked_post_baseline_features", [])
+        if isinstance(features, list):
+            print(f"blocked_post_baseline_features: {', '.join(str(item) for item in features) or '-'}")
+        print(f"registry_pane: {registry.get('pane_id')}")
+        print(f"live_pane: {live.get('pane_id') or '-'}")
+        print(f"port: {live.get('port') or registry.get('port')}")
+        print(f"binding_confidence: {result.get('binding_confidence')}")
+        print(
+            "allow_auto_submit: "
+            f"{str(bool(registry.get('allow_auto_submit'))).lower()}"
+        )
+        print(
+            "dispatch_policy_status: "
+            f"{result.get('dispatch_policy_status') or '-'}"
+        )
+        print(
+            "ready_for_dispatch: "
+            f"{str(bool(result.get('ready_for_dispatch'))).lower()}"
+        )
+        print(
+            "registry_stale_after_reboot: "
+            f"{str(bool(result.get('registry_stale_after_reboot'))).lower()}"
+        )
+        print(
+            "target_worker_rebind_available: "
+            f"{str(bool(result.get('target_worker_rebind_available'))).lower()}"
+        )
+        print(
+            "unrelated_locks_present: "
+            f"{str(bool(result.get('unrelated_locks_present'))).lower()}"
+        )
+        print(
+            "global_surface_refresh_deferred: "
+            f"{str(bool(result.get('global_surface_refresh_deferred'))).lower()}"
+        )
+        recovery_sequence = result.get("recovery_sequence", [])
+        if isinstance(recovery_sequence, list) and recovery_sequence:
+            print("recovery_sequence:")
+            for index, command in enumerate(recovery_sequence, start=1):
+                print(f"  {index}. {command}")
+        if result.get("check_path"):
+            print(f"check_path: {result.get('check_path')}")
+        if result.get("warnings"):
+            print("Warnings:")
+            for item in result["warnings"]:
+                print(f"  - {item}")
+        if result.get("errors"):
+            print("Errors:")
+            for item in result["errors"]:
+                print(f"  - {item}")
+            print(f"rebind_command: {result.get('rebind_command')}")
+    if backend == "rmux-spike":
+        return 0 if result.get("status") == "candidate_fixture_only" else 1
+    return 0 if result.get("status") == "current_binding_ok" else 1
+
+
+def apply_rebind_success_projection(result: dict[str, Any]) -> dict[str, Any]:
+    post = result.get("post_rebind_check")
+    post = post if isinstance(post, dict) else {}
+    result["ok"] = True
+    result["status"] = post.get("status")
+    result["ready_for_dispatch"] = bool(post.get("ready_for_dispatch"))
+    result["conflicting_worker_ids"] = []
+    if result["ready_for_dispatch"]:
+        result["message"] = "rebind transaction completed"
+    else:
+        result["message"] = (
+            "rebind transaction completed; binding current but not ready "
+            "for dispatch"
+        )
+        result["policy_next_action"] = dispatch_policy_next_action(
+            [
+                str(item)
+                for item in (post.get("dispatch_policy_errors") or [])
+            ],
+            root=str(post.get("root") or ""),
+            worker_id=str(post.get("worker_id") or ""),
+            registry=(
+                post.get("registry")
+                if isinstance(post.get("registry"), dict)
+                else None
+            ),
+        )
+    return result
+
+
+def print_known_cli_failure(exc: BaseException, args: argparse.Namespace) -> None:
+    print(f"ERROR: {exc}", file=sys.stderr)
+    if not bool(getattr(args, "json", False)):
+        return
+    worker_id = ""
+    status = None
+    conflict_ids: list[str] = []
+    result_path = None
+    extra: dict[str, Any] = {}
+    if isinstance(exc, RebindError):
+        worker_id = exc.worker_id
+        status = exc.status
+        conflict_ids = list(exc.conflicting_worker_ids)
+        result_path = exc.result_path
+        extra = dict(exc.facts)
+    if not worker_id:
+        worker_id = str(getattr(args, "worker", None) or "")
+    payload: dict[str, Any] = {
+        "ok": False,
+        "worker_id": worker_id,
+        "status": status,
+        "ready_for_dispatch": False,
+        "conflicting_worker_ids": conflict_ids,
+        "message": str(exc),
+        "result_path": result_path,
+    }
+    for key in (
+        "post_rebind_check",
+        "registry_rolled_back",
+        "rollback_error",
+        "registry_backup",
+        "registry_mutation",
+        "refusal_reason",
+    ):
+        if key in extra:
+            payload[key] = extra[key]
+    print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
+
+
+def command_rebind(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    if getattr(args, "runtime_backend", default_backend_name()) == "rmux-spike":
+        raise RebindError("rmux-spike real rebind is disabled; fixture checks only")
+    worker_id = resolve_worker_arg(root, getattr(args, "worker", None))
+    port = resolve_port_arg(root, worker_id, getattr(args, "port", None))
+    result = do_rebind(
+        root,
+        worker_id,
+        port,
+        allow_rebind=args.allow_rebind,
+        allow_cross_session_move=getattr(
+            args,
+            "allow_cross_session_move",
+            False,
+        ),
+        require_global_quiescence=getattr(
+            args,
+            "require_global_quiescence",
+            False,
+        ),
+    )
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True, ensure_ascii=False))
+    else:
+        print("rebind: OK")
+        print(f"worker_id: {result.get('worker_id')}")
+        print(f"pane_id: {result.get('pane_id')}")
+        print(f"pane_pid: {result.get('pane_pid')}")
+        print(f"opencode_pid: {result.get('opencode_pid')}")
+        print(f"port: {result.get('port')}")
+        print(f"registry_backup: {result.get('registry_backup')}")
+        agents = result.get("agents_update", {})
+        print(f"agents_changed: {str(bool(agents.get('changed'))).lower()}")
+        if agents.get("backup"):
+            print(f"agents_backup: {agents.get('backup')}")
+        print(f"prompt_changed: {str(bool(result.get('prompt_update', {}).get('changed'))).lower()}")
+        print(f"result_path: {result.get('result_path')}")
+        policy_action = result.get("policy_next_action")
+        if isinstance(policy_action, dict) and policy_action:
+            print(f"policy_state: {policy_action.get('policy_state') or '-'}")
+            print(f"policy_next_action: {policy_action.get('next_safe_action') or '-'}")
+    return 0
+
+
+def command_refresh_surface(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    worker_id = resolve_worker_arg(root, getattr(args, "worker", None))
+    result = refresh_surface_from_registry(root, worker_id)
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True, ensure_ascii=False))
+    else:
+        print("refresh_surface: OK")
+        print(f"worker_id: {result.get('worker_id')}")
+        print(f"pane_id: {result.get('pane_id')}")
+        print(f"port: {result.get('port')}")
+        print(f"agents_changed: {str(bool(result.get('agents_update', {}).get('changed'))).lower()}")
+        print(f"prompt_changed: {str(bool(result.get('prompt_update', {}).get('changed'))).lower()}")
+        surface_updates = result.get("surface_updates", {}) if isinstance(result.get("surface_updates"), dict) else {}
+        print(f"legacy_prompt_changed: {str(bool((surface_updates.get('legacy_prompt') or {}).get('changed'))).lower()}")
+        print(f"hard_rules_changed: {str(bool((surface_updates.get('hard_rules') or {}).get('changed'))).lower()}")
+        changed_count = sum(1 for item in surface_updates.values() if isinstance(item, dict) and item.get("changed"))
+        print(f"surface_docs_changed: {changed_count}")
+        print(f"usage_policy_changed: {str(bool(result.get('usage_policy_update', {}).get('changed'))).lower()}")
+        print(f"result_path: {result.get('result_path')}")
+    return 0
+
+
+def command_status(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    workers = read_json(registry_path(root)).get("workers", [])
+    rows = []
+    for worker in workers if isinstance(workers, list) else []:
+        if not isinstance(worker, dict):
+            continue
+        if worker.get("default_for_new_tasks"):
+            try:
+                check = check_binding(root, str(worker.get("worker_id")), write_report=False)
+            except Exception as exc:
+                check = {"status": "check_error", "errors": [str(exc)], "live": {}, "registry": worker}
+            rows.append(check)
+    payload = {"generated_at": utc_now(), "root": str(root), "bindings": rows}
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
+    else:
+        if not rows:
+            print("No visible default bindings found.")
+        for row in rows:
+            print(
+                f"{row.get('worker_id')} status={row.get('status')} "
+                f"registry={row.get('registry', {}).get('pane_id')} "
+                f"live={row.get('live', {}).get('pane_id') or '-'} "
+                f"port={row.get('registry', {}).get('port')}"
+            )
+    return 0 if all(row.get("status") == "current_binding_ok" for row in rows) else 1
+
+
+def command_doctor(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    checks: list[dict[str, Any]] = []
+    errors: list[str] = []
+    default_worker_id = ""
+    default_port: int | None = None
+
+    def add(name: str, ok: bool, detail: str) -> None:
+        checks.append({"name": name, "ok": ok, "detail": detail})
+        if not ok:
+            errors.append(f"{name}: {detail}")
+
+    state_team = root / ".omx" / "state" / "team"
+    polluted = []
+    if state_team.is_dir():
+        polluted = sorted(path.name for path in state_team.iterdir() if path.is_dir() and path.name in POLLUTION_DIRS)
+    add("state_team_clean", not polluted, ", ".join(polluted) if polluted else "ok")
+    try:
+        default_worker_id = resolve_worker_arg(root, None)
+        default_port = resolve_port_arg(root, default_worker_id, None)
+        check = check_binding(root, default_worker_id, write_report=False)
+        add("rebind_check", check.get("status") == "current_binding_ok", check.get("status", "unknown"))
+    except Exception as exc:
+        check = {"status": "error", "errors": [str(exc)]}
+        add("rebind_check", False, str(exc))
+
+    policy = run_command([str(root / "bin" / "omx_visible_policy_check"), "check", "--root", str(root)], root, timeout=90)
+    add("policy_check", policy["returncode"] == 0, f"returncode={policy['returncode']}")
+    dispatch = run_command([str(root / "bin" / "omx_visible_dispatch"), "doctor", "--root", str(root)], root, timeout=90)
+    add("dispatch_doctor", dispatch["returncode"] == 0, f"returncode={dispatch['returncode']}")
+    watcher = run_command([str(root / "bin" / "omx_visible_watcher"), "status", "--root", str(root)], root, timeout=30)
+    add("watcher_status", watcher["returncode"] == 0, f"returncode={watcher['returncode']}")
+    result = {
+        "generated_at": utc_now(),
+        "root": str(root),
+        "ok": not errors,
+        "checks": checks,
+        "errors": errors,
+        "rebind_check": check,
+    }
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True, ensure_ascii=False))
+    else:
+        print(f"doctor: {'OK' if result['ok'] else 'ERROR'}")
+        for item in checks:
+            print(f"{'OK' if item['ok'] else 'ERROR'} {item['name']}: {item['detail']}")
+        if check.get("status") != "current_binding_ok":
+            if default_worker_id and default_port:
+                print(
+                    "suggested_rebind: "
+                    f"./bin/omx_visible_rebind rebind --root . --worker {default_worker_id} "
+                    f"--port {default_port} --allow-rebind"
+                )
+    return 0 if result["ok"] else 1
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="omx_visible_rebind",
+        description=(
+            "Read-only visible OpenCode TUI binding discovery plus explicit registry rebind. "
+            "Scans only the current tmux window and never sends pane input or OpenCode POSTs."
+        ),
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    discover = sub.add_parser("discover", help="read-only discover pane/process binding for a local OpenCode port")
+    discover.add_argument("--root", default=".")
+    discover.add_argument("--port", type=int, required=True)
+    discover.add_argument("--json", action="store_true")
+    discover.set_defaults(func=command_discover)
+
+    check = sub.add_parser("check", help="verify registry binding still matches the live current-window binding")
+    check.add_argument("--root", default=".")
+    check.add_argument("--worker")
+    check.add_argument("--runtime-backend", default=default_backend_name(), choices=[item["name"] for item in available_backends()])
+    check.add_argument("--fixture", help="fixture directory for RuntimeAdapter-backed check")
+    check.add_argument("--json", action="store_true")
+    check.set_defaults(func=command_check)
+
+    rebind = sub.add_parser("rebind", help="update registry and project prompt only after strong binding")
+    rebind.add_argument("--root", default=".")
+    rebind.add_argument("--worker")
+    rebind.add_argument("--port", type=int)
+    rebind.add_argument("--runtime-backend", default=default_backend_name(), choices=[item["name"] for item in available_backends()])
+    rebind.add_argument("--fixture", help="accepted for check symmetry; real rebind remains protected")
+    rebind.add_argument("--allow-rebind", action="store_true")
+    rebind.add_argument("--allow-cross-session-move", action="store_true")
+    rebind.add_argument("--require-global-quiescence", action="store_true")
+    rebind.add_argument("--json", action="store_true")
+    rebind.set_defaults(func=command_rebind)
+
+    refresh = sub.add_parser("refresh-surface", help="sync AGENTS/prompt/usage policy from the current registry binding only")
+    refresh.add_argument("--root", default=".")
+    refresh.add_argument("--worker")
+    refresh.add_argument("--json", action="store_true")
+    refresh.set_defaults(func=command_refresh_surface)
+
+    status = sub.add_parser("status", help="show registry binding versus live discovered binding")
+    status.add_argument("--root", default=".")
+    status.add_argument("--json", action="store_true")
+    status.set_defaults(func=command_status)
+
+    doctor = sub.add_parser("doctor", help="run rebind, policy, dispatch, and watcher read-only checks")
+    doctor.add_argument("--root", default=".")
+    doctor.add_argument("--json", action="store_true")
+    doctor.set_defaults(func=command_doctor)
+
+    for command_parser in sub.choices.values():
+        command_parser.set_defaults(root=None)
+    return parser
+
+
+def main(argv: list[str] | None = None, *, _admission_root: Path | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return invoke_cli_handler("omx_visible_rebind", args, args.func, admission_root=_admission_root)
+    except RebindError as exc:
+        print_known_cli_failure(exc, args)
+        return 1
+    except AdmissionError as exc:
+        print_known_cli_failure(exc, args)
+        return 1
+    except RuntimeAdapterError as exc:
+        print_known_cli_failure(exc, args)
+        return 1
+    except KeyboardInterrupt:
+        print("ERROR: interrupted", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

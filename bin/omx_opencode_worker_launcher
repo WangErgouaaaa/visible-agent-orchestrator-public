@@ -1,0 +1,1621 @@
+#!/usr/bin/env python3
+"""Fixed-port OpenCode TUI worker launcher for phase 3B-0.
+
+This tool is intentionally narrow:
+- framework state is written only under .omx/framework/team
+- real OMX team state under .omx/state/team is never modified
+- workers are started only with explicit --allow-launch
+- tmux input APIs and OpenCode mutating HTTP APIs are not used
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+_THIS_FILE = Path(__file__).resolve()
+for _p in ((_THIS_FILE.parent.parent / "src").resolve(), (_THIS_FILE.parent.parent / "lib").resolve()):
+    if _p.exists() and str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
+
+from visible_agent_orchestrator.runtime.tmux_capabilities import command_shape_supported
+from visible_agent_orchestrator.runtime_paths import workspace_root
+from visible_agent_orchestrator.visible_registry_lock import (
+    visible_registry_path_lock,
+)
+
+
+HOSTNAME = "127.0.0.1"
+BACKEND = "opencode_tui"
+REGISTRY_NAME = "opencode_fixed_workers.json"
+LAUNCH_LOG_NAME = "opencode_worker_launch.log"
+STATE_POLLUTION_DIRS = {"_framework", "demo-run", "dispatch-demo"}
+TUI_ENDPOINTS = ("/tui/clear-prompt", "/tui/append-prompt", "/tui/submit-prompt")
+PROBE_ENDPOINTS = ("/global/health", "/doc", "/session/status", "/global/event", "/event")
+EVENT_ENDPOINTS = ("/global/event", "/event")
+RUNTIME_SUBSTRATE_AUTO = "auto"
+RUNTIME_SUBSTRATE_CHOICES = (RUNTIME_SUBSTRATE_AUTO, "tmux", "rmux")
+PLACEMENT_NEW_WINDOW = "new-window"
+PLACEMENT_CURRENT_WINDOW = "current-window"
+PLACEMENT_CHOICES = (PLACEMENT_NEW_WINDOW, PLACEMENT_CURRENT_WINDOW)
+FIXED_WORKER_IDENTITY_FIELDS = (
+    "host_boot_id",
+    "tmux_server_pid",
+    "pane_id",
+    "pane_pid",
+    "pane_start_time_ticks",
+    "opencode_pid",
+    "opencode_start_time_ticks",
+)
+
+
+class LauncherError(Exception):
+    """Expected operator-facing error."""
+
+
+@dataclass
+class CommandResult:
+    argv: list[str]
+    returncode: int
+    stdout: str
+    stderr: str
+    timed_out: bool = False
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def timestamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def root_path(value: str | None) -> Path:
+    return workspace_root(value)
+
+
+def team_root(root: Path) -> Path:
+    return root / ".omx" / "state" / "team"
+
+
+def framework_root(root: Path) -> Path:
+    return root / ".omx" / "framework" / "team"
+
+
+def ensure_framework(root: Path) -> Path:
+    path = framework_root(root)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def registry_path(root: Path) -> Path:
+    return framework_root(root) / REGISTRY_NAME
+
+
+def tmux_caller_pane() -> str:
+    pane = str(os.environ.get("TMUX_PANE") or "")
+    return pane if pane.startswith("%") and pane[1:].isdigit() else ""
+
+
+def tmux_caller_scope() -> dict[str, str]:
+    pane = tmux_caller_pane()
+    if not pane:
+        raise LauncherError(
+            "TMUX_PANE is required for caller-scoped tmux launch"
+        )
+    result = run_argv(
+        mux_argv(
+            "tmux",
+            "display-message",
+            "-t",
+            pane,
+            "-p",
+            "#{pane_id}\t#{window_id}\t#{session_name}\t"
+            "#{window_index}\t#{pane_index}",
+        ),
+        timeout=5,
+    )
+    parts = result.stdout.strip().split("\t")
+    if result.returncode != 0:
+        detail = result.stderr.strip() or "targeted tmux lookup failed"
+        raise LauncherError(
+            f"caller tmux pane {pane} is unavailable or stale: {detail}"
+        )
+    if (
+        len(parts) != 5
+        or parts[0] != pane
+        or not parts[1].startswith("@")
+        or not parts[2]
+        or not parts[3].isdigit()
+        or not parts[4].isdigit()
+    ):
+        raise LauncherError(
+            f"caller tmux pane/window evidence mismatch for {pane}: "
+            f"{result.stdout!r}"
+        )
+    return {
+        "pane_id": parts[0],
+        "window_id": parts[1],
+        "session_name": parts[2],
+        "window_index": parts[3],
+        "pane_index": parts[4],
+        "pane_ref": f"{parts[2]}:{parts[3]}.{parts[4]}",
+    }
+
+
+@contextmanager
+def launch_serialization_lock(root: Path):
+    path = ensure_framework(root) / ".opencode-launch.lock"
+    with path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def rel(path: Path, root: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(root.resolve()))
+    except Exception:
+        return str(path)
+
+
+def write_json(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def write_json_atomic(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(
+        f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+    )
+    try:
+        temporary.write_text(
+            json.dumps(
+                data,
+                indent=2,
+                sort_keys=True,
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def commit_fixed_registry(
+    root: Path,
+    payload: dict[str, Any],
+    *,
+    expected_snapshot: dict[str, Any] | None = None,
+    require_absent: bool = False,
+) -> None:
+    path = registry_path(root)
+    with visible_registry_path_lock(path):
+        current = read_json_safe(path)
+        if expected_snapshot is not None and current != expected_snapshot:
+            raise LauncherError(
+                "fixed worker registry changed during verification; "
+                "refusing stale overwrite"
+            )
+        if require_absent and current:
+            raise LauncherError(
+                "fixed worker registry appeared during launch; "
+                "refusing overwrite"
+            )
+        write_json_atomic(path, payload)
+
+
+def read_json_safe(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def append_log(root: Path, line: str) -> None:
+    fw = ensure_framework(root)
+    with (fw / LAUNCH_LOG_NAME).open("a", encoding="utf-8") as handle:
+        handle.write(f"{utc_now()} {line}\n")
+
+
+def resolve_runtime_substrate(
+    preferred: str = RUNTIME_SUBSTRATE_AUTO,
+    *,
+    env: dict[str, str] | None = None,
+) -> str:
+    value = str(preferred or RUNTIME_SUBSTRATE_AUTO)
+    if value not in RUNTIME_SUBSTRATE_CHOICES:
+        raise LauncherError(f"unsupported runtime substrate: {value}")
+    if value != RUNTIME_SUBSTRATE_AUTO:
+        return value
+    env_map = env if env is not None else os.environ
+    if env_map.get("TMUX"):
+        return "tmux"
+    if env_map.get("RMUX"):
+        return "tmux" if shutil.which("tmux") else "rmux"
+    if shutil.which("tmux"):
+        return "tmux"
+    if shutil.which("rmux"):
+        return "rmux"
+    raise LauncherError("neither rmux nor tmux is available")
+
+
+def mux_argv(runtime_substrate: str, *args: str) -> list[str]:
+    return [resolve_runtime_substrate(runtime_substrate), *args]
+
+
+def guarded_mux_argv(runtime_substrate: str, command: str, *args: str) -> list[str]:
+    supported, reason = command_shape_supported(command, list(args))
+    if not supported:
+        raise LauncherError(reason)
+    return mux_argv(runtime_substrate, command, *args)
+
+
+def run_argv(argv: list[str], timeout: int = 15) -> CommandResult:
+    try:
+        proc = subprocess.run(
+            argv,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False,
+        )
+        return CommandResult(argv=argv, returncode=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
+    except subprocess.TimeoutExpired as exc:
+        return CommandResult(
+            argv=argv,
+            returncode=124,
+            stdout=exc.stdout or "",
+            stderr=exc.stderr or "command timed out",
+            timed_out=True,
+        )
+    except FileNotFoundError as exc:
+        return CommandResult(argv=argv, returncode=127, stdout="", stderr=str(exc))
+
+
+def require_port_range(workers: int, base_port: int) -> None:
+    if workers < 1:
+        raise LauncherError("--workers must be >= 1")
+    if not (1 <= base_port <= 65535):
+        raise LauncherError("--base-port must be a valid TCP port")
+    if base_port + workers - 1 > 65535:
+        raise LauncherError("worker port range exceeds 65535")
+
+
+def worker_specs(
+    workers: int,
+    base_port: int,
+    project: Path,
+    root: Path,
+    *,
+    first_worker_number: int = 1,
+) -> list[dict[str, Any]]:
+    require_port_range(workers, base_port)
+    if first_worker_number < 1:
+        raise LauncherError("first worker number must be >= 1")
+    specs: list[dict[str, Any]] = []
+    for index in range(workers):
+        worker_id = f"w{first_worker_number + index}"
+        port = base_port + index
+        command = (
+            f"opencode {shlex.quote(str(project))} --hostname {HOSTNAME} --port {port}"
+        )
+        specs.append({
+            "worker_id": worker_id,
+            "backend": BACKEND,
+            "hostname": HOSTNAME,
+            "port": port,
+            "project": str(project),
+            "base_url": f"http://{HOSTNAME}:{port}",
+            "pane_title": f"opencode-{worker_id}-{port}",
+            "command": command,
+        })
+    return specs
+
+
+def caller_window(caller_scope: dict[str, str]) -> str:
+    return f"{caller_scope['session_name']}:{caller_scope['window_index']}"
+
+
+def discover_current_window_worker(
+    root: Path,
+    port: int,
+    caller_scope: dict[str, str],
+) -> dict[str, Any]:
+    result = run_argv(
+        [
+            str(_THIS_FILE.with_name("omx_visible_rebind")),
+            "discover",
+            "--root",
+            str(root),
+            "--port",
+            str(int(port)),
+            "--json",
+        ],
+        timeout=15,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise LauncherError(
+            f"current-window discovery failed for port {port}: {detail}"
+        )
+    try:
+        discovery = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise LauncherError(
+            f"current-window discovery returned invalid JSON for port {port}"
+        ) from exc
+    expected_window = caller_window(caller_scope)
+    if (
+        discovery.get("binding_confidence") != "strong"
+        or discovery.get("tmux_session") != caller_scope["session_name"]
+        or discovery.get("tmux_window") != expected_window
+        or any(not discovery.get(key) for key in FIXED_WORKER_IDENTITY_FIELDS)
+    ):
+        raise LauncherError(
+            f"current-window discovery is not strong for port {port}"
+        )
+    return {
+        key: discovery[key]
+        for key in (
+            *FIXED_WORKER_IDENTITY_FIELDS,
+            "tmux_session",
+            "tmux_window",
+        )
+    } | {"tmux_window_id": caller_scope["window_id"]}
+
+
+def resolve_placement(value: str | None, runtime_substrate: str) -> str:
+    placement = str(value or PLACEMENT_NEW_WINDOW)
+    if placement not in PLACEMENT_CHOICES:
+        raise LauncherError(
+            f"unsupported placement {placement!r}; choose one of {', '.join(PLACEMENT_CHOICES)}"
+        )
+    if placement == PLACEMENT_CURRENT_WINDOW and runtime_substrate != "tmux":
+        raise LauncherError("--placement current-window requires the tmux runtime substrate")
+    return placement
+
+
+def render_plan(
+    root: Path,
+    specs: list[dict[str, Any]],
+    runtime_substrate: str,
+    placement: str,
+) -> str:
+    substrate = resolve_runtime_substrate(runtime_substrate)
+    lines = [
+        "# OpenCode Fixed-Port Worker Launch Plan",
+        "",
+        f"Generated at: `{utc_now()}`",
+        f"Workspace: `{root}`",
+        f"Runtime substrate: `{substrate}`",
+        f"Placement: `{placement}`",
+        "",
+        "This plan is produced by `omx_opencode_worker_launcher`. The `plan` command does not start processes or modify tmux.",
+        "",
+        "## Workers",
+        "",
+    ]
+    for spec in specs:
+        lines.extend([
+            f"- worker `{spec['worker_id']}` on `{spec['hostname']}:{spec['port']}`",
+            "",
+            "```bash",
+            spec["command"],
+            "```",
+            "",
+        ])
+    lines.extend([
+        "## Launch Boundary",
+        "",
+        "- `launch` requires explicit `--allow-launch`.",
+        (
+            f"- Launch creates a new `{substrate}` window and new panes only."
+            if placement == PLACEMENT_NEW_WINDOW
+            else "- Launch creates new task-owned panes in the caller's current tmux window."
+        ),
+        "- Existing panes, including unmanaged OpenCode pane `%31`, must not be reused, interrupted, or killed.",
+        "- OpenCode prompt mutation endpoints are not called in phase 3B-0.",
+        "- Worker completion still requires `report.md` plus exactly one terminal marker: `.done`, `.fail`, or `.blocked`.",
+        "- `submitted` is not `received`; no `.received` marker is fabricated here.",
+        "",
+    ])
+    return "\n".join(lines)
+
+
+def command_plan(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    project = Path(args.project).resolve()
+    runtime_substrate = resolve_runtime_substrate(getattr(args, "runtime_substrate", RUNTIME_SUBSTRATE_AUTO))
+    placement = resolve_placement(
+        getattr(args, "placement", PLACEMENT_NEW_WINDOW),
+        runtime_substrate,
+    )
+    specs = worker_specs(args.workers, args.base_port, project, root)
+    fw = ensure_framework(root)
+    plan = {
+        "schema_version": 2,
+        "generated_at": utc_now(),
+        "root": str(root),
+        "runtime_substrate": runtime_substrate,
+        "placement": placement,
+        "workers": specs,
+        "constraints": [
+            "plan-only; no process is started",
+            f"no {runtime_substrate} command is executed by plan",
+            "launch requires --allow-launch",
+            "do not reuse, interrupt, or kill existing unmanaged OpenCode panes",
+            "no POST, PUT, PATCH, or DELETE requests are used in phase 3B-0",
+        ],
+    }
+    write_json(fw / "opencode_worker_launch_plan.json", plan)
+    (fw / "OPENCODE_WORKER_LAUNCH_PLAN.md").write_text(
+        render_plan(root, specs, runtime_substrate, placement),
+        encoding="utf-8",
+    )
+    print(f"launch_plan_json: {rel(fw / 'opencode_worker_launch_plan.json', root)}")
+    print(f"launch_plan_md: {rel(fw / 'OPENCODE_WORKER_LAUNCH_PLAN.md', root)}")
+    for spec in specs:
+        print(f"{spec['worker_id']}: {spec['command']}")
+    return 0
+
+
+def is_port_open(port: int, host: str = HOSTNAME, timeout: float = 0.25) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(timeout)
+        return sock.connect_ex((host, int(port))) == 0
+
+
+def http_get_limited(url: str, timeout: float = 2.0, limit: int = 8192) -> dict[str, Any]:
+    request = Request(url, method="GET", headers={"User-Agent": "omx-opencode-worker-launcher/3B-0"})
+    started = time.time()
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            status = int(getattr(response, "status", 200))
+            headers = dict(response.headers.items())
+            body = b""
+            timed_out = False
+            try:
+                body = response.read(limit)
+            except socket.timeout:
+                timed_out = True
+            return {
+                "ok": 200 <= status < 300,
+                "reachable": True,
+                "status": status,
+                "content_type": headers.get("Content-Type", ""),
+                "bytes_read": len(body),
+                "timed_out": timed_out,
+                "elapsed_seconds": round(time.time() - started, 3),
+                "body_head": body.decode("utf-8", errors="replace")[:2000],
+            }
+    except HTTPError as exc:
+        body = exc.read(limit)
+        return {
+            "ok": 200 <= int(exc.code) < 300,
+            "reachable": True,
+            "status": int(exc.code),
+            "content_type": exc.headers.get("Content-Type", ""),
+            "bytes_read": len(body),
+            "timed_out": False,
+            "elapsed_seconds": round(time.time() - started, 3),
+            "body_head": body.decode("utf-8", errors="replace")[:2000],
+            "error": str(exc),
+        }
+    except (URLError, TimeoutError, socket.timeout, ConnectionError, OSError) as exc:
+        return {
+            "ok": False,
+            "reachable": False,
+            "status": None,
+            "content_type": "",
+            "bytes_read": 0,
+            "timed_out": isinstance(exc, (TimeoutError, socket.timeout)),
+            "elapsed_seconds": round(time.time() - started, 3),
+            "body_head": "",
+            "error": str(exc),
+        }
+
+
+def summarize_doc(doc_text: str) -> dict[str, Any]:
+    paths = {
+        "/global/health": "/global/health" in doc_text,
+        "/doc": "/doc" in doc_text,
+        "/session/status": "/session/status" in doc_text,
+        "/global/event": "/global/event" in doc_text,
+        "/event": "/event" in doc_text,
+        "/tui/clear-prompt": "/tui/clear-prompt" in doc_text,
+        "/tui/append-prompt": "/tui/append-prompt" in doc_text,
+        "/tui/submit-prompt": "/tui/submit-prompt" in doc_text,
+    }
+    summary: dict[str, Any] = {"openapi_version": "", "title": "", "version": "", "paths": paths}
+    try:
+        parsed = json.loads(doc_text)
+    except Exception:
+        return summary
+    if not isinstance(parsed, dict):
+        return summary
+    summary["openapi_version"] = str(parsed.get("openapi", "") or parsed.get("swagger", ""))
+    info = parsed.get("info", {})
+    if isinstance(info, dict):
+        summary["title"] = str(info.get("title", ""))
+        summary["version"] = str(info.get("version", ""))
+    openapi_paths = parsed.get("paths", {})
+    if isinstance(openapi_paths, dict):
+        for endpoint in paths:
+            summary["paths"][endpoint] = endpoint in openapi_paths
+    return summary
+
+
+def probe_port(port: int, hostname: str = HOSTNAME) -> dict[str, Any]:
+    if hostname not in {"127.0.0.1", "localhost"}:
+        raise LauncherError("only localhost probe targets are allowed")
+    endpoint_results: dict[str, Any] = {}
+    for endpoint in PROBE_ENDPOINTS:
+        timeout = 2.0 if endpoint in EVENT_ENDPOINTS else 1.5
+        limit = 1024 if endpoint in EVENT_ENDPOINTS else 65536 if endpoint == "/doc" else 4096
+        endpoint_results[endpoint] = http_get_limited(f"http://{hostname}:{port}{endpoint}", timeout=timeout, limit=limit)
+    doc_text = str(endpoint_results.get("/doc", {}).get("body_head", ""))
+    doc_summary = summarize_doc(doc_text)
+    paths = doc_summary.get("paths", {})
+    detected_tui = [endpoint for endpoint in TUI_ENDPOINTS if paths.get(endpoint) or endpoint in doc_text]
+    reachable = any(result.get("reachable") for result in endpoint_results.values())
+    return {
+        "hostname": hostname,
+        "port": int(port),
+        "base_url": f"http://{hostname}:{port}",
+        "reachable": reachable,
+        "server_live": reachable,
+        "global_health_available": bool(endpoint_results["/global/health"].get("ok")),
+        "global_health_status": endpoint_results["/global/health"].get("status"),
+        "doc_available": bool(endpoint_results["/doc"].get("ok")),
+        "doc_status": endpoint_results["/doc"].get("status"),
+        "doc_summary": doc_summary,
+        "session_status_available": bool(endpoint_results["/session/status"].get("ok")),
+        "session_status_code": endpoint_results["/session/status"].get("status"),
+        "global_event_available": bool(endpoint_results["/global/event"].get("reachable") and endpoint_results["/global/event"].get("status") == 200),
+        "global_event_status": endpoint_results["/global/event"].get("status"),
+        "global_event_timed_out": endpoint_results["/global/event"].get("timed_out", False),
+        "event_available": bool(endpoint_results["/event"].get("reachable") and endpoint_results["/event"].get("status") == 200),
+        "event_status": endpoint_results["/event"].get("status"),
+        "event_timed_out": endpoint_results["/event"].get("timed_out", False),
+        "detected_tui_methods": detected_tui,
+        "tui_clear_prompt": "/tui/clear-prompt" in detected_tui,
+        "tui_append_prompt": "/tui/append-prompt" in detected_tui,
+        "tui_submit_prompt": "/tui/submit-prompt" in detected_tui,
+        "endpoint_results": {
+            endpoint: {
+                "ok": result.get("ok"),
+                "reachable": result.get("reachable"),
+                "status": result.get("status"),
+                "content_type": result.get("content_type", ""),
+                "bytes_read": result.get("bytes_read", 0),
+                "timed_out": result.get("timed_out", False),
+                "elapsed_seconds": result.get("elapsed_seconds"),
+                "error": result.get("error", ""),
+            }
+            for endpoint, result in endpoint_results.items()
+        },
+    }
+
+
+def apply_probe_to_worker(worker: dict[str, Any], probe: dict[str, Any]) -> dict[str, Any]:
+    updated = dict(worker)
+    for key in [
+        "server_live",
+        "global_health_available",
+        "global_health_status",
+        "doc_available",
+        "doc_status",
+        "doc_summary",
+        "session_status_available",
+        "session_status_code",
+        "global_event_available",
+        "global_event_status",
+        "global_event_timed_out",
+        "event_available",
+        "event_status",
+        "event_timed_out",
+        "detected_tui_methods",
+        "tui_clear_prompt",
+        "tui_append_prompt",
+        "tui_submit_prompt",
+        "endpoint_results",
+    ]:
+        updated[key] = probe.get(key)
+    updated["last_verified_at"] = utc_now()
+    return updated
+
+
+def registry_is_live(registry: dict[str, Any]) -> bool:
+    workers = registry.get("workers", [])
+    return bool(workers) and all(worker.get("server_live") for worker in workers)
+
+
+def probe_registry_workers(registry: dict[str, Any]) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    for worker in registry.get("workers", []):
+        port = int(worker.get("port", 0))
+        if not (1 <= port <= 65535):
+            results.append(dict(worker, server_live=False, probe_error="invalid port"))
+            continue
+        try:
+            probe = probe_port(port, str(worker.get("hostname") or HOSTNAME))
+            results.append(apply_probe_to_worker(worker, probe))
+        except Exception as exc:
+            results.append(dict(worker, server_live=False, probe_error=str(exc), last_verified_at=utc_now()))
+    return results
+
+
+def find_state_pollution(root: Path) -> list[str]:
+    state = team_root(root)
+    if not state.is_dir():
+        return []
+    return sorted(path.name for path in state.iterdir() if path.is_dir() and path.name in STATE_POLLUTION_DIRS)
+
+
+def preflight_checks(
+    root: Path,
+    workers: int,
+    base_port: int,
+    project: Path,
+    runtime_substrate: str,
+    placement: str = PLACEMENT_NEW_WINDOW,
+) -> dict[str, Any]:
+    runtime_substrate = resolve_runtime_substrate(runtime_substrate)
+    specs = worker_specs(workers, base_port, project, root)
+    errors: list[str] = []
+    warnings: list[str] = []
+    registry: dict[str, Any] = {}
+    registry_workers_live: list[dict[str, Any]] = []
+    already_live = False
+    stale_registry = False
+    tmux_scope_proven = runtime_substrate != "tmux"
+    try:
+        placement = resolve_placement(placement, runtime_substrate)
+    except LauncherError as exc:
+        errors.append(str(exc))
+
+    if runtime_substrate == "rmux":
+        if not os.environ.get("RMUX"):
+            errors.append("not running inside rmux")
+        if not shutil.which("rmux"):
+            errors.append("rmux command not found")
+    else:
+        if not os.environ.get("TMUX"):
+            errors.append("not running inside tmux")
+        if not shutil.which("tmux"):
+            errors.append("tmux command not found")
+        if not tmux_caller_pane():
+            errors.append(
+                "TMUX_PANE is required for caller-scoped tmux launch"
+            )
+        if (
+            os.environ.get("TMUX")
+            and shutil.which("tmux")
+            and tmux_caller_pane()
+        ):
+            try:
+                tmux_caller_scope()
+                tmux_scope_proven = True
+            except LauncherError as exc:
+                errors.append(str(exc))
+    opencode_path = shutil.which("opencode")
+    if not opencode_path:
+        errors.append("opencode command not found")
+    if not project.exists():
+        errors.append(f"project path does not exist: {project}")
+    polluted = find_state_pollution(root)
+    if polluted:
+        errors.append(f".omx/state/team contains framework/internal dirs: {', '.join(polluted)}")
+
+    if runtime_substrate != "tmux" or tmux_scope_proven:
+        registry = read_json_safe(registry_path(root))
+        if registry:
+            registry_workers_live = probe_registry_workers(registry)
+            already_live = bool(registry_workers_live) and all(worker.get("server_live") for worker in registry_workers_live)
+            if not already_live:
+                stale_registry = True
+                warnings.append(f"stale registry exists: {rel(registry_path(root), root)}")
+
+        if not already_live:
+            occupied = [spec["port"] for spec in specs if is_port_open(int(spec["port"]))]
+            if occupied:
+                errors.append(f"requested ports are occupied: {', '.join(str(port) for port in occupied)}")
+
+    return {
+        "schema_version": 1,
+        "generated_at": utc_now(),
+        "root": str(root),
+        "project": str(project),
+        "workers_requested": workers,
+        "base_port": base_port,
+        "runtime_substrate": runtime_substrate,
+        "placement": placement,
+        "opencode_path": opencode_path or "",
+        "in_tmux": bool(os.environ.get("TMUX")),
+        "in_rmux": bool(os.environ.get("RMUX")),
+        "registry_path": rel(registry_path(root), root),
+        "registry_exists": bool(registry),
+        "registry_snapshot": registry,
+        "already_live": already_live,
+        "stale_registry": stale_registry,
+        "registry_workers": registry_workers_live,
+        "planned_workers": specs,
+        "errors": errors,
+        "warnings": warnings,
+    }
+
+
+def print_preflight(data: dict[str, Any]) -> None:
+    print(f"root: {data.get('root')}")
+    print(f"project: {data.get('project')}")
+    print(f"runtime_substrate: {data.get('runtime_substrate')}")
+    print(f"placement: {data.get('placement')}")
+    print(f"in_tmux: {str(data.get('in_tmux')).lower()}")
+    print(f"in_rmux: {str(data.get('in_rmux')).lower()}")
+    print(f"opencode_path: {data.get('opencode_path')}")
+    print(f"registry_exists: {str(data.get('registry_exists')).lower()}")
+    print(f"already_live: {str(data.get('already_live')).lower()}")
+    print(f"stale_registry: {str(data.get('stale_registry')).lower()}")
+    print(f"planned_ports: {[worker.get('port') for worker in data.get('planned_workers', [])]}")
+    if data.get("registry_workers"):
+        print("registry_workers:")
+        for worker in data["registry_workers"]:
+            print(
+                f"  {worker.get('worker_id')} port={worker.get('port')} "
+                f"server_live={str(worker.get('server_live')).lower()} "
+                f"doc={str(worker.get('doc_available')).lower()} "
+                f"tui={str(all(worker.get(key) for key in ['tui_clear_prompt', 'tui_append_prompt', 'tui_submit_prompt'])).lower()}"
+            )
+    if data.get("errors"):
+        print("Errors:")
+        for error in data["errors"]:
+            print(f"  - {error}")
+    else:
+        print("Errors: none")
+    if data.get("warnings"):
+        print("Warnings:")
+        for warning in data["warnings"]:
+            print(f"  - {warning}")
+    else:
+        print("Warnings: none")
+
+
+def command_preflight(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    project = Path(args.project).resolve()
+    data = preflight_checks(
+        root,
+        args.workers,
+        args.base_port,
+        project,
+        getattr(args, "runtime_substrate", RUNTIME_SUBSTRATE_AUTO),
+        getattr(args, "placement", PLACEMENT_NEW_WINDOW),
+    )
+    print_preflight(data)
+    return 1 if data["errors"] else 0
+
+
+def mux_current_session(runtime_substrate: str) -> str:
+    substrate = resolve_runtime_substrate(runtime_substrate)
+    if substrate == "tmux":
+        return tmux_caller_scope()["session_name"]
+    args = ["display-message"]
+    args.extend(["-p", "#S"])
+    result = run_argv(mux_argv(substrate, *args), timeout=5)
+    if result.returncode != 0 or not result.stdout.strip():
+        raise LauncherError(
+            f"could not determine current {substrate} session: {result.stderr.strip()}"
+        )
+    return result.stdout.strip()
+
+
+def tmux_shell_command(
+    root: Path,
+    spec: dict[str, Any],
+    opencode_path: str,
+) -> str:
+    exports = {
+        "OMX_WORKER_ID": spec["worker_id"],
+        "OMX_WORKER_BACKEND": BACKEND,
+        "OMX_OPENCODE_HOST": HOSTNAME,
+        "OMX_OPENCODE_PORT": str(spec["port"]),
+    }
+    export_text = " ".join(f"export {key}={shlex.quote(value)};" for key, value in exports.items())
+    return (
+        "bash -lc "
+        + shlex.quote(
+            f"{export_text} exec {shlex.quote(opencode_path)} {shlex.quote(spec['project'])} "
+            f"--hostname {HOSTNAME} --port {int(spec['port'])}"
+        )
+    )
+
+
+def parse_new_window_output(output: str) -> tuple[str, str, str]:
+    parts = output.strip().split()
+    if len(parts) < 3:
+        raise LauncherError(f"unexpected tmux new-window output: {output!r}")
+    return parts[0], parts[1], parts[2]
+
+
+def archive_stale_registry(
+    root: Path,
+    *,
+    expected_snapshot: dict[str, Any] | None = None,
+) -> Path | None:
+    path = registry_path(root)
+    with visible_registry_path_lock(path):
+        current = read_json_safe(path)
+        if expected_snapshot is not None and current != expected_snapshot:
+            raise LauncherError(
+                "fixed worker registry changed during launch preflight; "
+                "refusing stale archive"
+            )
+        if not path.exists():
+            return None
+        backup = path.with_name(path.name + f".bak.{timestamp()}")
+        path.rename(backup)
+    append_log(root, f"archived stale registry {rel(path, root)} -> {rel(backup, root)}")
+    return backup
+
+
+def create_mux_workers(
+    root: Path,
+    specs: list[dict[str, Any]],
+    window_name: str,
+    opencode_path: str,
+    runtime_substrate: str,
+    placement: str = PLACEMENT_NEW_WINDOW,
+) -> dict[str, Any]:
+    substrate = resolve_runtime_substrate(runtime_substrate)
+    placement = resolve_placement(placement, substrate)
+    caller_scope: dict[str, str] | None = None
+    if placement == PLACEMENT_CURRENT_WINDOW:
+        caller_scope = tmux_caller_scope()
+        session = caller_scope["session_name"]
+    else:
+        session = mux_current_session(substrate)
+    first = specs[0]
+    first_command = tmux_shell_command(root, first, opencode_path)
+    if caller_scope:
+        first_launch = run_argv(
+            guarded_mux_argv(
+                substrate,
+                "split-window",
+                "-d",
+                "-P",
+                "-F",
+                "#{session_name}:#{window_index} #{window_id} #{pane_id}",
+                "-t",
+                caller_scope["pane_id"],
+                "-c",
+                first["project"],
+                first_command,
+            ),
+            timeout=10,
+        )
+        append_log(root, f"{substrate} split-window current-window returncode={first_launch.returncode} stdout={first_launch.stdout.strip()!r} stderr={first_launch.stderr.strip()!r}")
+        if first_launch.returncode != 0:
+            raise LauncherError(f"{substrate} split-window failed for current-window placement: {first_launch.stderr.strip()}")
+        target, window_id, first_pane = parse_new_window_output(first_launch.stdout)
+        expected_target = f"{caller_scope['session_name']}:{caller_scope['window_index']}"
+        if target != expected_target or window_id != caller_scope["window_id"]:
+            raise LauncherError(
+                "current-window split result did not match caller window"
+            )
+        window_label = PLACEMENT_CURRENT_WINDOW
+    else:
+        first_launch = run_argv(
+            guarded_mux_argv(
+                substrate,
+                "new-window",
+                "-d",
+                "-P",
+                "-F",
+                "#{session_name}:#{window_index} #{window_id} #{pane_id}",
+                "-t",
+                f"{session}:",
+                "-n",
+                window_name,
+                "-c",
+                first["project"],
+                first_command,
+            ),
+            timeout=10,
+        )
+        append_log(root, f"{substrate} new-window returncode={first_launch.returncode} stdout={first_launch.stdout.strip()!r} stderr={first_launch.stderr.strip()!r}")
+        if first_launch.returncode != 0:
+            raise LauncherError(f"{substrate} new-window failed: {first_launch.stderr.strip()}")
+        target, window_id, first_pane = parse_new_window_output(first_launch.stdout)
+        window_label = window_name
+
+    created: list[dict[str, Any]] = []
+    first_record = dict(first)
+    first_record.update({"tmux_session": session, "tmux_window": target, "tmux_window_id": window_id, "pane_id": first_pane})
+    created.append(first_record)
+    title = run_argv(guarded_mux_argv(substrate, "select-pane", "-t", first_pane, "-T", first["pane_title"]), timeout=5)
+    append_log(root, f"{substrate} select-pane title {first_pane} returncode={title.returncode} stderr={title.stderr.strip()!r}")
+
+    for spec in specs[1:]:
+        split = run_argv(
+            guarded_mux_argv(
+                substrate,
+                "split-window",
+                "-d",
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "-t",
+                window_id,
+                "-c",
+                spec["project"],
+                tmux_shell_command(root, spec, opencode_path),
+            ),
+            timeout=10,
+        )
+        append_log(root, f"{substrate} split-window {spec['worker_id']} returncode={split.returncode} stdout={split.stdout.strip()!r} stderr={split.stderr.strip()!r}")
+        if split.returncode != 0:
+            raise LauncherError(f"{substrate} split-window failed for {spec['worker_id']}: {split.stderr.strip()}")
+        pane_id = split.stdout.strip().splitlines()[-1].strip()
+        record = dict(spec)
+        record.update({"tmux_session": session, "tmux_window": target, "tmux_window_id": window_id, "pane_id": pane_id})
+        created.append(record)
+        title = run_argv(guarded_mux_argv(substrate, "select-pane", "-t", pane_id, "-T", spec["pane_title"]), timeout=5)
+        append_log(root, f"{substrate} select-pane title {pane_id} returncode={title.returncode} stderr={title.stderr.strip()!r}")
+
+    if not caller_scope:
+        layout = run_argv(
+            guarded_mux_argv(substrate, "select-layout", "-t", window_id, "tiled"),
+            timeout=5,
+        )
+        append_log(
+            root,
+            f"{substrate} select-layout returncode={layout.returncode} "
+            f"stderr={layout.stderr.strip()!r}",
+        )
+    panes = run_argv(
+        guarded_mux_argv(
+            substrate,
+            "list-panes",
+            "-t",
+            window_id,
+            "-F",
+            "#{pane_id} #{pane_current_command} #{pane_title} #{pane_pid} #{pane_current_path}",
+        ),
+        timeout=5,
+    )
+    append_log(root, f"{substrate} list-panes new window returncode={panes.returncode} stdout={panes.stdout.strip()!r} stderr={panes.stderr.strip()!r}")
+    if caller_scope:
+        restore = run_argv(
+            guarded_mux_argv(
+                substrate,
+                "select-pane",
+                "-t",
+                caller_scope["pane_id"],
+            ),
+            timeout=5,
+        )
+        append_log(root, f"{substrate} select-pane restore {caller_scope['pane_id']} returncode={restore.returncode} stderr={restore.stderr.strip()!r}")
+
+    return {
+        "runtime_substrate": substrate,
+        "tmux_session": session,
+        "tmux_window": target,
+        "tmux_window_id": window_id,
+        "tmux_window_name": window_label,
+        "tmux_panes_after_launch": panes.stdout.splitlines(),
+        "workers": created,
+    }
+
+
+def verify_registry(root: Path, registry: dict[str, Any], write: bool = True) -> dict[str, Any]:
+    workers = probe_registry_workers(registry)
+    pane_lines: list[str] = []
+    pane_errors: list[str] = []
+    runtime_substrate = resolve_runtime_substrate(str(registry.get("runtime_substrate") or RUNTIME_SUBSTRATE_AUTO))
+    window_id = registry.get("tmux_window_id") or registry.get("tmux_window")
+    if window_id:
+        result = run_argv(
+            guarded_mux_argv(
+                runtime_substrate,
+                "list-panes",
+                "-t",
+                str(window_id),
+                "-F",
+                "#{pane_id} #{pane_current_command} #{pane_title} #{pane_pid} #{pane_current_path}",
+            ),
+            timeout=5,
+        )
+        if result.returncode == 0:
+            pane_lines = result.stdout.splitlines()
+        else:
+            pane_errors.append(result.stderr.strip())
+    pane_ids = {line.split()[0] for line in pane_lines if line.split()}
+    updated_workers: list[dict[str, Any]] = []
+    for worker in workers:
+        worker = dict(worker)
+        worker["pane_exists"] = bool(worker.get("pane_id") in pane_ids)
+        updated_workers.append(worker)
+
+    updated = dict(registry)
+    updated["workers"] = updated_workers
+    updated["last_verified_at"] = utc_now()
+    updated["runtime_substrate"] = runtime_substrate
+    updated["tmux_panes_last_seen"] = pane_lines
+    updated["tmux_pane_errors"] = pane_errors
+    updated["fixed_workers_ready"] = bool(updated_workers) and all(
+        worker.get("server_live")
+        and worker.get("doc_available")
+        and worker.get("tui_clear_prompt")
+        and worker.get("tui_append_prompt")
+        and worker.get("tui_submit_prompt")
+        for worker in updated_workers
+    )
+    updated["ready_for_phase_3B_submit_real"] = any(
+        worker.get("server_live")
+        and worker.get("doc_available")
+        and worker.get("tui_clear_prompt")
+        and worker.get("tui_append_prompt")
+        and worker.get("tui_submit_prompt")
+        for worker in updated_workers
+    )
+    if write:
+        commit_fixed_registry(
+            root,
+            updated,
+            expected_snapshot=registry,
+        )
+    return updated
+
+
+def command_launch(args: argparse.Namespace) -> int:
+    if not args.allow_launch:
+        raise LauncherError("launch requires --allow-launch")
+    runtime_substrate = resolve_runtime_substrate(
+        getattr(
+            args,
+            "runtime_substrate",
+            RUNTIME_SUBSTRATE_AUTO,
+        )
+    )
+    resolve_placement(
+        getattr(args, "placement", PLACEMENT_NEW_WINDOW),
+        runtime_substrate,
+    )
+    if runtime_substrate == "tmux":
+        try:
+            tmux_caller_scope()
+        except LauncherError as exc:
+            print("Errors:")
+            print(f"  - {exc}")
+            return 1
+    root = root_path(args.root)
+    with launch_serialization_lock(root):
+        return _command_launch_locked(args, root)
+
+
+def command_rebind_current_window(args: argparse.Namespace) -> int:
+    if not args.allow_rebind:
+        raise LauncherError(
+            "rebind-current-window requires --allow-rebind"
+        )
+    runtime_substrate = resolve_runtime_substrate(
+        getattr(
+            args,
+            "runtime_substrate",
+            RUNTIME_SUBSTRATE_AUTO,
+        )
+    )
+    if runtime_substrate != "tmux":
+        raise LauncherError(
+            "rebind-current-window requires the tmux runtime substrate"
+        )
+    caller_scope = tmux_caller_scope()
+    root = root_path(args.root)
+    with launch_serialization_lock(root):
+        registry = read_json_safe(registry_path(root))
+        workers = registry.get("workers", [])
+        if not isinstance(workers, list) or not workers:
+            raise LauncherError(
+                "fixed worker registry has no workers to rebind"
+            )
+        registry_session = registry.get("tmux_session")
+        if registry_session != caller_scope["session_name"]:
+            raise LauncherError(
+                f"fixed worker registry belongs to tmux session "
+                f"{registry_session or '<missing>'!r}; "
+                f"refusing cross-session rebind from "
+                f"{caller_scope['session_name']!r}"
+            )
+        rebound: list[dict[str, Any]] = []
+        for worker in workers:
+            if not isinstance(worker, dict):
+                raise LauncherError(
+                    "fixed worker registry contains invalid worker"
+                )
+            rebound.append(
+                {
+                    **worker,
+                    **discover_current_window_worker(
+                        root,
+                        int(worker["port"]),
+                        caller_scope,
+                    ),
+                }
+            )
+        updated = {
+            **registry,
+            "tmux_session": caller_scope["session_name"],
+            "tmux_window": caller_window(caller_scope),
+            "tmux_window_id": caller_scope["window_id"],
+            "workers": rebound,
+            "last_rebound_at": utc_now(),
+        }
+        commit_fixed_registry(
+            root,
+            updated,
+            expected_snapshot=registry,
+        )
+    print("rebind_current_window: true")
+    return 0
+
+
+def _command_append_locked(
+    args: argparse.Namespace,
+    root: Path,
+    project: Path,
+    placement: str,
+    preflight: dict[str, Any],
+) -> int:
+    if args.workers != 1:
+        raise LauncherError("--append requires --workers 1")
+    if placement != PLACEMENT_CURRENT_WINDOW:
+        raise LauncherError("--append requires --placement current-window")
+    if preflight["stale_registry"] or not preflight["already_live"]:
+        raise LauncherError(
+            "--append requires a live fixed registry; use normal launch after reboot"
+        )
+    registry = preflight.get("registry_snapshot")
+    workers = registry.get("workers", []) if isinstance(registry, dict) else []
+    if not isinstance(workers, list) or not workers:
+        raise LauncherError("--append requires a fixed registry with workers")
+    caller_scope = tmux_caller_scope()
+    expected_window = caller_window(caller_scope)
+    if (
+        registry.get("tmux_session") != caller_scope["session_name"]
+        or registry.get("tmux_window") != expected_window
+        or registry.get("tmux_window_id") != caller_scope["window_id"]
+    ):
+        raise LauncherError(
+            "fixed worker registry is not bound to the caller window; "
+            "run rebind-current-window"
+        )
+
+    worker_numbers: list[int] = []
+    registered_ports: set[int] = set()
+    for worker in workers:
+        if not isinstance(worker, dict):
+            raise LauncherError("fixed worker registry contains invalid worker")
+        worker_id = str(worker.get("worker_id") or "")
+        if not worker_id.startswith("w") or not worker_id[1:].isdigit():
+            raise LauncherError(
+                f"fixed worker registry has invalid worker id: {worker_id!r}"
+            )
+        worker_numbers.append(int(worker_id[1:]))
+        try:
+            port = int(worker["port"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise LauncherError(
+                f"fixed worker registry has invalid port for {worker_id}"
+            ) from exc
+        if port in registered_ports:
+            raise LauncherError(
+                f"fixed worker registry has duplicate port {port}"
+            )
+        registered_ports.add(port)
+        identity = discover_current_window_worker(
+            root,
+            port,
+            caller_scope,
+        )
+        if any(
+            worker.get(key) != identity.get(key)
+            for key in (
+                *FIXED_WORKER_IDENTITY_FIELDS,
+                "tmux_session",
+                "tmux_window",
+                "tmux_window_id",
+            )
+        ):
+            raise LauncherError(
+                f"fixed worker {worker_id} identity changed; "
+                "run rebind-current-window"
+            )
+
+    if len(worker_numbers) != len(set(worker_numbers)):
+        raise LauncherError("fixed worker registry has duplicate worker ids")
+    if args.base_port in registered_ports:
+        raise LauncherError(
+            f"--append port {args.base_port} is already in the fixed registry"
+        )
+    if is_port_open(args.base_port):
+        raise LauncherError(
+            f"--append port {args.base_port} is already listening"
+        )
+
+    spec = worker_specs(
+        1,
+        args.base_port,
+        project,
+        root,
+        first_worker_number=max(worker_numbers) + 1,
+    )[0]
+    opencode_path = shutil.which("opencode") or "opencode"
+    launch_data = create_mux_workers(
+        root,
+        [spec],
+        f"opencode-append-{timestamp()}",
+        opencode_path,
+        "tmux",
+        placement=PLACEMENT_CURRENT_WINDOW,
+    )
+    new_workers = launch_data.get("workers", [])
+    if (
+        len(new_workers) != 1
+        or new_workers[0].get("worker_id") != spec["worker_id"]
+        or new_workers[0].get("port") != spec["port"]
+        or launch_data.get("tmux_session") != caller_scope["session_name"]
+        or launch_data.get("tmux_window") != expected_window
+        or launch_data.get("tmux_window_id") != caller_scope["window_id"]
+    ):
+        raise LauncherError(
+            "current-window append result did not match the requested worker"
+        )
+
+    candidate = {
+        **registry,
+        "runtime_substrate": "tmux",
+        "tmux_session": caller_scope["session_name"],
+        "tmux_window": expected_window,
+        "tmux_window_id": caller_scope["window_id"],
+        "tmux_window_name": launch_data.get(
+            "tmux_window_name",
+            PLACEMENT_CURRENT_WINDOW,
+        ),
+        "placement": PLACEMENT_CURRENT_WINDOW,
+        "tmux_panes_after_launch": launch_data.get(
+            "tmux_panes_after_launch",
+            [],
+        ),
+        "workers": [*workers, new_workers[0]],
+        "last_append_requested_at": utc_now(),
+    }
+    deadline = time.time() + 30
+    verified = candidate
+    appended_live = False
+    while time.time() < deadline:
+        verified = verify_registry(root, verified, write=False)
+        appended_live = any(
+            worker.get("worker_id") == spec["worker_id"]
+            and worker.get("server_live")
+            for worker in verified.get("workers", [])
+        )
+        if appended_live:
+            break
+        time.sleep(2)
+    if not appended_live:
+        raise LauncherError(
+            f"appended worker {spec['worker_id']} did not become live"
+        )
+
+    identity = discover_current_window_worker(
+        root,
+        spec["port"],
+        caller_scope,
+    )
+    updated = {
+        **verified,
+        "workers": [
+            {
+                **worker,
+                **identity,
+            }
+            if worker.get("worker_id") == spec["worker_id"]
+            else worker
+            for worker in verified["workers"]
+        ],
+        "last_appended_at": utc_now(),
+    }
+    commit_fixed_registry(
+        root,
+        updated,
+        expected_snapshot=registry,
+    )
+    verified = verify_registry(root, updated, write=True)
+    print(f"appended_worker: {spec['worker_id']}")
+    print(f"registry: {rel(registry_path(root), root)}")
+    print_status_table(verified)
+    return 0
+
+
+def _command_launch_locked(
+    args: argparse.Namespace,
+    root: Path,
+) -> int:
+    project = Path(args.project).resolve()
+    runtime_substrate = resolve_runtime_substrate(getattr(args, "runtime_substrate", RUNTIME_SUBSTRATE_AUTO))
+    placement = resolve_placement(
+        getattr(args, "placement", PLACEMENT_NEW_WINDOW),
+        runtime_substrate,
+    )
+    preflight = preflight_checks(
+        root,
+        args.workers,
+        args.base_port,
+        project,
+        runtime_substrate,
+        placement,
+    )
+    if preflight["errors"]:
+        print_preflight(preflight)
+        return 1
+    if bool(getattr(args, "append", False)):
+        return _command_append_locked(
+            args,
+            root,
+            project,
+            placement,
+            preflight,
+        )
+    if preflight["already_live"]:
+        registry = read_json_safe(registry_path(root))
+        verified = verify_registry(root, registry, write=True)
+        print("already_live: true")
+        print(f"registry: {rel(registry_path(root), root)}")
+        print_status_table(verified)
+        return 0
+    if preflight["stale_registry"]:
+        archive_stale_registry(
+            root,
+            expected_snapshot=preflight.get("registry_snapshot"),
+        )
+
+    specs = worker_specs(args.workers, args.base_port, project, root)
+    opencode_path = shutil.which("opencode") or "opencode"
+    window_name = f"omx-opencode-workers-{timestamp()}"
+    append_log(root, f"launch requested substrate={runtime_substrate} placement={placement} workers={args.workers} base_port={args.base_port} project={project} window={window_name}")
+    launch_data = create_mux_workers(
+        root,
+        specs,
+        window_name,
+        opencode_path,
+        runtime_substrate,
+        placement=placement,
+    )
+    registry = {
+        "schema_version": 1,
+        "created_at": utc_now(),
+        "root": str(root),
+        "project": str(project),
+        "backend": BACKEND,
+        "runtime_substrate": launch_data["runtime_substrate"],
+        "tmux_session": launch_data["tmux_session"],
+        "tmux_window": launch_data["tmux_window"],
+        "tmux_window_id": launch_data["tmux_window_id"],
+        "tmux_window_name": launch_data.get("tmux_window_name", window_name),
+        "placement": placement,
+        "tmux_panes_after_launch": launch_data["tmux_panes_after_launch"],
+        "workers": launch_data["workers"],
+        "notes": [
+            "Created by explicit --allow-launch in phase 3B-0.",
+            "No tmux input command was used.",
+            "No OpenCode mutating HTTP endpoint was called.",
+            "Do not kill or reuse unmanaged existing OpenCode panes.",
+        ],
+    }
+    commit_fixed_registry(root, registry, require_absent=True)
+
+    deadline = time.time() + 30
+    verified = registry
+    while time.time() < deadline:
+        verified = verify_registry(root, verified, write=True)
+        if any(worker.get("server_live") for worker in verified.get("workers", [])):
+            break
+        time.sleep(2)
+    verified = verify_registry(root, verified, write=True)
+
+    print(f"launched_window: {verified.get('tmux_window_name')} ({verified.get('tmux_window')})")
+    print(f"registry: {rel(registry_path(root), root)}")
+    print_status_table(verified)
+    return 0
+
+
+def command_verify(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    registry = read_json_safe(registry_path(root))
+    if not registry:
+        raise LauncherError(f"registry not found: {rel(registry_path(root), root)}")
+    verified = verify_registry(root, registry, write=True)
+    print(f"registry: {rel(registry_path(root), root)}")
+    print_status_table(verified)
+    return 0
+
+
+def print_status_table(registry: dict[str, Any]) -> None:
+    print("WORKER  PANE   PORT  SERVER  HEALTH  DOC  STATUS  EVENT  CLEAR  APPEND  SUBMIT")
+    for worker in registry.get("workers", []):
+        event_ok = bool(worker.get("global_event_available") or worker.get("event_available"))
+        print(
+            f"{str(worker.get('worker_id', '')):<7} "
+            f"{str(worker.get('pane_id', '')):<6} "
+            f"{str(worker.get('port', '')):<5} "
+            f"{str(bool(worker.get('server_live'))).lower():<7} "
+            f"{str(bool(worker.get('global_health_available'))).lower():<7} "
+            f"{str(bool(worker.get('doc_available'))).lower():<4} "
+            f"{str(bool(worker.get('session_status_available'))).lower():<7} "
+            f"{str(event_ok).lower():<6} "
+            f"{str(bool(worker.get('tui_clear_prompt'))).lower():<6} "
+            f"{str(bool(worker.get('tui_append_prompt'))).lower():<7} "
+            f"{str(bool(worker.get('tui_submit_prompt'))).lower():<6}"
+        )
+
+
+def command_status(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    registry = read_json_safe(registry_path(root))
+    if not registry:
+        raise LauncherError(f"registry not found: {rel(registry_path(root), root)}")
+    print(f"registry: {rel(registry_path(root), root)}")
+    print(f"runtime_substrate: {registry.get('runtime_substrate') or '-'}")
+    print(f"tmux_window: {registry.get('tmux_window_name', '')} ({registry.get('tmux_window', '')})")
+    print_status_table(registry)
+    return 0
+
+
+def command_stop_plan(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    registry = read_json_safe(registry_path(root))
+    if not registry:
+        raise LauncherError(f"registry not found: {rel(registry_path(root), root)}")
+    lines = [
+        "# OpenCode Fixed Worker Stop Plan",
+        "",
+        f"Generated at: `{utc_now()}`",
+        "",
+        "This is a plan only. It does not stop or interrupt anything.",
+        "",
+        f"- runtime_substrate: `{registry.get('runtime_substrate') or '-'}`",
+        f"- tmux window: `{registry.get('tmux_window_name', '')}` / `{registry.get('tmux_window', '')}`",
+        f"- tmux session: `{registry.get('tmux_session', '')}`",
+        "",
+        "## Panes To Confirm Before Any Future Manual Shutdown",
+        "",
+    ]
+    for worker in registry.get("workers", []):
+        lines.append(
+            f"- `{worker.get('worker_id')}` pane `{worker.get('pane_id')}` "
+            f"port `{worker.get('port')}` command `{worker.get('command')}`"
+        )
+    lines.extend([
+        "",
+        "No automated stop command is implemented in phase 3B-0.",
+        "Do not close these panes unless the user explicitly authorizes that lifecycle action.",
+        "",
+    ])
+    path = ensure_framework(root) / "OPENCODE_WORKER_STOP_PLAN.md"
+    path.write_text("\n".join(lines), encoding="utf-8")
+    print(f"stop_plan: {rel(path, root)}")
+    for line in lines:
+        print(line)
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Phase 3B-0 fixed-port OpenCode TUI worker launcher. Defaults are non-launching; "
+            "launch requires --allow-launch and only creates new mux window/panes."
+        )
+    )
+    parser.add_argument("--version", action="version", version="omx_opencode_worker_launcher phase-3B-0")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    plan = sub.add_parser("plan", help="generate fixed-port worker launch plan without starting anything")
+    plan.add_argument("--root", default=".")
+    plan.add_argument("--workers", type=int, default=3)
+    plan.add_argument("--base-port", type=int, default=4101)
+    plan.add_argument("--project", default=str(workspace_root()))
+    plan.add_argument("--runtime-substrate", default=RUNTIME_SUBSTRATE_AUTO, choices=RUNTIME_SUBSTRATE_CHOICES)
+    plan.add_argument("--placement", default=PLACEMENT_NEW_WINDOW, choices=PLACEMENT_CHOICES)
+    plan.set_defaults(func=command_plan)
+
+    preflight = sub.add_parser("preflight", help="check tmux, opencode, state isolation, registry, and port availability")
+    preflight.add_argument("--root", default=".")
+    preflight.add_argument("--workers", type=int, default=3)
+    preflight.add_argument("--base-port", type=int, default=4101)
+    preflight.add_argument("--project", default=str(workspace_root()))
+    preflight.add_argument("--runtime-substrate", default=RUNTIME_SUBSTRATE_AUTO, choices=RUNTIME_SUBSTRATE_CHOICES)
+    preflight.add_argument("--placement", default=PLACEMENT_NEW_WINDOW, choices=PLACEMENT_CHOICES)
+    preflight.set_defaults(func=command_preflight)
+
+    launch = sub.add_parser("launch", help="create fixed-port OpenCode workers in an explicit tmux placement")
+    launch.add_argument("--root", default=".")
+    launch.add_argument("--workers", type=int, default=3)
+    launch.add_argument("--base-port", type=int, default=4101)
+    launch.add_argument("--project", default=str(workspace_root()))
+    launch.add_argument("--runtime-substrate", default=RUNTIME_SUBSTRATE_AUTO, choices=RUNTIME_SUBSTRATE_CHOICES)
+    launch.add_argument("--placement", default=PLACEMENT_NEW_WINDOW, choices=PLACEMENT_CHOICES)
+    launch.add_argument("--allow-launch", action="store_true")
+    launch.add_argument(
+        "--append",
+        action="store_true",
+        help="append one worker to a rebound current-window fixed registry",
+    )
+    launch.set_defaults(func=command_launch)
+
+    rebind = sub.add_parser(
+        "rebind-current-window",
+        help="explicitly rediscover fixed workers in the caller tmux window",
+    )
+    rebind.add_argument("--root", default=".")
+    rebind.add_argument(
+        "--runtime-substrate",
+        default=RUNTIME_SUBSTRATE_AUTO,
+        choices=RUNTIME_SUBSTRATE_CHOICES,
+    )
+    rebind.add_argument("--allow-rebind", action="store_true")
+    rebind.set_defaults(func=command_rebind_current_window)
+
+    verify = sub.add_parser("verify", help="read registry, verify panes and server endpoints, and update registry")
+    verify.add_argument("--root", default=".")
+    verify.set_defaults(func=command_verify)
+
+    status = sub.add_parser("status", help="print registry status without probing or changing runtime state")
+    status.add_argument("--root", default=".")
+    status.set_defaults(func=command_status)
+
+    stop_plan = sub.add_parser("stop-plan", help="generate a non-executing stop plan")
+    stop_plan.add_argument("--root", default=".")
+    stop_plan.set_defaults(func=command_stop_plan)
+    for command_parser in sub.choices.values():
+        command_parser.set_defaults(root=None)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return int(args.func(args))
+    except LauncherError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("ERROR: interrupted", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

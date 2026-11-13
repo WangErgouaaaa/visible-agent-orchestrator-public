@@ -1,0 +1,1170 @@
+#!/usr/bin/env python3
+"""Owned-process multiworker smoke harness for visible OpenCode workers."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable
+
+_THIS_FILE = Path(__file__).resolve()
+for _p in ((_THIS_FILE.parent.parent / "src").resolve(), (_THIS_FILE.parent.parent / "lib").resolve()):
+    if _p.exists() and str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
+
+from visible_agent_orchestrator.runtime_paths import runtime_root, workspace_root
+
+
+NOOP_BODY = (
+    "这是 visible-agent-orchestrator skill 安装后的 {worker_count}-worker live no-op smoke，"
+    "不是业务任务。不要修改配置的业务工作区 "
+    "或任何业务项目文件。不要修改任何 git index。只允许写当前 visible-run "
+    "任务目录中的 report/marker。请使用 prompt 中的 omx_task_signal 写 "
+    ".received、.started，写 report.md 说明：1. worker_id 是 {worker}；"
+    "2. skill 已安装并被识别；3. RuntimeAdapter-backed tmux-reference live path 可用；"
+    "4. rmux default=false 且本轮未使用 rmux；5. 没有修改业务文件。"
+    "最后 finish --state done。finish 后立即停止输出，只保留最多一行 OMX_TASK_CLOSED."
+)
+NATIVE_NOOP_BODY = (
+    "这是 Phase 5 的 {worker_count}-worker native arena smoke，不是业务任务。"
+    "不要修改配置的业务工作区或任何业务项目文件。"
+    "不要修改任何 git index。只允许写当前 visible-run 任务目录中的 report/marker。"
+    "请使用 prompt 中的 omx_task_signal 写 .received、.started，写 report.md 说明："
+    "1. worker_id 是 {worker}；"
+    "2. submit path 使用 official opencode run --attach semantics；"
+    "3. 当前 worker 通过 rmux-reference live control plane 执行；"
+    "4. 本轮未修改业务文件；"
+    "5. 这是 arena/fan-in smoke 的一个 worker 结果。"
+    "最后 finish --state done。finish 后立即停止输出，只保留最多一行 OMX_TASK_CLOSED."
+)
+
+WRITER_REVIEWER_SCENARIO = "writer-reviewer-sandbox"
+SCENARIOS = ["noop", WRITER_REVIEWER_SCENARIO]
+DISPATCH_MODES = ["legacy", "native"]
+
+
+RunCommand = Callable[..., subprocess.CompletedProcess[str]]
+
+
+class SmokeError(Exception):
+    """Operator-facing smoke failure."""
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def parse_workers(value: str) -> list[str]:
+    workers = [item.strip() for item in value.split(",") if item.strip()]
+    if not workers:
+        raise SmokeError("--workers must name at least one worker")
+    for worker in workers:
+        if worker in {".", ".."} or "/" in worker or "\\" in worker or "\x00" in worker:
+            raise SmokeError(f"invalid worker id: {worker!r}")
+    return workers
+
+
+def artifact_dir(root: Path, timestamp: str) -> Path:
+    return root / ".omx" / "framework" / "team" / "multiworker-smoke-runs" / timestamp
+
+
+def sandbox_artifact_dir(root: Path, timestamp: str) -> Path:
+    return root / ".omx" / "framework" / "team" / "multiworker-sandbox-runs" / timestamp / "writer-reviewer"
+
+
+def dispatch_executable() -> str:
+    return os.environ.get("OMX_MULTIWORKER_SMOKE_DISPATCH", "./bin/omx_visible_dispatch")
+
+
+def visible_command(root: Path, *args: str) -> list[str]:
+    return [str(root / "bin" / args[0]), *args[1:]]
+
+
+def writer_output_path(sandbox_root: Path) -> Path:
+    return sandbox_root / "sandbox" / "writer-output.json"
+
+
+def writer_notes_path(sandbox_root: Path) -> Path:
+    return sandbox_root / "sandbox" / "writer-notes.md"
+
+
+def writer_body(worker: str, sandbox_root: Path) -> str:
+    output = writer_output_path(sandbox_root)
+    notes = writer_notes_path(sandbox_root)
+    return (
+        "这是 writer-reviewer sandbox smoke。"
+        f"worker_id 必须是 {worker}。这是 sandbox 任务，不是业务任务。"
+        f"WRITER_OUTPUT_PATH={output} WRITER_NOTES_PATH={notes} "
+        f"allowed_write_paths: [{output}, {notes}]。"
+        "只允许写 sandbox/writer-output.json 和 sandbox/writer-notes.md，以及当前 visible-run task report/marker。"
+        "禁止修改配置的业务工作区。禁止修改任何 git index。禁止修改 source repo。"
+        "禁止写 .omx/state/team。禁止使用 rmux。"
+        "写 writer-output.json，内容至少包含 scenario: writer-reviewer-sandbox, role: writer, "
+        f"worker_id: {worker}, policy_violation: false, "
+        f"actual_written_files: [\"{output}\", \"{notes}\"], rmux_used: false, business_repo_modified: false。"
+        "写 writer-notes.md，说明文件级互斥规则。写 report.md，总结实际修改文件和验证。"
+        "最后 finish --state done。finish 后立即停止输出，只保留最多一行 OMX_TASK_CLOSED."
+    )
+
+
+def reviewer_body(worker: str, sandbox_root: Path) -> str:
+    output = writer_output_path(sandbox_root)
+    notes = writer_notes_path(sandbox_root)
+    return (
+        f"worker_id 必须是 {worker}。role: reviewer。这是 sandbox review，不是业务任务。"
+        f"只读审计 sandbox/writer-output.json 和 sandbox/writer-notes.md：{output} 和 {notes}。"
+        "不允许修改 sandbox files。不允许修改配置的业务工作区。不允许修改任何 git index。"
+        "不允许修改 source repo。不允许写 .omx/state/team。不允许使用 rmux。"
+        "只允许写当前 visible-run task report/marker。report.md 必须包含："
+        f"reviewer_worker_id: {worker}; reviewed_files; sandbox_modified_by_reviewer: false; "
+        "policy_violation: false; whether writer-output.json declares policy_violation=false; "
+        "whether writer actual_written_files stay within allowed_write_paths; remaining_risks。"
+        "最后 finish --state done。finish 后立即停止输出，只保留最多一行 OMX_TASK_CLOSED."
+    )
+
+
+def run_one_command(
+    worker: str,
+    scenario: str,
+    timeout: int,
+    *,
+    dispatch_mode: str = "legacy",
+    dispatch: str | None = None,
+    role: str | None = None,
+    sandbox_root: Path | None = None,
+    worker_count: int | None = None,
+) -> list[str]:
+    if scenario not in SCENARIOS:
+        raise SmokeError(f"unsupported scenario: {scenario}")
+    if dispatch_mode not in DISPATCH_MODES:
+        raise SmokeError(f"unsupported dispatch mode: {dispatch_mode}")
+    if (
+        scenario == WRITER_REVIEWER_SCENARIO
+        and dispatch_mode == "native"
+    ):
+        raise SmokeError(
+            "writer-reviewer-sandbox requires rotation-capable run-one"
+        )
+    if scenario == WRITER_REVIEWER_SCENARIO:
+        if role not in {"writer", "reviewer"}:
+            raise SmokeError("writer-reviewer-sandbox requires role=writer or role=reviewer")
+        if sandbox_root is None:
+            raise SmokeError("writer-reviewer-sandbox requires sandbox_root")
+        title = f"skill-live-two-worker-writer-reviewer-sandbox：{role}：{worker}"
+        body = writer_body(worker, sandbox_root) if role == "writer" else reviewer_body(worker, sandbox_root)
+    else:
+        count = worker_count or 1
+        if dispatch_mode == "native":
+            title = f"phase5-live-{count}-worker-native-arena-smoke：{worker}"
+            body = NATIVE_NOOP_BODY.format(worker_count=count, worker=worker)
+        else:
+            title = f"skill-live-{count}-worker-noop-smoke：{worker}"
+            body = NOOP_BODY.format(worker_count=count, worker=worker)
+    session_args = [
+        "--session-action",
+        "rotate",
+        "--session-action-reason",
+        "role_isolation",
+        "--rotation-reason",
+        "role_isolation",
+        "--rehydration-packet-type",
+        "clean-room-review",
+    ] if role == "reviewer" else [
+        "--session-action",
+        "keep",
+        "--session-action-reason",
+        "same_domain_continuation",
+    ]
+    return [
+        dispatch or dispatch_executable(),
+        "run-one-native" if dispatch_mode == "native" else "run-one",
+        "--root",
+        ".",
+        "--worker",
+        worker,
+        "--title",
+        title,
+        "--body",
+        body,
+        "--timeout",
+        str(timeout),
+        *session_args,
+        "--allow-real",
+    ]
+
+
+def writer_reviewer_phases(workers: list[str]) -> list[dict[str, Any]]:
+    if len(workers) != 2:
+        raise SmokeError("writer-reviewer-sandbox requires exactly two workers")
+    return [
+        {"phase": 1, "role": "writer", "worker": workers[0]},
+        {"phase": 2, "role": "reviewer", "worker": workers[1]},
+    ]
+
+
+def run_one_commands(
+    workers: list[str],
+    scenario: str,
+    timeout: int,
+    *,
+    dispatch_mode: str = "legacy",
+    dispatch: str | None = None,
+    sandbox_root: Path | None = None,
+) -> list[list[str]]:
+    if scenario == WRITER_REVIEWER_SCENARIO:
+        if sandbox_root is None:
+            sandbox_root = sandbox_artifact_dir(runtime_root(), "<timestamp>")
+        return [
+            run_one_command(
+                phase["worker"],
+                scenario,
+                timeout,
+                dispatch_mode=dispatch_mode,
+                dispatch=dispatch,
+                role=phase["role"],
+                sandbox_root=sandbox_root,
+            )
+            for phase in writer_reviewer_phases(workers)
+        ]
+    return [
+        run_one_command(worker, scenario, timeout, dispatch_mode=dispatch_mode, dispatch=dispatch, worker_count=len(workers))
+        for worker in workers
+    ]
+
+
+def default_max_parallel(workers: list[str], scenario: str) -> int:
+    if scenario == WRITER_REVIEWER_SCENARIO:
+        return 1
+    return min(len(workers), 3)
+
+
+def resolve_max_parallel(workers: list[str], scenario: str, max_parallel: int | None) -> int:
+    value = default_max_parallel(workers, scenario) if max_parallel is None else max_parallel
+    if value < 1:
+        raise SmokeError("--max-parallel must be >= 1")
+    if value > len(workers):
+        raise SmokeError("--max-parallel must not exceed worker count")
+    return value
+
+
+def worker_waves(workers: list[str], scenario: str, max_parallel: int | None = None) -> list[list[str]]:
+    resolved = resolve_max_parallel(workers, scenario, max_parallel)
+    return [workers[index : index + resolved] for index in range(0, len(workers), resolved)]
+
+
+def wave_plan(
+    workers: list[str],
+    scenario: str,
+    timeout: int,
+    max_parallel: int | None,
+    *,
+    dispatch_mode: str = "legacy",
+    dispatch: str | None = None,
+    sandbox_root: Path | None = None,
+) -> list[dict[str, Any]]:
+    commands = run_one_commands(workers, scenario, timeout, dispatch_mode=dispatch_mode, dispatch=dispatch, sandbox_root=sandbox_root)
+    commands_by_worker = dict(zip(workers, commands))
+    return [
+        {
+            "wave": index,
+            "workers": wave_workers,
+            "commands": [commands_by_worker[worker] for worker in wave_workers],
+        }
+        for index, wave_workers in enumerate(worker_waves(workers, scenario, max_parallel), start=1)
+    ]
+
+
+def settle_commands(root: Path, workers: list[str]) -> list[list[str]]:
+    return [
+        [
+            str(root / "bin" / "omx_visible_dispatch"),
+            "settle-latest",
+            "--root",
+            ".",
+            "--worker",
+            worker,
+            "--allow-terminal-archive",
+        ]
+        for worker in workers
+    ]
+
+
+def read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        return ""
+
+
+def write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    digest.update(path.name.encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def hash_writer_files(sandbox_root: Path) -> str:
+    digest = hashlib.sha256()
+    for path in [writer_output_path(sandbox_root), writer_notes_path(sandbox_root)]:
+        digest.update(str(path.relative_to(sandbox_root)).encode("utf-8"))
+        digest.update(b"\0")
+        if path.exists():
+            digest.update(path.read_bytes())
+        else:
+            digest.update(b"<missing>")
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def extract_field(text: str, name: str) -> str:
+    match = re.search(rf"^{re.escape(name)}:\s*(.+)$", text, flags=re.MULTILINE)
+    return match.group(1).strip() if match else ""
+
+
+def extract_new_task(stdout: str) -> dict[str, str]:
+    segment = stdout.split("== new-task ==", 1)[1] if "== new-task ==" in stdout else stdout
+    return {
+        "run_id": extract_field(segment, "run_id"),
+        "task_id": extract_field(segment, "task_id") or "task-001",
+        "task_dir": extract_field(segment, "task_dir"),
+    }
+
+
+def extract_finalize(stdout: str) -> dict[str, Any]:
+    segment = stdout.split("== finalize-summary ==", 1)[1] if "== finalize-summary ==" in stdout else stdout
+    return {
+        "protocol_terminal_state": extract_field(segment, "protocol_terminal_state"),
+        "summary_reconciled": extract_field(segment, "summary_reconciled") == "true",
+        "stale_summary_detected": extract_field(segment, "stale_summary_detected") == "true",
+        "lock_archived_by_finalizer": extract_field(segment, "lock_archived_by_finalizer") == "true",
+        "wait_result": extract_field(stdout, "wait_result"),
+        "pending_after_timeout": extract_field(stdout, "pending_after_timeout") == "true",
+        "needs_settle": extract_field(stdout, "needs_settle") == "true",
+    }
+
+
+def task_truth(root: Path, run_id: str, task_id: str, task_dir_text: str = "") -> dict[str, Any]:
+    if task_dir_text:
+        task_dir = Path(task_dir_text)
+        if not task_dir.is_absolute():
+            task_dir = root / task_dir
+    else:
+        task_dir = root / ".omx" / "framework" / "team" / "visible-runs" / run_id / "tasks" / task_id
+    report = task_dir / "report.md"
+    markers = sorted(path.name for path in [task_dir / ".done", task_dir / ".fail", task_dir / ".blocked"] if path.exists())
+    marker_paths = [task_dir / name for name in markers]
+    state_by_marker = {".done": "completed", ".fail": "failed", ".blocked": "blocked"}
+    return {
+        "task_dir": str(task_dir),
+        "report_path": str(report),
+        "report_exists": report.exists(),
+        "report_bytes": report.stat().st_size if report.exists() else 0,
+        "terminal_markers": markers,
+        "terminal_marker_count": len(markers),
+        "terminal_marker": markers[0] if len(markers) == 1 else "",
+        "terminal_state": state_by_marker.get(markers[0], "") if len(markers) == 1 else "",
+        "terminal_marker_path": str(marker_paths[0]) if len(marker_paths) == 1 else "",
+        "terminal_marker_mtime": marker_paths[0].stat().st_mtime if len(marker_paths) == 1 and marker_paths[0].exists() else None,
+    }
+
+
+def fan_in_worker_entry(worker: str, process_record: dict[str, Any]) -> dict[str, Any]:
+    truth = process_record.get("truth", {})
+    return {
+        "worker": worker,
+        "run_id": process_record.get("run_id", ""),
+        "task_id": process_record.get("task_id", ""),
+        "protocol_terminal_state": process_record.get("protocol_terminal_state") or truth.get("terminal_state") or "",
+        "wait_result": process_record.get("wait_result", ""),
+        "report_path": truth.get("report_path", ""),
+        "report_bytes": truth.get("report_bytes", 0),
+        "terminal_marker": truth.get("terminal_marker", ""),
+        "terminal_marker_path": truth.get("terminal_marker_path", ""),
+        "terminal_marker_mtime": truth.get("terminal_marker_mtime"),
+        "returncode": process_record.get("returncode"),
+    }
+
+
+def build_fan_in_summary(processes: dict[str, dict[str, Any]], dispatch_mode: str) -> dict[str, Any]:
+    workers = [fan_in_worker_entry(worker, record) for worker, record in sorted(processes.items())]
+    terminal_workers = [item for item in workers if item.get("protocol_terminal_state") == "completed" and item.get("terminal_marker_mtime") is not None]
+    winner = min(terminal_workers, key=lambda item: (item.get("terminal_marker_mtime"), item.get("worker"))) if terminal_workers else {}
+    return {
+        "dispatch_mode": dispatch_mode,
+        "worker_count": len(workers),
+        "workers": workers,
+        "completed_workers": [item["worker"] for item in workers if item.get("protocol_terminal_state") == "completed"],
+        "winner_worker": winner.get("worker", ""),
+        "winner_run_id": winner.get("run_id", ""),
+        "winner_task_id": winner.get("task_id", ""),
+    }
+
+
+def parse_active_alerts(text: str) -> int | None:
+    match = re.search(r"active_alerts:\s*(\d+)", text)
+    return int(match.group(1)) if match else None
+
+
+def parse_active_locks(text: str) -> int | None:
+    match = re.search(r"active_locks:\s*(\d+)", text)
+    return int(match.group(1)) if match else None
+
+
+def worker_has_active_nonterminal_lock(state: dict[str, Any]) -> bool:
+    latest_state = state.get("summary", {}).get("latest_state", "")
+    if latest_state in {"completed", "failed", "blocked"}:
+        return False
+    health_locks = parse_active_locks(state.get("health", {}).get("stdout", ""))
+    if health_locks and health_locks > 0:
+        return True
+    status_text = state.get("status", {}).get("stdout", "")
+    return "Locks: none" not in status_text and "lock.json" in status_text
+
+
+def business_repo_snapshot(root: Path, *, run_command: RunCommand = subprocess.run) -> dict[str, Any]:
+    repo = workspace_root()
+    if not (repo / ".git").exists():
+        return {"exists": False, "status_short": "", "cached_names": "", "cached_check": "", "diff_names": ""}
+    commands = {
+        "status_short": ["git", "-C", str(repo), "status", "--short"],
+        "cached_names": ["git", "-C", str(repo), "diff", "--cached", "--name-only"],
+        "cached_check": ["git", "-C", str(repo), "diff", "--cached", "--check"],
+        "diff_names": ["git", "-C", str(repo), "diff", "--name-only"],
+    }
+    snapshot: dict[str, Any] = {"exists": True}
+    for key, argv in commands.items():
+        result = run_command(argv, cwd=str(root), text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        snapshot[key] = result.stdout
+        snapshot[f"{key}_returncode"] = result.returncode
+        snapshot[f"{key}_stderr"] = result.stderr
+    return snapshot
+
+
+def run_phase(
+    *,
+    root: Path,
+    artifact: Path,
+    worker: str,
+    role: str,
+    command: list[str],
+    popen_factory: Callable[..., Any],
+) -> dict[str, Any]:
+    logs = artifact / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    stdout_path = logs / f"{role}.log"
+    stderr_path = logs / f"{role}.stderr.log"
+    with stdout_path.open("w", encoding="utf-8") as stdout_handle, stderr_path.open("w", encoding="utf-8") as stderr_handle:
+        popen = popen_factory(command, cwd=str(root), stdout=stdout_handle, stderr=stderr_handle, text=True)
+        pid = getattr(popen, "pid", None)
+        returncode = popen.wait()
+    stdout_text = read_text(stdout_path)
+    stderr_text = read_text(stderr_path)
+    new_task = extract_new_task(stdout_text)
+    finalize = extract_finalize(stdout_text)
+    truth = task_truth(root, new_task["run_id"], new_task["task_id"], new_task["task_dir"])
+    return {
+        "argv": command,
+        "pid": pid,
+        "returncode": returncode,
+        "stdout_path": str(stdout_path),
+        "stderr_path": str(stderr_path),
+        "stdout": stdout_text,
+        "stderr": stderr_text,
+        "run_id": new_task["run_id"],
+        "task_id": new_task["task_id"],
+        **finalize,
+        "truth": truth,
+    }
+
+
+def run_checked(
+    argv: list[str],
+    *,
+    cwd: Path,
+    run_command: RunCommand = subprocess.run,
+) -> dict[str, Any]:
+    started = utc_now()
+    result = run_command(
+        argv,
+        cwd=str(cwd),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    return {
+        "argv": argv,
+        "started_at": started,
+        "finished_at": utc_now(),
+        "returncode": result.returncode,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+    }
+
+
+def capture_sample(
+    root: Path,
+    artifact: Path,
+    index: int,
+    *,
+    run_command: RunCommand = subprocess.run,
+) -> dict[str, Any]:
+    commands = {
+        "status_all_workers": [str(root / "bin" / "omx_visible_dispatch"), "status", "--root", ".", "--all-workers"],
+        "watcher_alerts": [str(root / "bin" / "omx_visible_watcher"), "alerts", "--root", ".", "--all-workers"],
+        "health": [str(root / "bin" / "omx_visible_health"), "check", "--root", ".", "--all-workers"],
+    }
+    sample: dict[str, Any] = {"index": index, "captured_at": utc_now(), "commands": {}}
+    for name, argv in commands.items():
+        sample["commands"][name] = run_checked(argv, cwd=root, run_command=run_command)
+
+    lock_dir = root / ".omx" / "framework" / "team" / "visible-runs" / "_locks"
+    locks: list[dict[str, Any]] = []
+    for path in sorted(lock_dir.glob("*.lock.json")):
+        locks.append({"path": str(path), "content": read_text(path)})
+    sample["locks"] = locks
+    write_json(artifact / "samples" / f"sample-{index:03d}.json", sample)
+    return sample
+
+
+def latest_artifact(root: Path) -> Path | None:
+    base = root / ".omx" / "framework" / "team" / "multiworker-smoke-runs"
+    if not base.exists():
+        return None
+    candidates = [path for path in base.iterdir() if path.is_dir()]
+    return sorted(candidates)[-1] if candidates else None
+
+
+def infer_root_from_artifact(artifact: Path) -> Path:
+    parts = artifact.resolve().parts
+    try:
+        index = parts.index(".omx")
+    except ValueError as exc:
+        raise SmokeError("--root is required when --artifact is not under a .omx tree") from exc
+    if index == 0:
+        raise SmokeError("cannot infer root from artifact path")
+    return Path(*parts[:index])
+
+
+def summarize_worker_result(
+    *,
+    worker: str,
+    returncode: int | None,
+    stdout: str,
+    stderr: str,
+    latest_state: str,
+    report_bytes: int,
+    terminal_markers: list[str],
+) -> dict[str, Any]:
+    wrapper_exit_before_submit = (
+        returncode is not None
+        and latest_state in {"prepared", "assigned", ""}
+        and report_bytes == 0
+        and not terminal_markers
+    )
+    return {
+        "worker": worker,
+        "returncode": returncode,
+        "stdout_bytes": len(stdout.encode("utf-8")),
+        "stderr_bytes": len(stderr.encode("utf-8")),
+        "latest_state": latest_state,
+        "report_bytes": report_bytes,
+        "terminal_markers": terminal_markers,
+        "wrapper_exit_before_submit": wrapper_exit_before_submit,
+    }
+
+
+def collect_worker_state(
+    root: Path,
+    worker: str,
+    process_record: dict[str, Any] | None = None,
+    *,
+    run_command: RunCommand = subprocess.run,
+) -> dict[str, Any]:
+    last = run_checked([str(root / "bin" / "omx_visible_dispatch"), "last", "--root", ".", "--worker", worker], cwd=root, run_command=run_command)
+    status = run_checked([str(root / "bin" / "omx_visible_dispatch"), "status", "--root", ".", "--worker", worker], cwd=root, run_command=run_command)
+    alerts = run_checked([str(root / "bin" / "omx_visible_watcher"), "alerts", "--root", ".", "--worker", worker], cwd=root, run_command=run_command)
+    health = run_checked([str(root / "bin" / "omx_visible_health"), "check", "--root", ".", "--worker", worker], cwd=root, run_command=run_command)
+    doctor = run_checked([str(root / "bin" / "omx_visible_dispatch"), "doctor", "--root", ".", "--worker", worker], cwd=root, run_command=run_command)
+    rebind = run_checked([str(root / "bin" / "omx_visible_rebind"), "check", "--root", ".", "--worker", worker], cwd=root, run_command=run_command)
+
+    latest_state = ""
+    for line in status.get("stdout", "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("truth_state:") or stripped.startswith("latest_state:"):
+            latest_state = stripped.split(":", 1)[1].strip()
+
+    proc = process_record or {}
+    worker_summary = summarize_worker_result(
+        worker=worker,
+        returncode=proc.get("returncode"),
+        stdout=str(proc.get("stdout") or ""),
+        stderr=str(proc.get("stderr") or ""),
+        latest_state=latest_state,
+        report_bytes=0,
+        terminal_markers=[],
+    )
+    return {
+        "summary": worker_summary,
+        "last": last,
+        "status": status,
+        "alerts": alerts,
+        "health": health,
+        "doctor": doctor,
+        "rebind": rebind,
+    }
+
+
+def run_writer_reviewer_smoke(
+    *,
+    root: Path,
+    workers: list[str],
+    timeout: int,
+    allow_real: bool,
+    dispatch_mode: str = "legacy",
+    popen_factory: Callable[..., Any] = subprocess.Popen,
+    run_command: RunCommand = subprocess.run,
+    timestamp: str | None = None,
+) -> dict[str, Any]:
+    if not allow_real:
+        raise SmokeError("run requires --allow-real")
+    timestamp = timestamp or utc_now().replace("-", "").replace(":", "")
+    artifact = sandbox_artifact_dir(root, timestamp)
+    sandbox = artifact / "sandbox"
+    hashes = artifact / "hashes"
+    sandbox.mkdir(parents=True, exist_ok=True)
+    hashes.mkdir(parents=True, exist_ok=True)
+
+    phases = writer_reviewer_phases(workers)
+    writer_worker = phases[0]["worker"]
+    reviewer_worker = phases[1]["worker"]
+    commands = run_one_commands(workers, WRITER_REVIEWER_SCENARIO, timeout, dispatch_mode=dispatch_mode, sandbox_root=artifact)
+    business_before = business_repo_snapshot(root, run_command=run_command)
+
+    writer_result = run_phase(
+        root=root,
+        artifact=artifact,
+        worker=writer_worker,
+        role="writer",
+        command=commands[0],
+        popen_factory=popen_factory,
+    )
+    writer_settle = run_checked(settle_commands(root, [writer_worker])[0], cwd=root, run_command=run_command)
+    writer_state = collect_worker_state(root, writer_worker, writer_result, run_command=run_command)
+
+    writer_hash_before = hash_writer_files(artifact)
+    (hashes / "writer-before-review.sha256").write_text(writer_hash_before + "\n", encoding="utf-8")
+
+    reviewer_result = run_phase(
+        root=root,
+        artifact=artifact,
+        worker=reviewer_worker,
+        role="reviewer",
+        command=commands[1],
+        popen_factory=popen_factory,
+    )
+    reviewer_settle = run_checked(settle_commands(root, [reviewer_worker])[0], cwd=root, run_command=run_command)
+    reviewer_state = collect_worker_state(root, reviewer_worker, reviewer_result, run_command=run_command)
+
+    writer_hash_after = hash_writer_files(artifact)
+    (hashes / "writer-after-review.sha256").write_text(writer_hash_after + "\n", encoding="utf-8")
+
+    business_after = business_repo_snapshot(root, run_command=run_command)
+    all_status = run_checked([str(root / "bin" / "omx_visible_dispatch"), "status", "--root", ".", "--all-workers"], cwd=root, run_command=run_command)
+    all_alerts = run_checked([str(root / "bin" / "omx_visible_watcher"), "alerts", "--root", ".", "--all-workers"], cwd=root, run_command=run_command)
+    policy = run_checked([str(root / "bin" / "omx_visible_policy_check"), "check", "--root", "."], cwd=root, run_command=run_command)
+
+    output = writer_output_path(artifact)
+    notes = writer_notes_path(artifact)
+    errors: list[str] = []
+    warnings: list[str] = []
+    writer_payload: dict[str, Any] = {}
+    if not output.exists() or output.stat().st_size == 0:
+        errors.append("writer-output.json missing or empty")
+    else:
+        try:
+            writer_payload = json.loads(output.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            errors.append(f"writer-output.json invalid JSON: {exc}")
+    if not notes.exists() or notes.stat().st_size == 0:
+        errors.append("writer-notes.md missing or empty")
+
+    expected_written = [str(output), str(notes)]
+    writer_policy_violation = bool(writer_payload.get("policy_violation")) if writer_payload else True
+    if writer_payload and writer_payload.get("policy_violation") is not False:
+        errors.append("writer-output.json policy_violation is not false")
+    if writer_payload and writer_payload.get("actual_written_files") != expected_written:
+        errors.append("writer actual_written_files did not exactly match expected sandbox paths")
+
+    for role, result in [("writer", writer_result), ("reviewer", reviewer_result)]:
+        truth = result["truth"]
+        if truth["report_bytes"] <= 0:
+            errors.append(f"{role} report.md missing or empty")
+        if truth["terminal_markers"] != [".done"]:
+            errors.append(f"{role} terminal marker is not exactly one .done")
+
+    business_repo_modified = business_after.get("status_short") != business_before.get("status_short") or business_after.get("diff_names") != business_before.get("diff_names")
+    business_repo_index_modified = business_after.get("cached_names") != business_before.get("cached_names") or business_after.get("cached_check") != business_before.get("cached_check")
+    if business_repo_modified:
+        errors.append("business repo status changed")
+    if business_repo_index_modified:
+        errors.append("business repo index changed")
+
+    lock_dir = root / ".omx" / "framework" / "team" / "visible-runs" / "_locks"
+    active_locks_final = sum(1 for worker in workers if (lock_dir / f"{worker}.lock.json").exists())
+    watcher_alerts_final = parse_active_alerts(all_alerts["stdout"])
+    reviewer_modified_writer_files = writer_hash_before != writer_hash_after
+    if reviewer_modified_writer_files:
+        errors.append("reviewer modified writer sandbox files")
+    if active_locks_final:
+        errors.append("active worker locks remain")
+    if watcher_alerts_final not in (0, None):
+        errors.append("watcher alerts remain")
+    if policy["returncode"] != 0 or "policy_check: OK" not in policy["stdout"]:
+        errors.append("policy check failed")
+
+    summary = {
+        "schema_version": 1,
+        "generated_at": utc_now(),
+        "root": str(root),
+        "scenario": WRITER_REVIEWER_SCENARIO,
+        "dispatch_mode": dispatch_mode,
+        "artifact_dir": str(artifact),
+        "sandbox_dir": str(sandbox),
+        "commands": commands,
+        "phases": phases,
+        "writer_worker": writer_worker,
+        "reviewer_worker": reviewer_worker,
+        "writer_run_id": writer_result["run_id"],
+        "reviewer_run_id": reviewer_result["run_id"],
+        "writer_task_id": writer_result["task_id"],
+        "reviewer_task_id": reviewer_result["task_id"],
+        "writer_terminal_state": writer_result["truth"]["terminal_state"],
+        "reviewer_terminal_state": reviewer_result["truth"]["terminal_state"],
+        "writer_report_bytes": writer_result["truth"]["report_bytes"],
+        "reviewer_report_bytes": reviewer_result["truth"]["report_bytes"],
+        "writer_terminal_markers": writer_result["truth"]["terminal_markers"],
+        "reviewer_terminal_markers": reviewer_result["truth"]["terminal_markers"],
+        "writer_run_one_exit_state": writer_result["returncode"],
+        "reviewer_run_one_exit_state": reviewer_result["returncode"],
+        "writer_wait_result": writer_result["wait_result"],
+        "reviewer_wait_result": reviewer_result["wait_result"],
+        "writer_pending_after_timeout": writer_result["pending_after_timeout"],
+        "reviewer_pending_after_timeout": reviewer_result["pending_after_timeout"],
+        "writer_needs_settle": writer_result["needs_settle"],
+        "reviewer_needs_settle": reviewer_result["needs_settle"],
+        "writer_protocol_terminal_state": writer_result["protocol_terminal_state"],
+        "reviewer_protocol_terminal_state": reviewer_result["protocol_terminal_state"],
+        "writer_hash_before_review": writer_hash_before,
+        "writer_hash_after_review": writer_hash_after,
+        "reviewer_modified_writer_files": reviewer_modified_writer_files,
+        "writer_output_exists": output.exists() and output.stat().st_size > 0,
+        "writer_notes_exists": notes.exists() and notes.stat().st_size > 0,
+        "writer_output_valid_json": bool(writer_payload),
+        "writer_output_policy_violation": writer_payload.get("policy_violation") if writer_payload else None,
+        "writer_actual_written_files": writer_payload.get("actual_written_files") if writer_payload else None,
+        "business_repo_before": business_before,
+        "business_repo_after": business_after,
+        "business_repo_modified": business_repo_modified,
+        "business_repo_index_modified": business_repo_index_modified,
+        "active_locks_final": active_locks_final,
+        "watcher_alerts_final": watcher_alerts_final,
+        "policy_violation": bool(errors) or writer_policy_violation,
+        "rmux_used": False,
+        "direct_tui_used": False,
+        "tmux_input_used": False,
+        "cross_worker_settle": False,
+        "settle": {writer_worker: writer_settle, reviewer_worker: reviewer_settle},
+        "workers_state": {writer_worker: writer_state, reviewer_worker: reviewer_state},
+        "all_status": all_status,
+        "all_alerts": all_alerts,
+        "policy_check": policy,
+        "processes": {writer_worker: writer_result, reviewer_worker: reviewer_result},
+        "fan_in": build_fan_in_summary({writer_worker: writer_result, reviewer_worker: reviewer_result}, dispatch_mode),
+        "errors": errors,
+        "warnings": warnings,
+    }
+    write_json(artifact / "summary.json", summary)
+    return summary
+
+
+def run_smoke(
+    *,
+    root: Path,
+    workers: list[str],
+    scenario: str,
+    timeout: int,
+    sample_interval: float,
+    samples: int,
+    allow_real: bool,
+    max_parallel: int | None = None,
+    dispatch_mode: str = "legacy",
+    popen_factory: Callable[..., Any] = subprocess.Popen,
+    run_command: RunCommand = subprocess.run,
+    timestamp: str | None = None,
+) -> dict[str, Any]:
+    if not allow_real:
+        raise SmokeError("run requires --allow-real")
+    if scenario == WRITER_REVIEWER_SCENARIO:
+        return run_writer_reviewer_smoke(
+            root=root,
+            workers=workers,
+            timeout=timeout,
+            allow_real=allow_real,
+            dispatch_mode=dispatch_mode,
+            popen_factory=popen_factory,
+            run_command=run_command,
+            timestamp=timestamp,
+        )
+    timestamp = timestamp or utc_now().replace("-", "").replace(":", "")
+    artifact = artifact_dir(root, timestamp)
+    logs = artifact / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+
+    commands = run_one_commands(workers, scenario, timeout, dispatch_mode=dispatch_mode)
+    resolved_max_parallel = resolve_max_parallel(workers, scenario, max_parallel)
+    waves = worker_waves(workers, scenario, resolved_max_parallel)
+    command_by_worker = dict(zip(workers, commands))
+    processes: dict[str, dict[str, Any]] = {}
+    settle_results: dict[str, dict[str, Any]] = {}
+    worker_states: dict[str, dict[str, Any]] = {}
+    sample_records: list[dict[str, Any]] = []
+    per_wave_results: list[dict[str, Any]] = []
+    stop_after_wave = False
+    sample_index = 1
+
+    for wave_index, wave_workers in enumerate(waves, start=1):
+        wave_popens: dict[str, Any] = {}
+        wave_result: dict[str, Any] = {
+            "wave": wave_index,
+            "workers": wave_workers,
+            "started_at": utc_now(),
+            "processes": {},
+            "settle": {},
+            "workers_state": {},
+            "delivery_uncertain_workers": [],
+            "active_nonterminal_lock_workers": [],
+            "wrapper_exit_before_submit_workers": [],
+            "stop_after_wave": False,
+        }
+        for worker in wave_workers:
+            argv = command_by_worker[worker]
+            stdout_path = logs / f"wave-{wave_index:02d}-run-{worker}.stdout.log"
+            stderr_path = logs / f"wave-{wave_index:02d}-run-{worker}.stderr.log"
+            stdout_handle = stdout_path.open("w", encoding="utf-8")
+            stderr_handle = stderr_path.open("w", encoding="utf-8")
+            popen = popen_factory(argv, cwd=str(root), stdout=stdout_handle, stderr=stderr_handle, text=True)
+            wave_popens[worker] = popen
+            processes[worker] = {
+                "wave": wave_index,
+                "argv": argv,
+                "stdout_path": str(stdout_path),
+                "stderr_path": str(stderr_path),
+                "pid": getattr(popen, "pid", None),
+            }
+            stdout_handle.close()
+            stderr_handle.close()
+
+        for sample_offset in range(samples):
+            sample_records.append(capture_sample(root, artifact, sample_index, run_command=run_command))
+            sample_index += 1
+            if sample_interval > 0 and sample_offset < samples - 1:
+                time.sleep(sample_interval)
+
+        for worker, popen in wave_popens.items():
+            returncode = popen.wait()
+            processes[worker]["returncode"] = returncode
+            processes[worker]["stdout"] = read_text(Path(processes[worker]["stdout_path"]))
+            processes[worker]["stderr"] = read_text(Path(processes[worker]["stderr_path"]))
+            new_task = extract_new_task(processes[worker]["stdout"])
+            processes[worker]["run_id"] = new_task.get("run_id", "")
+            processes[worker]["task_id"] = new_task.get("task_id", "")
+            processes[worker].update(extract_finalize(processes[worker]["stdout"]))
+            processes[worker]["truth"] = (
+                task_truth(root, processes[worker]["run_id"], processes[worker]["task_id"], new_task.get("task_dir", ""))
+                if processes[worker]["run_id"]
+                else {}
+            )
+            wave_result["processes"][worker] = processes[worker]
+
+        wave_settle_commands = settle_commands(root, wave_workers)
+        for worker, command in zip(wave_workers, wave_settle_commands):
+            settle_results[worker] = run_checked(command, cwd=root, run_command=run_command)
+            wave_result["settle"][worker] = settle_results[worker]
+
+        for worker in wave_workers:
+            worker_states[worker] = collect_worker_state(root, worker, processes[worker], run_command=run_command)
+            wave_result["workers_state"][worker] = worker_states[worker]
+            worker_summary = worker_states[worker]["summary"]
+            if worker_summary["latest_state"] == "delivery_uncertain":
+                wave_result["delivery_uncertain_workers"].append(worker)
+            if worker_has_active_nonterminal_lock(worker_states[worker]):
+                wave_result["active_nonterminal_lock_workers"].append(worker)
+            if worker_summary["wrapper_exit_before_submit"]:
+                wave_result["wrapper_exit_before_submit_workers"].append(worker)
+
+        wave_result["finished_at"] = utc_now()
+        wave_result["stop_after_wave"] = bool(
+            wave_result["delivery_uncertain_workers"] or wave_result["active_nonterminal_lock_workers"]
+        )
+        per_wave_results.append(wave_result)
+        if wave_result["stop_after_wave"]:
+            stop_after_wave = True
+            break
+
+    all_status = run_checked([str(root / "bin" / "omx_visible_dispatch"), "status", "--root", ".", "--all-workers"], cwd=root, run_command=run_command)
+    started_workers = [worker for wave in per_wave_results for worker in wave["workers"]]
+    skipped_workers = [worker for worker in workers if worker not in started_workers]
+    delivery_uncertain_workers = [
+        worker
+        for worker, state in worker_states.items()
+        if state.get("summary", {}).get("latest_state") == "delivery_uncertain"
+    ]
+    active_nonterminal_lock_workers = [
+        worker
+        for worker, state in worker_states.items()
+        if worker_has_active_nonterminal_lock(state)
+    ]
+    wrapper_exit_before_submit_workers = [
+        worker
+        for worker, state in worker_states.items()
+        if state.get("summary", {}).get("wrapper_exit_before_submit")
+    ]
+    worker_wrapper_failures = [
+        worker for worker, record in processes.items()
+        if record.get("returncode") not in (0, None)
+    ]
+    workers_missing_run_id = [
+        worker for worker, record in processes.items()
+        if not record.get("run_id")
+    ]
+    workers_noncompleted_terminal = [
+        worker for worker, record in processes.items()
+        if record.get("run_id") and record.get("truth", {}).get("terminal_state") != "completed"
+    ]
+    errors: list[str] = []
+    if delivery_uncertain_workers:
+        errors.append("delivery_uncertain workers: " + ",".join(delivery_uncertain_workers))
+    if active_nonterminal_lock_workers:
+        errors.append("active nonterminal locks: " + ",".join(active_nonterminal_lock_workers))
+    if skipped_workers:
+        errors.append("waves skipped after failure: " + ",".join(skipped_workers))
+    if worker_wrapper_failures:
+        errors.append("worker wrapper nonzero exit: " + ",".join(worker_wrapper_failures))
+    if workers_missing_run_id:
+        errors.append("workers missing run_id: " + ",".join(workers_missing_run_id))
+    if workers_noncompleted_terminal:
+        errors.append("workers not completed: " + ",".join(workers_noncompleted_terminal))
+
+    summary = {
+        "schema_version": 1,
+        "generated_at": utc_now(),
+        "root": str(root),
+        "artifact_dir": str(artifact),
+        "workers": workers,
+        "scenario": scenario,
+        "dispatch_mode": dispatch_mode,
+        "commands": commands,
+        "max_parallel": resolved_max_parallel,
+        "wave_count": len(waves),
+        "waves": [{"wave": index, "workers": wave_workers} for index, wave_workers in enumerate(waves, start=1)],
+        "per_wave_results": per_wave_results,
+        "stop_after_wave": stop_after_wave,
+        "started_workers": started_workers,
+        "skipped_workers": skipped_workers,
+        "delivery_uncertain_workers": delivery_uncertain_workers,
+        "active_nonterminal_lock_workers": active_nonterminal_lock_workers,
+        "wrapper_exit_before_submit": wrapper_exit_before_submit_workers,
+        "worker_wrapper_failures": worker_wrapper_failures,
+        "workers_missing_run_id": workers_missing_run_id,
+        "workers_noncompleted_terminal": workers_noncompleted_terminal,
+        "processes": processes,
+        "samples": sample_records,
+        "settle": settle_results,
+        "workers_state": worker_states,
+        "all_status": all_status,
+        "rmux_used": dispatch_mode == "native",
+        "direct_tui_used": False,
+        "fan_in": build_fan_in_summary(processes, dispatch_mode),
+        "errors": errors,
+    }
+    write_json(artifact / "summary.json", summary)
+    return summary
+
+
+def plan_payload(root: Path, workers: list[str], scenario: str, timeout: int, max_parallel: int | None = None, dispatch_mode: str = "legacy") -> dict[str, Any]:
+    sandbox_root = sandbox_artifact_dir(root, "<timestamp>") if scenario == WRITER_REVIEWER_SCENARIO else None
+    resolved_max_parallel = resolve_max_parallel(workers, scenario, max_parallel)
+    commands = run_one_commands(workers, scenario, timeout, dispatch_mode=dispatch_mode, dispatch="./bin/omx_visible_dispatch", sandbox_root=sandbox_root)
+    waves = wave_plan(
+        workers,
+        scenario,
+        timeout,
+        resolved_max_parallel,
+        dispatch_mode=dispatch_mode,
+        dispatch="./bin/omx_visible_dispatch",
+        sandbox_root=sandbox_root,
+    )
+    payload = {
+        "schema_version": 1,
+        "dry_run": True,
+        "root": str(root),
+        "workers": workers,
+        "scenario": scenario,
+        "dispatch_mode": dispatch_mode,
+        "commands": commands,
+        "max_parallel": resolved_max_parallel,
+        "wave_count": len(waves),
+        "waves": [{"wave": wave["wave"], "workers": wave["workers"]} for wave in waves],
+        "wave_commands": waves,
+        "artifact_root": str(
+            root / ".omx" / "framework" / "team" / ("multiworker-sandbox-runs" if scenario == WRITER_REVIEWER_SCENARIO else "multiworker-smoke-runs")
+        ),
+        "rmux_used": dispatch_mode == "native",
+        "direct_tui_used": False,
+    }
+    if scenario == WRITER_REVIEWER_SCENARIO:
+        payload["phases"] = writer_reviewer_phases(workers)
+        payload["sandbox_root"] = str(sandbox_root)
+        payload["phased_execution"] = True
+    return payload
+
+
+def command_plan(args: argparse.Namespace) -> int:
+    root = Path(args.root).resolve()
+    workers = parse_workers(args.workers)
+    payload = plan_payload(root, workers, args.scenario, args.timeout, args.max_parallel, getattr(args, "dispatch_mode", "legacy"))
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
+    else:
+        for command in payload["commands"]:
+            print(" ".join(command))
+    return 0
+
+
+def command_run(args: argparse.Namespace) -> int:
+    if not args.allow_real:
+        raise SmokeError("--allow-real required for run")
+    root = Path(args.root).resolve()
+    workers = parse_workers(args.workers)
+    summary = run_smoke(
+        root=root,
+        workers=workers,
+        scenario=args.scenario,
+        timeout=args.timeout,
+        sample_interval=args.sample_interval,
+        samples=args.samples,
+        allow_real=args.allow_real,
+        max_parallel=args.max_parallel,
+        dispatch_mode=getattr(args, "dispatch_mode", "legacy"),
+    )
+    if args.json:
+        print(json.dumps(summary, indent=2, sort_keys=True, ensure_ascii=False))
+    else:
+        print(f"artifact_dir: {summary['artifact_dir']}")
+    return 1 if summary.get("errors") else 0
+
+
+def collect_or_recover_summary(args: argparse.Namespace) -> int:
+    artifact = Path(args.artifact).resolve() if args.artifact else None
+    if args.root:
+        root = Path(args.root).resolve()
+    elif artifact:
+        root = infer_root_from_artifact(artifact)
+    else:
+        raise SmokeError("--root is required when --artifact is omitted")
+    artifact = artifact if artifact else latest_artifact(root)
+    if artifact is None:
+        raise SmokeError("no multiworker smoke artifact found")
+    summary_path = artifact / "summary.json"
+    payload = {
+        "schema_version": 1,
+        "root": str(root),
+        "artifact_dir": str(artifact),
+        "summary_exists": summary_path.exists(),
+        "summary": json.loads(summary_path.read_text(encoding="utf-8")) if summary_path.exists() else {},
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
+    else:
+        print(f"artifact_dir: {artifact}")
+        print(f"summary_exists: {summary_path.exists()}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        epilog=(
+            "N-worker noop smoke defaults to max_parallel=min(worker_count, 3). "
+            "Full 4-worker all-at-once concurrency requires explicit --max-parallel 4. "
+            "If 4 all-concurrent smoke fails, retry later with --max-parallel 3 or --max-parallel 2."
+        ),
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    def add_common(target: argparse.ArgumentParser) -> None:
+        target.add_argument("--root", required=True)
+        target.add_argument("--workers", required=True, help="comma-separated operator-selected worker IDs")
+        target.add_argument("--scenario", default="noop", choices=SCENARIOS)
+        target.add_argument("--timeout", type=int, default=300)
+        target.add_argument("--dispatch-mode", default="legacy", choices=DISPATCH_MODES)
+        target.add_argument(
+            "--max-parallel",
+            type=int,
+            help="maximum workers launched per wave; noop defaults to min(worker_count, 3), full 4-way requires --max-parallel 4",
+        )
+        target.add_argument("--json", action="store_true")
+
+    plan = sub.add_parser("plan", help="print run-one commands without executing")
+    add_common(plan)
+    plan.set_defaults(func=command_plan)
+
+    run = sub.add_parser("run", help="run multiworker smoke with owned Popen objects")
+    add_common(run)
+    run.add_argument("--sample-interval", type=float, default=5)
+    run.add_argument("--samples", type=int, default=5)
+    run.add_argument("--allow-real", action="store_true")
+    run.set_defaults(func=command_run)
+
+    collect = sub.add_parser("collect", help="read latest artifact summary without resubmitting")
+    collect.add_argument("--root")
+    collect.add_argument("--artifact")
+    collect.add_argument("--json", action="store_true")
+    collect.set_defaults(func=collect_or_recover_summary)
+
+    recover = sub.add_parser("recover-summary", help="summarize latest artifact and statuses without repairing")
+    recover.add_argument("--root")
+    recover.add_argument("--artifact")
+    recover.add_argument("--json", action="store_true")
+    recover.set_defaults(func=collect_or_recover_summary)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return int(args.func(args))
+    except SmokeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

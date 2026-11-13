@@ -1,0 +1,2827 @@
+#!/usr/bin/env python3
+"""Visible task lifecycle signal helper.
+
+This helper is intended to be called by a visible worker from inside a task
+prompt. It writes protocol markers and events in one visible-runs task
+directory, may finalize that task's pending session acceptance fence, and
+never edits report.md or owner locks.
+"""
+
+from __future__ import annotations
+
+import argparse
+from importlib.machinery import SourceFileLoader
+import fcntl
+import hashlib
+import json
+import os
+import subprocess
+import sys
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+_THIS_FILE = Path(__file__).resolve()
+for _candidate in (
+    (_THIS_FILE.parent.parent / "src").resolve(),
+    (_THIS_FILE.parent.parent / "lib").resolve(),
+):
+    if _candidate.exists() and str(_candidate) not in sys.path:
+        sys.path.insert(0, str(_candidate))
+
+from visible_agent_orchestrator.progress_checkpoints import (
+    PROGRESS_CHECKPOINTS_FILENAME,
+    _evidence_shape_error,
+    canonical_request_hash,
+    checkpoint_record,
+    evidence_path_in_scope,
+    identity_valid_records,
+    current_task_identity,
+    latest_seq,
+    read_progress_checkpoints,
+    store_integrity_errors,
+    validate_checkpoint_content,
+)
+from visible_agent_orchestrator.operation_authorization import (
+    OperationAuthorizationError,
+    supplement_selection_payload,
+)
+
+from visible_agent_orchestrator.task_evidence_budget import (
+    task_evidence_budget_status,
+)
+from visible_agent_orchestrator.task_protocol_status import (
+    FLOW_MARKERS,
+    STATE_TO_MARKER,
+    STATE_TO_STATUS,
+    TERMINAL_MARKERS,
+    file_size,
+    marker_exists,
+    marker_path,
+    read_json,
+    task_protocol_status,
+)
+from visible_agent_orchestrator.runtime_paths import runtime_root
+from visible_agent_orchestrator.companion_skill_admission import AdmissionError, invoke_cli_handler
+
+from visible_agent_orchestrator.terminal_acceptance import (
+    OPERATOR_RECOVERY_AUTHORIZATION_FILE,
+    OPERATOR_RECOVERY_CLAIM_KIND,
+    OPERATOR_RECOVERY_CONSUMPTION_FILE,
+    TERMINAL_PROTOCOL_CLASSIFICATION_INVALID,
+    TERMINAL_PROTOCOL_CLASSIFICATION_MODERN,
+    build_operator_recovery_claim,
+    build_terminal_output_claim,
+    compare_acceptance_identity,
+    operator_recovery_acceptance_mismatches,
+    quarantined_owner_stopped_evidence,
+    recovery_activity_snapshot,
+    recovery_authorization_hash,
+    recovery_stop_freshness,
+    terminal_acceptance_status,
+)
+from visible_agent_orchestrator.terminal_durability import (
+    durable_atomic_write,
+    pin_terminal_prerequisites,
+)
+
+OPERATOR_RECOVERY_SUPPORT_AVAILABLE = True
+
+
+try:
+    from visible_agent_orchestrator.visible_registry_lock import (
+        owner_lock_transition_fence,
+        visible_registry_lock,
+    )
+except ModuleNotFoundError:
+    def _fallback_owner_lock_version(value: Any) -> int:
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return 0
+
+    def owner_lock_transition_fence(data: dict[str, Any]) -> tuple[str, ...]:
+        owner_lock_id = str(data.get("owner_lock_id") or "")
+        identity = (
+            ("owner_lock_id", owner_lock_id)
+            if owner_lock_id
+            else (
+                "legacy",
+                str(data.get("worker_id") or ""),
+                str(data.get("run") or ""),
+                str(data.get("task") or ""),
+                str(data.get("created_at") or ""),
+                str(data.get("binding_generation") or ""),
+                str(data.get("binding_lease_id") or ""),
+            )
+        )
+        return (
+            *identity,
+            str(_fallback_owner_lock_version(data.get("owner_lock_version"))),
+            str(data.get("status") or ""),
+        )
+
+    @contextmanager
+    def visible_registry_lock(root: Path):
+        path = (
+            Path(root).resolve()
+            / ".omx"
+            / "framework"
+            / "team"
+            / "rebind"
+            / ".registry-rebind.lock"
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a+", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def task_lifecycle_lock(tdir: Path):
+    path = tdir / ".task-lifecycle.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+class SignalError(Exception):
+    """Expected operator-facing failure."""
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def root_path(value: str | None) -> Path:
+    return runtime_root(value)
+
+
+def visible_runs_root(root: Path) -> Path:
+    return root / ".omx" / "framework" / "team" / "visible-runs"
+
+
+def rel(path: Path, root: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(root.resolve()))
+    except Exception:
+        return str(path)
+
+
+def read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def registered_worker(root: Path, worker_id: str) -> dict[str, Any]:
+    registry = read_json(
+        root / ".omx" / "framework" / "team" / "opencode_visible_workers.json"
+    )
+    return next(
+        (
+            item
+            for item in registry.get("workers", [])
+            if isinstance(item, dict)
+            and str(item.get("worker_id") or "") == worker_id
+        ),
+        {},
+    )
+
+
+def nonnegative_int(value: Any) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def worker_binding_identity(worker: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        str(worker.get("worker_id") or ""),
+        str(worker.get("instance_id") or ""),
+        nonnegative_int(worker.get("binding_generation")),
+        nonnegative_int(
+            worker.get("fencing_generation")
+            if worker.get("fencing_generation") is not None
+            else worker.get("binding_generation")
+        ),
+        str(worker.get("host") or "127.0.0.1"),
+        nonnegative_int(worker.get("port")),
+        str(worker.get("pane_id") or ""),
+        nonnegative_int(worker.get("pane_pid")),
+    )
+
+
+def current_owner_lock(
+    root: Path,
+    worker_id: str,
+) -> dict[str, Any]:
+    if not worker_id or any(
+        character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_."
+        for character in worker_id
+    ):
+        return {}
+    return read_json(
+        visible_runs_root(root)
+        / "_locks"
+        / f"{worker_id}.lock.json"
+    )
+
+
+def owner_lock_matches_task(
+    root: Path,
+    tdir: Path,
+    worker_id: str,
+    lock: dict[str, Any],
+    worker: dict[str, Any],
+    *,
+    binding_generation: int,
+) -> bool:
+    run_id = tdir.parent.parent.name
+    status = str(lock.get("status") or "")
+    return (
+        bool(str(lock.get("owner_lock_id") or ""))
+        and str(read_text(tdir / "owner")).strip() == worker_id
+        and str(lock.get("worker_id") or "") == worker_id
+        and str(lock.get("run") or "") == run_id
+        and str(lock.get("task") or "") == tdir.name
+        and str(lock.get("task_dir") or "") == rel(tdir, root)
+        and status in {"submitting", "submitted"}
+        and nonnegative_int(lock.get("binding_generation"))
+        == binding_generation
+        and str(lock.get("pane_id") or "")
+        == str(worker.get("pane_id") or "")
+        and nonnegative_int(lock.get("port"))
+        == nonnegative_int(worker.get("port"))
+    )
+
+
+def invalid_generation_fields(payload: dict[str, Any]) -> list[str]:
+    return [
+        field
+        for field in ("binding_generation", "fencing_generation")
+        if nonnegative_int(payload.get(field)) is None
+    ]
+
+
+def acceptance_guard_snapshot(
+    root: Path,
+    tdir: Path,
+    worker_id: str,
+    fence: dict[str, Any],
+) -> dict[str, Any]:
+    invalid_fields = invalid_generation_fields(fence)
+    binding_generation = nonnegative_int(fence.get("binding_generation"))
+    fencing_generation = nonnegative_int(fence.get("fencing_generation"))
+    worker = registered_worker(root, worker_id)
+    worker_binding_generation = nonnegative_int(
+        worker.get("binding_generation")
+    )
+    worker_fencing_generation = nonnegative_int(
+        worker.get("fencing_generation")
+        if worker.get("fencing_generation") is not None
+        else worker.get("binding_generation")
+    )
+    binding_matches = (
+        bool(worker)
+        and str(fence.get("worker_id") or "") == worker_id
+        and str(fence.get("task_id") or "") == tdir.name
+        and str(fence.get("instance_id") or "")
+        == str(worker.get("instance_id") or "")
+        and binding_generation == worker_binding_generation
+        and fencing_generation == worker_fencing_generation
+    )
+    owner_lock = current_owner_lock(root, worker_id)
+    owner_lock_matches = bool(
+        binding_generation is not None
+        and worker
+        and owner_lock_matches_task(
+            root,
+            tdir,
+            worker_id,
+            owner_lock,
+            worker,
+            binding_generation=binding_generation,
+        )
+    )
+    status = (
+        "invalid_binding_identity"
+        if invalid_fields
+        else "binding_mismatch"
+        if not binding_matches
+        else "owner_lock_mismatch"
+        if not owner_lock_matches
+        else "ok"
+    )
+    return {
+        "ok": not invalid_fields and binding_matches and owner_lock_matches,
+        "status": status,
+        "invalid_fields": invalid_fields,
+        "worker": worker,
+        "owner_lock": owner_lock,
+        "binding_matches": binding_matches,
+        "owner_lock_matches": owner_lock_matches,
+        "worker_identity": worker_binding_identity(worker),
+        "owner_lock_id": str(owner_lock.get("owner_lock_id") or ""),
+        "owner_lock_transition": owner_lock_transition_fence(owner_lock),
+        "binding_generation": binding_generation,
+        "fencing_generation": fencing_generation,
+    }
+
+
+def _observe_active_codex_thread(
+    root: Path,
+    worker: dict[str, Any],
+    *,
+    observed_at: str,
+) -> dict[str, Any]:
+    observation = {
+        "source": "codex_appserver_thread_read",
+        "observed_at": observed_at,
+        "session_ids": [],
+        "status": "not_observed",
+        "error": "",
+    }
+    thread = str(worker.get("codex_thread") or "").strip()
+    if not thread:
+        observation["status"] = "codex_thread_binding_missing"
+        return observation
+    client = Path(os.environ.get("OMX_CODEX_APPSERVER_CLIENT")
+                  or root / "bin" / "omx_codex_appserver_client")
+    if not client.is_file():
+        observation["status"] = "codex_client_missing"
+        observation["error"] = str(client)
+        return observation
+    client_python = os.environ.get("OMX_CODEX_PYTHON", "/usr/bin/python3")
+    argv = [client_python, str(client), "thread-read", "--thread", thread]
+    socket_path = str(worker.get("codex_socket") or "").strip()
+    if socket_path:
+        argv += ["--socket", socket_path]
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=15.0)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        observation["status"] = "live_session_observation_failed"
+        observation["error"] = repr(exc)[:500]
+        return observation
+    try:
+        payload = json.loads(proc.stdout or "{}")
+    except json.JSONDecodeError:
+        payload = {}
+    if proc.returncode == 0 and isinstance(payload, dict) \
+            and payload.get("status") == "ok":
+        state = payload.get("thread_state") or {}
+        if str(state.get("id") or "") == thread:
+            observation["session_ids"] = [thread]
+            observation["status"] = "live_sessions_observed"
+            return observation
+    observation["status"] = "live_session_not_observed"
+    observation["error"] = str(payload.get("status") or proc.returncode)[:500]
+    return observation
+
+
+def observe_active_opencode_sessions(
+    root: Path,
+    worker_id: str,
+    *,
+    observed_at: str,
+    worker: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    observation = {
+        "source": "opencode_session_status",
+        "observed_at": observed_at,
+        "worker_id": worker_id,
+        "session_ids": [],
+        "status": "not_observed",
+        "error": "",
+        "worker": {},
+    }
+    worker = worker if isinstance(worker, dict) else registered_worker(
+        root,
+        worker_id,
+    )
+    if not worker:
+        observation["status"] = "worker_not_registered"
+        return observation
+    observation["worker"] = worker
+    if str(worker.get("backend") or "") == "codex_tui":
+        codex = _observe_active_codex_thread(
+            root,
+            worker,
+            observed_at=observed_at,
+        )
+        codex["worker_id"] = worker_id
+        codex["worker"] = worker
+        return codex
+    host = str(worker.get("host") or "127.0.0.1").strip()
+    if host == "localhost":
+        host = "127.0.0.1"
+    if host != "127.0.0.1":
+        observation["status"] = "non_localhost_worker"
+        return observation
+    try:
+        port = int(worker.get("port") or 0)
+    except (TypeError, ValueError):
+        port = 0
+    if not 1 <= port <= 65535:
+        observation["status"] = "invalid_worker_port"
+        return observation
+    request = Request(
+        f"http://{host}:{port}/session/status",
+        method="GET",
+        headers={
+            "User-Agent": "omx-task-signal/session-fence",
+            "Accept": "application/json",
+            "Accept-Encoding": "identity",
+        },
+    )
+    try:
+        with urlopen(request, timeout=3.0) as response:
+            payload = json.loads(response.read(2_000_000).decode("utf-8"))
+    except (
+        HTTPError,
+        URLError,
+        TimeoutError,
+        OSError,
+        json.JSONDecodeError,
+    ) as exc:
+        observation["status"] = "live_session_observation_failed"
+        observation["error"] = str(exc)[:500]
+        return observation
+    if not isinstance(payload, dict):
+        observation["status"] = "invalid_session_status_payload"
+        return observation
+    session_ids = sorted(
+        {
+            str(item or "").strip()
+            for item in payload.keys()
+            if str(item or "").strip().startswith("ses_")
+        }
+    )
+    observation["session_ids"] = session_ids
+    observation["status"] = (
+        "live_sessions_observed"
+        if session_ids
+        else "live_session_not_observed"
+    )
+    return observation
+
+
+def fill_finish_identity_from_fence(
+    args: argparse.Namespace,
+    fence: dict[str, Any],
+) -> dict[str, Any]:
+    """Fill omitted session_id from the current-attempt fence only.
+
+    task/attempt/contract/instance/generation stay as provided so a stale
+    attempt cannot omit them and pass current-fence identity. --state remains
+    required worker intent; report.md is never auto-finished.
+    """
+    provided_session_id = str(args.session_id or "").strip()
+    expected_session_id = str(fence.get("session_id") or "").strip()
+    return {
+        "worker_id": args.worker,
+        "session_id": provided_session_id or expected_session_id,
+        "task_id": str(args.task_id or ""),
+        "attempt_id": str(args.attempt_id or ""),
+        "contract_hash": str(args.contract_hash or ""),
+        "instance_id": str(args.instance_id or ""),
+        "binding_generation": int(args.binding_generation or 0),
+        "fencing_generation": int(args.fencing_generation or 0),
+    }
+
+
+def observe_live_opencode_session(
+    root: Path,
+    worker_id: str,
+    expected_session_id: str,
+    *,
+    observed_at: str,
+    worker: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    observation = {
+        "source": "opencode_session_status",
+        "observed_at": observed_at,
+        "worker_id": worker_id,
+        "expected_session_id": expected_session_id,
+        "session_ids": [],
+        "matches": False,
+        "status": "not_observed",
+        "error": "",
+    }
+    if not expected_session_id.startswith("ses_"):
+        resolved = worker if isinstance(worker, dict) else registered_worker(
+            root,
+            worker_id,
+        )
+        if not (isinstance(resolved, dict)
+                and str(resolved.get("backend") or "") == "codex_tui"):
+            observation["status"] = "invalid_expected_session_id"
+            return observation
+    active = observe_active_opencode_sessions(
+        root,
+        worker_id,
+        observed_at=observed_at,
+        worker=worker,
+    )
+    session_ids = list(active.get("session_ids") or [])
+    observation["session_ids"] = session_ids
+    observation["error"] = str(active.get("error") or "")
+    if active.get("status") not in {
+        "live_sessions_observed",
+        "live_session_not_observed",
+    }:
+        observation["status"] = str(active.get("status") or "not_observed")
+        return observation
+    observation["matches"] = expected_session_id in session_ids
+    observation["status"] = (
+        "live_session_match"
+        if observation["matches"]
+        else "live_session_mismatch"
+        if session_ids
+        else "live_session_not_observed"
+    )
+    return observation
+
+
+def record_acceptance_fence_reconciliation(
+    tdir: Path,
+    reconciliation: dict[str, Any],
+) -> dict[str, Any]:
+    atomic_write_json(
+        tdir / "acceptance_fence_reconciliation.json",
+        reconciliation,
+    )
+    append_jsonl(
+        tdir / "acceptance_fence_reconciliations.jsonl",
+        reconciliation,
+    )
+    return reconciliation
+
+
+def update_current_acceptance_fence_records(
+    tdir: Path,
+    updated_fence: dict[str, Any],
+) -> None:
+    for name in ("task.json", "dispatch.json"):
+        path = tdir / name
+        payload = read_json(path)
+        if not payload:
+            continue
+        if isinstance(payload.get("acceptance_fence"), dict):
+            payload["acceptance_fence"] = dict(updated_fence)
+        for field in (
+            "worker_id",
+            "session_id",
+            "instance_id",
+            "binding_generation",
+            "fencing_generation",
+        ):
+            if field in payload:
+                payload[field] = updated_fence.get(field)
+        atomic_write_json(path, payload)
+
+
+def reconcile_pending_acceptance_fence(
+    root: Path,
+    tdir: Path,
+    worker_id: str,
+    *,
+    observed_at: str,
+    signal: str,
+) -> dict[str, Any]:
+    fence_path = tdir / "acceptance_fence.json"
+    fence = read_json(fence_path)
+    if not fence:
+        return {"required": False, "status": "legacy_task_without_acceptance_fence"}
+    if "session_fence_state" not in fence:
+        return {"required": False, "status": "legacy_acceptance_fence"}
+    session_fence_state = str(fence.get("session_fence_state") or "")
+    if session_fence_state == "live_observed":
+        return {"required": False, "status": "acceptance_fence_already_bound"}
+    if session_fence_state not in {"pending_live_observation", "provisional"}:
+        reconciliation = {
+            "schema_version": 1,
+            "reconciliation_kind": "pending_visible_session_acceptance_fence",
+            "observed_at": observed_at,
+            "signal": signal,
+            "worker_id": worker_id,
+            "task_id": tdir.name,
+            "status": "invalid_session_fence_state",
+            "session_id": "",
+            "session_ids": [],
+            "error": "",
+        }
+        return record_acceptance_fence_reconciliation(tdir, reconciliation)
+
+    reconciliation = {
+        "schema_version": 1,
+        "reconciliation_kind": "pending_visible_session_acceptance_fence",
+        "observed_at": observed_at,
+        "signal": signal,
+        "worker_id": worker_id,
+        "task_id": tdir.name,
+        "status": "not_reconciled",
+        "session_id": "",
+        "session_ids": [],
+        "error": "",
+    }
+    pending_session_id = str(fence.get("session_id") or "").strip()
+    if session_fence_state == "pending_live_observation" and pending_session_id:
+        reconciliation["status"] = "invalid_pending_session_id"
+        return record_acceptance_fence_reconciliation(tdir, reconciliation)
+    if session_fence_state == "provisional" and not pending_session_id.startswith(
+        "ses_"
+    ):
+        reconciliation["status"] = "invalid_provisional_session_id"
+        return record_acceptance_fence_reconciliation(tdir, reconciliation)
+
+    guard_before = acceptance_guard_snapshot(root, tdir, worker_id, fence)
+    if not guard_before.get("ok"):
+        reconciliation["status"] = str(
+            guard_before.get("status") or "binding_mismatch"
+        )
+        reconciliation["invalid_fields"] = list(
+            guard_before.get("invalid_fields") or []
+        )
+        return record_acceptance_fence_reconciliation(tdir, reconciliation)
+
+    reconciliation["owner_lock_id"] = str(
+        guard_before.get("owner_lock_id") or ""
+    )
+    reconciliation["owner_lock_transition"] = list(
+        guard_before.get("owner_lock_transition") or []
+    )
+    active = observe_active_opencode_sessions(
+        root,
+        worker_id,
+        observed_at=observed_at,
+        worker=guard_before.get("worker"),
+    )
+    with visible_registry_lock(root):
+        current_fence = read_json(fence_path)
+        guard_after = acceptance_guard_snapshot(
+            root,
+            tdir,
+            worker_id,
+            current_fence,
+        )
+        if (
+            not guard_after.get("ok")
+            or guard_after.get("worker_identity")
+            != guard_before.get("worker_identity")
+        ):
+            reconciliation["status"] = "binding_changed_during_observation"
+            if (
+                str(guard_after.get("status") or "")
+                == "owner_lock_mismatch"
+            ):
+                reconciliation["status"] = (
+                    "owner_lock_changed_during_observation"
+                )
+            return record_acceptance_fence_reconciliation(
+                tdir,
+                reconciliation,
+            )
+        if guard_after.get("owner_lock_transition") != guard_before.get(
+            "owner_lock_transition"
+        ):
+            reconciliation["status"] = (
+                "owner_lock_changed_during_observation"
+            )
+            return record_acceptance_fence_reconciliation(
+                tdir,
+                reconciliation,
+            )
+        if current_fence != fence:
+            reconciliation["status"] = (
+                "acceptance_fence_changed_during_observation"
+            )
+            return record_acceptance_fence_reconciliation(
+                tdir,
+                reconciliation,
+            )
+
+        session_ids = list(active.get("session_ids") or [])
+        reconciliation["session_ids"] = session_ids
+        reconciliation["error"] = str(active.get("error") or "")
+        if active.get("status") not in {
+            "live_sessions_observed",
+            "live_session_not_observed",
+        }:
+            reconciliation["status"] = str(
+                active.get("status") or "live_session_observation_failed"
+            )
+        elif not session_ids:
+            reconciliation["status"] = "live_session_not_observed"
+        elif (
+            session_fence_state == "pending_live_observation"
+            and len(session_ids) != 1
+        ):
+            reconciliation["status"] = "live_session_ambiguous"
+        elif (
+            session_fence_state == "provisional"
+            and pending_session_id not in session_ids
+        ):
+            reconciliation["status"] = "provisional_session_not_observed"
+        else:
+            session_id = (
+                pending_session_id
+                if session_fence_state == "provisional"
+                else session_ids[0]
+            )
+            updated_fence = {
+                **fence,
+                "session_id": session_id,
+                "session_fence_state": "live_observed",
+                "session_observed_at": observed_at,
+                "session_observation_source": f"omx_task_signal:{signal}",
+                "session_observation_owner_lock_id": str(
+                    guard_after.get("owner_lock_id") or ""
+                ),
+                "session_observation_owner_lock_transition": list(
+                    guard_after.get("owner_lock_transition") or []
+                ),
+            }
+            update_current_acceptance_fence_records(tdir, updated_fence)
+            atomic_write_json(fence_path, updated_fence)
+            reconciliation["status"] = "reconciled"
+            reconciliation["session_id"] = session_id
+
+        return record_acceptance_fence_reconciliation(
+            tdir,
+            reconciliation,
+        )
+
+
+def append_jsonl(path: Path, event: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(event, sort_keys=True, ensure_ascii=False) + "\n")
+
+
+def atomic_write(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    tmp.write_text(content, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def atomic_write_json(path: Path, data: dict[str, Any]) -> None:
+    atomic_write(path, json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
+
+
+def durable_write(path: Path, content: str) -> None:
+    """Terminal-only durable publication (tmp + fsync + replace + dir fsync)."""
+    try:
+        durable_atomic_write(path, content)
+    except OSError as exc:
+        raise SignalError(
+            f"durable write failed for {path.name}: {exc}"
+        ) from exc
+
+
+def durable_write_json(path: Path, data: dict[str, Any]) -> None:
+    durable_write(path, json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
+
+
+def reject_unsafe_task_dir_arg(value: str) -> None:
+    if not value:
+        raise SignalError("--task-dir is required")
+    if "\x00" in value or "\\" in value:
+        raise SignalError("--task-dir contains forbidden characters")
+    parts = Path(value).parts
+    if any(part == ".." for part in parts):
+        raise SignalError("--task-dir must not contain '..'")
+
+
+def resolve_task_dir(root: Path, value: str) -> Path:
+    reject_unsafe_task_dir_arg(value)
+    raw = Path(value)
+    path = raw if raw.is_absolute() else root / raw
+    resolved = path.resolve(strict=False)
+    base = visible_runs_root(root).resolve()
+    try:
+        parts = resolved.relative_to(base).parts
+    except ValueError as exc:
+        raise SignalError("task_dir must stay under .omx/framework/team/visible-runs") from exc
+    if len(parts) != 3 or parts[1] != "tasks":
+        raise SignalError("task_dir must have shape .omx/framework/team/visible-runs/<run>/tasks/<task>")
+    if parts[0] in {"_locks", "_watcher"} or any(part in {"", ".", ".."} for part in parts):
+        raise SignalError("task_dir points at a reserved or invalid visible-runs path")
+    if not resolved.is_dir():
+        raise SignalError(f"task_dir does not exist: {rel(resolved, root)}")
+    return resolved
+
+
+def task_snapshot(
+    tdir: Path,
+    *,
+    evidence_budget: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    base = task_protocol_status(tdir)
+    protocol = read_json(tdir / "protocol_status.json")
+    acceptance = base["terminal_acceptance"]
+    last_event: dict[str, Any] = {}
+    events = tdir / "events.jsonl"
+    if events.is_file():
+        for line in events.read_text(encoding="utf-8", errors="replace").splitlines():
+            if not line.strip():
+                continue
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                data = {"raw": line}
+            if isinstance(data, dict):
+                last_event = data
+    return {
+        "status": base["status"],
+        "reason": base["reason"],
+        "flow_markers": base["flow_markers"],
+        "terminal_markers": base["terminal_markers"],
+        "report_exists": base["report_exists"],
+        "report_bytes": base["report_bytes"],
+        "report_nonempty": base["report_nonempty"],
+        "evidence_budget": (
+            evidence_budget
+            if evidence_budget is not None
+            else task_evidence_budget_status(tdir)
+        ),
+        "protocol": protocol,
+        "terminal_acceptance": acceptance,
+        "last_event": last_event,
+    }
+
+
+def build_protocol_status(
+    root: Path,
+    tdir: Path,
+    *,
+    status: str,
+    signal: str,
+    worker: str,
+    ts: str,
+    warnings: list[str] | None = None,
+    errors: list[str] | None = None,
+    finish_refused_missing_report: bool = False,
+    terminal_state: str = "",
+    requested_terminal_state: str = "",
+    effective_terminal_state: str = "",
+    error_code: str = "",
+    evidence_budget: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    snapshot = task_snapshot(tdir, evidence_budget=evidence_budget)
+    budget = snapshot["evidence_budget"]
+    protocol_warnings = list(warnings or [])
+    protocol_errors = list(errors or [])
+    if budget["state"] == "warning":
+        protocol_warnings.append("evidence_budget_warning")
+    elif budget["state"] == "exceeded":
+        protocol_warnings.append("evidence_budget_exceeded")
+    elif budget["state"] == "scan_failed":
+        protocol_errors.append("evidence_budget_scan_failed")
+        protocol_errors.extend(budget.get("errors", []))
+    return {
+        "schema_version": 1,
+        "updated_at": ts,
+        "status": status,
+        "last_signal": signal,
+        "last_worker": worker,
+        "last_ts": ts,
+        "task_dir": rel(tdir, root),
+        "flow_markers": snapshot["flow_markers"],
+        "terminal_markers": snapshot["terminal_markers"],
+        "report_exists": snapshot["report_exists"],
+        "report_nonempty": snapshot["report_nonempty"],
+        "report_bytes": snapshot["report_bytes"],
+        "finish_refused_missing_report": finish_refused_missing_report,
+        "terminal_state": terminal_state,
+        "requested_terminal_state": requested_terminal_state,
+        "effective_terminal_state": effective_terminal_state,
+        "error_code": error_code,
+        "evidence_budget": budget,
+        "warnings": protocol_warnings,
+        "errors": protocol_errors,
+        "terminal_acceptance": snapshot["terminal_acceptance"],
+        "source": "omx_task_signal",
+    }
+
+
+def pending_supplement_ids(tdir: Path, worker: str) -> list[str]:
+    """Return accepted/ambiguous supplements without an exact worker ACK.
+
+    A supplement receipt is transport evidence, not completion evidence.  The
+    receipt's checkpoint cursor and the current task identity bound the ACK
+    lookup to this attempt; a pre-reservation or foreign ACK cannot discharge it.
+    Malformed receipt files are retained as pending so finish cannot publish a
+    terminal marker while an accepted request is unaccounted for.
+    """
+    paths = sorted(tdir.glob("supplement-*.json"))
+    if not paths:
+        return []
+    fence = read_json(tdir / "acceptance_fence.json")
+    identity = current_task_identity(tdir)
+    attempt = str(identity.get("attempt_id") or "")
+    store = read_progress_checkpoints(tdir)
+    checkpoints, _foreign = identity_valid_records(store, identity)
+    integrity_ok = not any(
+        store.get(field)
+        for field in (
+            "oversize_store", "incomplete_tail", "invalid_count",
+            "unsafe_evidence_count", "sequence_conflict",
+        )
+    )
+    pending: list[str] = []
+    for path in paths:
+        record = read_json(path)
+        if not record:
+            pending.append(path.name)
+            continue
+        if set(record) == {"agent", "model", "variant", "selection_evidence"}:
+            try:
+                supplement_selection_payload(
+                    {key: record[key] for key in ("agent", "model", "variant")},
+                    record["selection_evidence"],
+                )
+            except OperationAuthorizationError:
+                pass
+            else:
+                continue
+        if attempt and record.get("attempt_id") and record["attempt_id"] != attempt:
+            continue
+        status = str(record.get("status") or "")
+        if status in {"refused", "backend_rejected"}:
+            continue
+        supplement_id = str(record.get("supplement_id") or "")
+        cursor = record.get("checkpoint_cursor_at_reservation")
+        receipt_matches = bool(
+            identity.get("known") and identity.get("worker") == worker
+            and record.get("worker_id") == worker
+            and record.get("attempt_id") == attempt
+            and record.get("run") == tdir.parent.parent.name
+            and record.get("task") == tdir.name
+            and record.get("session_id") == fence.get("session_id")
+            and type(cursor) is int and cursor >= 0
+            and supplement_id and path.name == f"supplement-{supplement_id}.json"
+        )
+        if not (
+            receipt_matches and integrity_ok
+            and any(
+                item["seq"] > cursor
+                and item["name"] == f"supplement:{supplement_id}"
+                for item in checkpoints
+            )
+        ):
+            pending.append(supplement_id or path.name)
+    return sorted(set(pending))
+
+
+def write_marker(tdir: Path, name: str, worker: str, ts: str, *, durable: bool = False) -> None:
+    content = f"{ts} worker={worker} signal={name}\n"
+    if durable:
+        durable_write(marker_path(tdir, name), content)
+    else:
+        atomic_write(marker_path(tdir, name), content)
+
+
+def reject_flow_signal_after_terminal(tdir: Path, signal: str) -> bool:
+    existing = [name for name in TERMINAL_MARKERS if marker_exists(tdir, name)]
+    if not existing:
+        return False
+    print(
+        "ERROR: refusing "
+        f"{signal}: task already has terminal marker {','.join(existing)}",
+        file=sys.stderr,
+    )
+    return True
+
+
+def write_status(root: Path, tdir: Path, data: dict[str, Any], *, durable: bool = False) -> None:
+    if durable:
+        durable_write_json(tdir / "protocol_status.json", data)
+    else:
+        atomic_write_json(tdir / "protocol_status.json", data)
+
+
+def event(root: Path, tdir: Path, *, event_name: str, signal: str, worker: str, ts: str, **extra: Any) -> dict[str, Any]:
+    data = {
+        "ts": ts,
+        "event": event_name,
+        "signal": signal,
+        "source": "omx_task_signal",
+        "worker": worker,
+        "task_dir": rel(tdir, root),
+    }
+    data.update(extra)
+    append_jsonl(tdir / "events.jsonl", data)
+    return data
+
+
+def maybe_update_keep_session_title(
+    root: Path,
+    tdir: Path,
+    worker_id: str,
+    *,
+    reconciliation: dict[str, Any],
+    signal: str,
+    ts: str,
+) -> None:
+    """#1010: refresh a keep task's reused session title, display-only.
+
+    Fires only when this signal just reconciled the task's pending keep
+    fence (the received/started attribution binding of the current
+    task/attempt/session), and only for keep tasks: rotate/cold-start set
+    their task-derived title at session creation. The narrowed adapter entry
+    re-validates the full identity chain immediately before its one PATCH
+    and read-back, so a moved identity refuses instead of writing the new
+    task's title. Advisory from end to end: every failure path here is an
+    observable display note only; this helper never changes the flow
+    signal's own outcome and never re-dispatches. Protocol errors raised by
+    the signal itself outside this helper keep their original behavior.
+    """
+    try:
+        _maybe_update_keep_session_title_advisory(
+            root,
+            tdir,
+            worker_id,
+            reconciliation=reconciliation,
+            signal=signal,
+            ts=ts,
+        )
+    except Exception as exc:  # noqa: BLE001 - advisory display aid only
+        print(
+            "session_title_update_failed: display-only keep title refresh "
+            f"hit an unexpected local error (task protocol unaffected): "
+            f"{str(exc)[:200]}"
+        )
+
+
+def _maybe_update_keep_session_title_advisory(
+    root: Path,
+    tdir: Path,
+    worker_id: str,
+    *,
+    reconciliation: dict[str, Any],
+    signal: str,
+    ts: str,
+) -> None:
+    if reconciliation.get("status") != "reconciled":
+        return
+    session_action = read_json(tdir / "session_action.json")
+    if str(session_action.get("session_action") or "") != "keep":
+        return
+    session_id = str(reconciliation.get("session_id") or "")
+    fence = read_json(tdir / "acceptance_fence.json")
+    attempt_id = str(fence.get("attempt_id") or "")
+    run_id = str(fence.get("run_id") or "") or tdir.parent.parent.name
+    task_id = str(fence.get("task_id") or "") or tdir.name
+    argv = [
+        str(root / "bin" / "omx_opencode_tui_adapter"),
+        "session-title-update-real",
+        "--root",
+        str(root),
+        "--run",
+        run_id,
+        "--task",
+        task_id,
+        "--worker",
+        worker_id,
+        "--attempt-id",
+        attempt_id,
+        "--session-id",
+        session_id,
+        "--allow-real",
+    ]
+    outcome = "failed"
+    detail = ""
+    try:
+        proc = subprocess.run(
+            argv,
+            cwd=str(root),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+            check=False,
+        )
+        detail = str(proc.stderr or proc.stdout or "").strip()
+        if proc.returncode == 0:
+            outcome = "updated"
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        detail = str(exc)
+    event(
+        root,
+        tdir,
+        event_name="keep_session_title_update",
+        signal=signal,
+        worker=worker_id,
+        ts=ts,
+        session_title_update=outcome,
+        session_id=session_id,
+    )
+    note = f"session_title_update_{outcome}: display-only keep title refresh"
+    if outcome == "failed" and detail:
+        note = f"{note}: {detail[:300]}"
+    print(note)
+
+
+def command_received(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    tdir = resolve_task_dir(root, args.task_dir)
+    with task_lifecycle_lock(tdir):
+        return _command_received_locked(args, root, tdir)
+
+
+def _command_received_locked(
+    args: argparse.Namespace,
+    root: Path,
+    tdir: Path,
+) -> int:
+    if reject_flow_signal_after_terminal(tdir, "received"):
+        return 1
+    ts = utc_now()
+    write_marker(tdir, "received", args.worker, ts)
+    reconciliation = reconcile_pending_acceptance_fence(
+        root,
+        tdir,
+        args.worker,
+        observed_at=ts,
+        signal="received",
+    )
+    write_status(root, tdir, build_protocol_status(root, tdir, status="received", signal="received", worker=args.worker, ts=ts))
+    event(
+        root,
+        tdir,
+        event_name="task_signal_received",
+        signal="received",
+        worker=args.worker,
+        ts=ts,
+        acceptance_fence_reconciliation=reconciliation.get("status"),
+    )
+    maybe_update_keep_session_title(
+        root,
+        tdir,
+        args.worker,
+        reconciliation=reconciliation,
+        signal="received",
+        ts=ts,
+    )
+    print(f"received: {rel(tdir, root)}")
+    return 0
+
+
+def command_started(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    tdir = resolve_task_dir(root, args.task_dir)
+    with task_lifecycle_lock(tdir):
+        return _command_started_locked(args, root, tdir)
+
+
+def _command_started_locked(
+    args: argparse.Namespace,
+    root: Path,
+    tdir: Path,
+) -> int:
+    if reject_flow_signal_after_terminal(tdir, "started"):
+        return 1
+    ts = utc_now()
+    warnings = [] if marker_exists(tdir, "received") else ["started_without_received"]
+    write_marker(tdir, "started", args.worker, ts)
+    reconciliation = reconcile_pending_acceptance_fence(
+        root,
+        tdir,
+        args.worker,
+        observed_at=ts,
+        signal="started",
+    )
+    write_status(root, tdir, build_protocol_status(root, tdir, status="started", signal="started", worker=args.worker, ts=ts, warnings=warnings))
+    event(
+        root,
+        tdir,
+        event_name="task_signal_started",
+        signal="started",
+        worker=args.worker,
+        ts=ts,
+        warnings=warnings,
+        acceptance_fence_reconciliation=reconciliation.get("status"),
+    )
+    maybe_update_keep_session_title(
+        root,
+        tdir,
+        args.worker,
+        reconciliation=reconciliation,
+        signal="started",
+        ts=ts,
+    )
+    print(f"started: {rel(tdir, root)}")
+    return 0
+
+
+def command_heartbeat(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    tdir = resolve_task_dir(root, args.task_dir)
+    with task_lifecycle_lock(tdir):
+        return _command_heartbeat_locked(args, root, tdir)
+
+
+def _command_heartbeat_locked(
+    args: argparse.Namespace,
+    root: Path,
+    tdir: Path,
+) -> int:
+    if reject_flow_signal_after_terminal(tdir, "heartbeat"):
+        return 1
+    ts = utc_now()
+    warnings = [] if marker_exists(tdir, "started") else ["heartbeat_without_started"]
+    write_marker(tdir, "heartbeat", args.worker, ts)
+    reconciliation = reconcile_pending_acceptance_fence(
+        root,
+        tdir,
+        args.worker,
+        observed_at=ts,
+        signal="heartbeat",
+    )
+    write_status(root, tdir, build_protocol_status(root, tdir, status="heartbeat", signal="heartbeat", worker=args.worker, ts=ts, warnings=warnings))
+    event(
+        root,
+        tdir,
+        event_name="task_signal_heartbeat",
+        signal="heartbeat",
+        worker=args.worker,
+        ts=ts,
+        warnings=warnings,
+        acceptance_fence_reconciliation=reconciliation.get("status"),
+    )
+    maybe_update_keep_session_title(
+        root,
+        tdir,
+        args.worker,
+        reconciliation=reconciliation,
+        signal="heartbeat",
+        ts=ts,
+    )
+    print(f"heartbeat: {rel(tdir, root)}")
+    return 0
+
+
+def marker_worker(tdir: Path, name: str) -> str:
+    content = read_text(marker_path(tdir, name))
+    for token in content.split():
+        if token.startswith("worker="):
+            return token.removeprefix("worker=").strip()
+    return ""
+
+
+def checkpoint_current_attempt(tdir: Path) -> tuple[str, str | None]:
+    """Return the authoritative current attempt or a refusal reason.
+
+    Acceptance fence is authoritative for the current attempt. A disagreeing
+    task.json attempt is a conflict and refuses instead of being resolved
+    silently in favor of either record.
+    """
+    metadata = read_json(tdir / "task.json")
+    fence = read_json(tdir / "acceptance_fence.json")
+    fence_attempt = str(fence.get("attempt_id") or "")
+    task_json_attempt = str(metadata.get("attempt_id") or "")
+    if not fence_attempt:
+        return "", "acceptance_fence carries no attempt identity"
+    if task_json_attempt and task_json_attempt != fence_attempt:
+        return "", (
+            f"identity conflict: task.json attempt {task_json_attempt} "
+            f"disagrees with fence attempt {fence_attempt}"
+        )
+    return fence_attempt, None
+
+
+def command_checkpoint(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    tdir = resolve_task_dir(root, args.task_dir)
+    with task_lifecycle_lock(tdir):
+        return _command_checkpoint_locked(args, root, tdir)
+
+
+def _checkpoint_duplicate_result(
+    prior: dict[str, Any],
+    tdir: Path,
+    root: Path,
+    *,
+    json_output: bool,
+) -> int:
+    payload = {
+        "task_dir": rel(tdir, root),
+        "duplicate": True,
+        "record": prior,
+    }
+    if json_output:
+        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
+    else:
+        print(
+            f"checkpoint: duplicate=true seq={prior.get('seq')} "
+            f"request_id={prior.get('request_id')}"
+        )
+    return 0
+
+
+def _command_checkpoint_locked(
+    args: argparse.Namespace,
+    root: Path,
+    tdir: Path,
+) -> int:
+    if reject_flow_signal_after_terminal(tdir, "checkpoint"):
+        return 1
+    owner = read_text(tdir / "owner").strip()
+    if not owner:
+        print("ERROR: checkpoint refused: task has no recorded owner", file=sys.stderr)
+        return 1
+    if owner != args.worker:
+        print(
+            f"ERROR: checkpoint refused: worker {args.worker} does not match task owner {owner}",
+            file=sys.stderr,
+        )
+        return 1
+    if not marker_exists(tdir, "started"):
+        print(
+            "ERROR: checkpoint refused: task has no started marker",
+            file=sys.stderr,
+        )
+        return 1
+    started_worker = marker_worker(tdir, "started")
+    if started_worker != args.worker:
+        print(
+            f"ERROR: checkpoint refused: started marker worker {started_worker or '-'} does not match {args.worker}",
+            file=sys.stderr,
+        )
+        return 1
+    attempt_id, identity_error = checkpoint_current_attempt(tdir)
+    if identity_error:
+        print(f"ERROR: checkpoint refused: {identity_error}", file=sys.stderr)
+        return 1
+    claimed_attempt = str(args.attempt_id or "").strip()
+    if claimed_attempt != attempt_id:
+        print(
+            f"ERROR: checkpoint refused: caller attempt {claimed_attempt or '-'} does not match current attempt {attempt_id}",
+            file=sys.stderr,
+        )
+        return 1
+    fence = read_json(tdir / "acceptance_fence.json")
+    guard = acceptance_guard_snapshot(root, tdir, args.worker, fence)
+    if not guard.get("ok"):
+        print(
+            "ERROR: checkpoint refused: current binding/owner-lock guard failed: "
+            f"{guard.get('status')} ({','.join(acceptance_guard_mismatches(guard)) or '-'})",
+            file=sys.stderr,
+        )
+        return 1
+    request_id = str(args.request_id or "").strip()
+    if not request_id or len(request_id) > 128:
+        print(
+            "ERROR: checkpoint refused: --request-id is required (1..128 characters)",
+            file=sys.stderr,
+        )
+        return 1
+    evidence_paths = list(args.evidence_path or [])
+    errors = validate_checkpoint_content(
+        name=str(args.name or ""),
+        summary=str(args.summary or ""),
+        next_action=str(args.next_action or ""),
+        blocker=str(args.blocker or ""),
+        evidence_paths=evidence_paths,
+    )
+    for item in evidence_paths:
+        if not evidence_path_in_scope(tdir, item):
+            errors.append(
+                f"evidence path escapes the task directory: {item}"
+            )
+            break
+    if errors:
+        for item in errors:
+            print(f"ERROR: checkpoint refused: {item}", file=sys.stderr)
+        return 1
+    store = read_progress_checkpoints(tdir)
+    request_hash = canonical_request_hash(
+        request_id=request_id,
+        worker=args.worker,
+        attempt_id=attempt_id,
+        name=str(args.name or ""),
+        summary=str(args.summary or ""),
+        next_action=str(args.next_action or ""),
+        blocker=str(args.blocker or ""),
+        evidence_paths=evidence_paths,
+        needs_decision=bool(args.needs_decision),
+        key=bool(args.key),
+    )
+    prior = next(
+        (
+            record
+            for record in reversed(store["records"])
+            if record.get("request_id") == request_id
+        ),
+        None,
+    )
+    if prior is not None:
+        if str(prior.get("request_hash") or "") != request_hash:
+            print(
+                f"ERROR: checkpoint refused: request_id {request_id} already exists with different content",
+                file=sys.stderr,
+            )
+            return 1
+        return _checkpoint_duplicate_result(prior, tdir, root, json_output=bool(args.json))
+    integrity_errors = store_integrity_errors(store)
+    if integrity_errors:
+        for item in integrity_errors:
+            print(f"ERROR: checkpoint refused: {item}", file=sys.stderr)
+        return 1
+    seq = latest_seq(store["records"]) + 1
+    try:
+        record = checkpoint_record(
+            ts=utc_now(),
+            request_id=request_id,
+            worker=args.worker,
+            attempt_id=attempt_id,
+            seq=seq,
+            name=str(args.name or ""),
+            summary=str(args.summary or ""),
+            next_action=str(args.next_action or ""),
+            blocker=str(args.blocker or ""),
+            evidence_paths=evidence_paths,
+            needs_decision=bool(args.needs_decision),
+            key=bool(args.key),
+            request_hash=request_hash,
+        )
+    except ValueError as exc:
+        print(f"ERROR: checkpoint refused: {exc}", file=sys.stderr)
+        return 1
+    append_jsonl(tdir / PROGRESS_CHECKPOINTS_FILENAME, record)
+    event(
+        root,
+        tdir,
+        event_name="task_signal_checkpoint",
+        signal="checkpoint",
+        worker=args.worker,
+        ts=record["ts"],
+        seq=seq,
+        checkpoint_name=str(args.name or ""),
+        key=bool(args.key),
+        needs_decision=bool(args.needs_decision),
+        attempt_id=attempt_id,
+        request_id=request_id,
+    )
+    payload = {
+        "task_dir": rel(tdir, root),
+        "duplicate": False,
+        **record,
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
+    else:
+        print(
+            f"checkpoint: seq={seq} key={str(bool(args.key)).lower()} "
+            f"needs_decision={str(bool(args.needs_decision)).lower()}"
+        )
+    return 0
+
+
+def acceptance_guard_mismatches(guard: dict[str, Any]) -> list[str]:
+    mismatched = list(guard.get("invalid_fields") or [])
+    if not guard.get("binding_matches"):
+        mismatched.append("current_binding")
+    if not guard.get("owner_lock_matches"):
+        mismatched.append("owner_lock")
+    return mismatched
+
+
+def converted_budget_projection_matches(
+    prior: object,
+    current: dict[str, Any],
+    expected_state: str,
+) -> bool:
+    required = {
+        "configured",
+        "used_bytes",
+        "warning_bytes",
+        "hard_limit_bytes",
+        "terminal_reserve_bytes",
+        "remaining_bytes",
+        "state",
+    }
+    if (
+        not isinstance(prior, dict)
+        or not required.issubset(prior)
+        or prior.get("configured") is not True
+        or prior.get("state") != expected_state
+        or current.get("state") != expected_state
+    ):
+        return False
+    numeric_fields = (
+        "used_bytes",
+        "warning_bytes",
+        "hard_limit_bytes",
+        "terminal_reserve_bytes",
+        "remaining_bytes",
+    )
+    if expected_state == "scan_failed":
+        return (
+            all(prior.get(field) is None for field in numeric_fields)
+            and isinstance(prior.get("errors"), list)
+            and bool(prior["errors"])
+            and all(isinstance(error, str) for error in prior["errors"])
+        )
+    if expected_state != "exceeded" or any(
+        type(prior.get(field)) is not int for field in numeric_fields
+    ):
+        return False
+    return (
+        all(
+            prior.get(field) == current.get(field)
+            for field in (
+                "warning_bytes",
+                "hard_limit_bytes",
+                "terminal_reserve_bytes",
+            )
+        )
+        and prior["used_bytes"] >= 0
+        and prior["remaining_bytes"]
+        == max(prior["hard_limit_bytes"] - prior["used_bytes"], 0)
+        and prior["used_bytes"] + prior["terminal_reserve_bytes"]
+        > prior["hard_limit_bytes"]
+    )
+
+
+def commit_terminal_marker(
+    root: Path,
+    tdir: Path,
+    *,
+    marker: str,
+    state: str,
+    worker: str,
+    ts: str,
+) -> int:
+    existing = [name for name in TERMINAL_MARKERS if marker_exists(tdir, name)]
+    prior_protocol = read_json(tdir / "protocol_status.json")
+    prior_error_code = prior_protocol.get("error_code")
+    prior_budget = prior_protocol.get("evidence_budget")
+    expected_budget_state = {
+        "evidence_budget_exceeded": "exceeded",
+        "evidence_budget_scan_failed": "scan_failed",
+    }.get(prior_error_code)
+    converted_candidate = (
+        state == "done"
+        and existing == ["blocked"]
+        and prior_protocol.get("requested_terminal_state") == "done"
+        and prior_protocol.get("effective_terminal_state") == "blocked"
+        and expected_budget_state is not None
+    )
+    current_budget = (
+        task_evidence_budget_status(tdir)
+        if converted_candidate
+        else None
+    )
+    converted_idempotent = (
+        converted_candidate
+        and current_budget is not None
+        and converted_budget_projection_matches(
+            prior_budget,
+            current_budget,
+            expected_budget_state,
+        )
+    )
+    if converted_idempotent:
+        budget = prior_budget
+        write_status(
+            root,
+            tdir,
+            build_protocol_status(
+                root,
+                tdir,
+                status=STATE_TO_STATUS["blocked"],
+                signal="finish",
+                worker=worker,
+                ts=ts,
+                terminal_state="blocked",
+                requested_terminal_state="done",
+                effective_terminal_state="blocked",
+                error_code=str(prior_error_code),
+                evidence_budget=budget,
+            ),
+        )
+        event(
+            root,
+            tdir,
+            event_name="task_signal_finish_idempotent",
+            signal="finish",
+            worker=worker,
+            ts=ts,
+            state="blocked",
+            requested_state="done",
+            effective_state="blocked",
+            error_code=prior_error_code,
+        )
+        print(f"finish_idempotent: blocked {rel(tdir, root)}")
+        return 0
+
+    if existing and existing != [marker]:
+        errors = [
+            f"terminal marker conflict: existing={','.join(existing)} "
+            f"requested={marker}"
+        ]
+        write_status(
+            root,
+            tdir,
+            build_protocol_status(
+                root,
+                tdir,
+                status="invalid_conflicting_terminal_markers",
+                signal="finish",
+                worker=worker,
+                ts=ts,
+                errors=errors,
+                terminal_state=state,
+            ),
+        )
+        event(
+            root,
+            tdir,
+            event_name="task_signal_finish_conflict",
+            signal="finish",
+            worker=worker,
+            ts=ts,
+            state=state,
+            errors=errors,
+        )
+        print(f"ERROR: {errors[0]}", file=sys.stderr)
+        return 1
+
+    if existing == [marker]:
+        write_status(
+            root,
+            tdir,
+            build_protocol_status(
+                root,
+                tdir,
+                status=STATE_TO_STATUS[state],
+                signal="finish",
+                worker=worker,
+                ts=ts,
+                terminal_state=state,
+            ),
+        )
+        event(
+            root,
+            tdir,
+            event_name="task_signal_finish_idempotent",
+            signal="finish",
+            worker=worker,
+            ts=ts,
+            state=state,
+        )
+        print(f"finish_idempotent: {state} {rel(tdir, root)}")
+        return 0
+
+    requested_state = state
+    budget = task_evidence_budget_status(tdir)
+    error_code = ""
+    if requested_state == "done" and budget["state"] in {
+        "exceeded",
+        "scan_failed",
+    }:
+        state = "blocked"
+        marker = STATE_TO_MARKER[state]
+        error_code = (
+            "evidence_budget_exceeded"
+            if budget["state"] == "exceeded"
+            else "evidence_budget_scan_failed"
+        )
+
+    write_marker(tdir, marker, worker, ts, durable=True)
+    write_status(
+        root,
+        tdir,
+        build_protocol_status(
+            root,
+            tdir,
+            status=STATE_TO_STATUS[state],
+            signal="finish",
+            worker=worker,
+            ts=ts,
+            terminal_state=state,
+            requested_terminal_state=requested_state,
+            effective_terminal_state=state,
+            error_code=error_code,
+            evidence_budget=budget,
+        ),
+        durable=True,
+    )
+    event(
+        root,
+        tdir,
+        event_name="task_signal_finish",
+        signal="finish",
+        worker=worker,
+        ts=ts,
+        state=state,
+        requested_state=requested_state,
+        effective_state=state,
+        error_code=error_code,
+        evidence_budget_state=budget["state"],
+        evidence_budget_used_bytes=budget["used_bytes"],
+        evidence_budget_warning_bytes=budget["warning_bytes"],
+        evidence_budget_hard_limit_bytes=budget["hard_limit_bytes"],
+        evidence_budget_errors=budget.get("errors", []),
+    )
+    print(f"finish: {state} {rel(tdir, root)}")
+    return 0
+
+
+def refuse_non_durable_prerequisites(
+    root: Path,
+    tdir: Path,
+    *,
+    worker: str,
+    ts: str,
+    state: str,
+    barrier: dict[str, Any],
+) -> int:
+    errors = [
+        "terminal closeout prerequisites are not durable: "
+        + str(barrier.get("reason") or "")
+        + (f" ({barrier.get('error')})" if barrier.get("error") else "")
+    ]
+    write_status(
+        root,
+        tdir,
+        build_protocol_status(
+            root,
+            tdir,
+            status="finish_refused_prerequisite_durability",
+            signal="finish",
+            worker=worker,
+            ts=ts,
+            errors=errors,
+            terminal_state=state,
+        ),
+    )
+    event(
+        root,
+        tdir,
+        event_name="task_signal_finish_refused_prerequisite_durability",
+        signal="finish",
+        worker=worker,
+        ts=ts,
+        state=state,
+        reason=str(barrier.get("reason") or ""),
+    )
+    print(f"ERROR: {errors[0]}", file=sys.stderr)
+    return 1
+
+
+def recovery_dispatch_module():
+    return SourceFileLoader(
+        "omx_dispatch_recovery_closeout", str(_THIS_FILE.parent / "omx_visible_dispatch")
+    ).load_module()
+
+
+def command_operator_recovery_finish(
+    root: Path,
+    tdir: Path,
+    args: argparse.Namespace,
+    *,
+    ts: str,
+    state: str,
+    marker: str,
+) -> int:
+    if state not in {"blocked", "fail"}:
+        print(
+            "ERROR: operator recovery closeout only allows blocked or fail",
+            file=sys.stderr,
+        )
+        return 1
+    if not OPERATOR_RECOVERY_SUPPORT_AVAILABLE:
+        print(
+            "ERROR: operator recovery closeout requires the "
+            "terminal_acceptance module",
+            file=sys.stderr,
+        )
+        return 1
+    fence = read_json(tdir / "acceptance_fence.json")
+    if not fence:
+        print(
+            "ERROR: operator recovery closeout requires acceptance_fence.json",
+            file=sys.stderr,
+        )
+        return 1
+    operator_recovery_session = str(fence.get("session_id") or "")
+    operator_recovery_worker = registered_worker(
+        root, str(fence.get("worker_id") or ""))
+    operator_recovery_is_codex = bool(
+        isinstance(operator_recovery_worker, dict)
+        and str(operator_recovery_worker.get("backend") or "") == "codex_tui"
+        and operator_recovery_session
+        and operator_recovery_session == str(
+            operator_recovery_worker.get("codex_thread") or ""))
+    if not operator_recovery_session.startswith("ses_") \
+            and not operator_recovery_is_codex:
+        print(
+            "ERROR: operator recovery closeout refuses a pending acceptance "
+            "fence without an observed session; quarantine the reviewed "
+            "nonterminal lock instead of writing recovery terminal markers",
+            file=sys.stderr,
+        )
+        return 1
+    authorization_path = (
+        tdir / OPERATOR_RECOVERY_AUTHORIZATION_FILE
+    )
+    consumption_path = (
+        tdir / OPERATOR_RECOVERY_CONSUMPTION_FILE
+    )
+    authorization = read_json(authorization_path)
+    claim = build_operator_recovery_claim(
+        fence,
+        authorization,
+        {},
+        state=state,
+        created_at=ts,
+    )
+    guard_before = acceptance_guard_snapshot(
+        root,
+        tdir,
+        args.worker,
+        fence,
+    )
+    mismatched = compare_acceptance_identity(fence, claim)
+    mismatched.extend(invalid_generation_fields(fence))
+    mismatched.extend(invalid_generation_fields(claim))
+    mismatched.extend(
+        operator_recovery_acceptance_mismatches(
+            tdir,
+            fence,
+            claim,
+            authorization,
+            {},
+            require_consumption=False,
+        )
+    )
+    guard_mismatch_before = acceptance_guard_mismatches(guard_before)
+    quarantine_evidence: dict[str, Any] = {}
+    quarantine_route = False
+    if guard_mismatch_before:
+        # #1014: after a reviewed reboot-stale quarantine archived the old
+        # owner lock and the worker was rebound, the current binding and
+        # owner lock legitimately belong to newer work. When the only guard
+        # mismatches are that newer-work drift and the quarantine provenance
+        # (archived old-lock identity plus a still-stopped old boot
+        # generation) validates, the old attempt may close through this
+        # evidence instead of a live binding/lock equality that can never
+        # hold again. The new owner lock is never treated as the old actor.
+        quarantine_evidence = quarantined_owner_stopped_evidence(
+            root,
+            tdir,
+            fence,
+            worker_id=args.worker,
+        )
+        live_lock = guard_before.get("owner_lock") or {}
+        live_lock_references_task = (
+            str(live_lock.get("run") or "") == tdir.parent.parent.name
+            and str(live_lock.get("task") or "") == tdir.name
+        )
+        quarantine_route = bool(
+            quarantine_evidence.get("ok")
+            and set(guard_mismatch_before)
+            <= {"current_binding", "owner_lock"}
+            and not live_lock_references_task
+        )
+        if not quarantine_route:
+            mismatched.extend(guard_mismatch_before)
+
+    with visible_registry_lock(root):
+        current_fence = read_json(tdir / "acceptance_fence.json")
+        current_authorization = read_json(authorization_path)
+        guard_after = acceptance_guard_snapshot(
+            root,
+            tdir,
+            args.worker,
+            current_fence,
+        )
+        current_claim = build_operator_recovery_claim(
+            current_fence,
+            current_authorization,
+            {},
+            state=state,
+            created_at=ts,
+        )
+        if current_fence != fence:
+            mismatched.append("acceptance_fence")
+        if current_authorization != authorization:
+            mismatched.append("recovery_authorization")
+        if (
+            guard_after.get("worker_identity")
+            != guard_before.get("worker_identity")
+        ):
+            mismatched.append("current_binding")
+        if guard_after.get("owner_lock_transition") != guard_before.get(
+            "owner_lock_transition"
+        ):
+            mismatched.append("owner_lock")
+        if quarantine_route:
+            current_quarantine_evidence = quarantined_owner_stopped_evidence(
+                root,
+                tdir,
+                current_fence,
+                worker_id=args.worker,
+            )
+            if not current_quarantine_evidence.get("ok"):
+                mismatched.append("quarantine_provenance")
+        else:
+            mismatched.extend(acceptance_guard_mismatches(guard_after))
+        mismatched.extend(
+            operator_recovery_acceptance_mismatches(
+                tdir,
+                current_fence,
+                current_claim,
+                current_authorization,
+                {},
+                require_consumption=False,
+            )
+        )
+        if consumption_path.exists():
+            mismatched.append("recovery_authorization_consumed")
+        stop_observation: dict[str, Any] = {}
+        if not mismatched and not quarantine_route:
+            try:
+                stop_observation = recovery_stop_freshness(
+                    root, tdir, current_fence, current_authorization,
+                    dispatch=recovery_dispatch_module(),
+                )
+            except Exception as exc:
+                stop_observation = {"ok": False, "errors": [f"stop observation unknown: {type(exc).__name__}: {exc}"]}
+            if not stop_observation.get("ok"):
+                mismatched.append("recovery_stop_freshness")
+            if read_json(tdir / "acceptance_fence.json") != current_fence:
+                mismatched.append("acceptance_fence")
+            if read_json(authorization_path) != current_authorization:
+                mismatched.append("recovery_authorization")
+            final_guard = acceptance_guard_snapshot(root, tdir, args.worker, current_fence)
+            if final_guard != guard_after:
+                mismatched.append("recovery_guard_during_observation")
+            mismatched.extend(operator_recovery_acceptance_mismatches(
+                tdir, current_fence, current_claim, current_authorization, {},
+                require_consumption=False,
+            ))
+        consumption: dict[str, Any] = {}
+        if not mismatched:
+            activity_guard = current_authorization.get(
+                "activity_guard"
+            )
+            activity_snapshot_hash = (
+                str(activity_guard.get("activity_snapshot_hash") or "")
+                if isinstance(activity_guard, dict)
+                else ""
+            )
+            consumption = {
+                "schema_version": 1,
+                "consumption_kind": OPERATOR_RECOVERY_CLAIM_KIND,
+                "authorization_id": str(
+                    current_authorization.get("authorization_id") or ""
+                ),
+                "authorization_hash": recovery_authorization_hash(
+                    current_authorization
+                ),
+                "activity_snapshot_hash": activity_snapshot_hash,
+                "run_id": tdir.parent.parent.name,
+                "task_id": tdir.name,
+                "worker_id": args.worker,
+                "state": state,
+                "consumed_at": ts,
+                "stop_observation": stop_observation,
+            }
+            atomic_write_json(consumption_path, consumption)
+            claim = build_operator_recovery_claim(
+                current_fence,
+                current_authorization,
+                consumption,
+                state=state,
+                created_at=ts,
+            )
+            mismatched.extend(
+                compare_acceptance_identity(
+                    current_fence,
+                    claim,
+                )
+            )
+            mismatched.extend(
+                invalid_generation_fields(current_fence)
+            )
+            mismatched.extend(
+                invalid_generation_fields(claim)
+            )
+            mismatched.extend(
+                operator_recovery_acceptance_mismatches(
+                    tdir,
+                    current_fence,
+                    claim,
+                    current_authorization,
+                    consumption,
+                    require_consumption=True,
+                )
+            )
+            if quarantine_route:
+                claim = {
+                    **claim,
+                    "closeout_authority": "quarantine_provenance",
+                    "quarantine_closeout_evidence": {
+                        "quarantine_basis": str(
+                            quarantine_evidence.get("quarantine_basis") or ""
+                        ),
+                        "archived_lock": str(
+                            quarantine_evidence.get("archived_lock") or ""
+                        ),
+                        "archived_owner_lock_id": str(
+                            quarantine_evidence.get("archived_owner_lock_id")
+                            or ""
+                        ),
+                        "conditions": dict(
+                            quarantine_evidence.get("conditions") or {}
+                        ),
+                    },
+                }
+        mismatched = sorted(set(mismatched))
+        if mismatched:
+            rejection = {
+                "schema_version": 1,
+                "rejection_kind": (
+                    "operator_recovery_terminal_acceptance_fence"
+                ),
+                "created_at": ts,
+                "state": state,
+                "worker": args.worker,
+                "mismatched_fields": mismatched,
+                "expected": current_fence,
+                "claim": claim,
+                "recovery_authorization": current_authorization,
+                "recovery_consumption": consumption,
+                "guard_before": guard_before,
+                "guard_after": guard_after,
+                "quarantine_route": quarantine_route,
+                "quarantine_evidence": quarantine_evidence,
+                "stop_observation": stop_observation,
+            }
+            atomic_write_json(
+                tdir / "terminal_output_rejection.json",
+                rejection,
+            )
+            errors = [
+                "operator recovery acceptance fence mismatch: "
+                + ",".join(mismatched)
+            ]
+            write_status(
+                root,
+                tdir,
+                build_protocol_status(
+                    root,
+                    tdir,
+                    status=(
+                        "finish_refused_operator_recovery_fence"
+                    ),
+                    signal="finish",
+                    worker=args.worker,
+                    ts=ts,
+                    errors=errors,
+                    terminal_state=state,
+                ),
+            )
+            event(
+                root,
+                tdir,
+                event_name=(
+                    "task_signal_finish_refused_operator_recovery"
+                ),
+                signal="finish",
+                worker=args.worker,
+                ts=ts,
+                state=state,
+                mismatched_fields=mismatched,
+            )
+            print(f"ERROR: {errors[0]}", file=sys.stderr)
+            return 1
+
+        barrier = pin_terminal_prerequisites(tdir)
+        if not barrier.get("ok"):
+            return refuse_non_durable_prerequisites(
+                root,
+                tdir,
+                worker=args.worker,
+                ts=ts,
+                state=state,
+                barrier=barrier,
+            )
+        durable_write_json(tdir / "terminal_output_claim.json", claim)
+        return commit_terminal_marker(
+            root,
+            tdir,
+            marker=marker,
+            state=state,
+            worker=args.worker,
+            ts=ts,
+        )
+
+
+def command_finish(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    tdir = resolve_task_dir(root, args.task_dir)
+    with task_lifecycle_lock(tdir):
+        return _command_finish_locked(args, root, tdir)
+
+
+def _command_finish_locked(
+    args: argparse.Namespace,
+    root: Path,
+    tdir: Path,
+) -> int:
+    ts = utc_now()
+    state = args.state
+    marker = STATE_TO_MARKER[state]
+    report = tdir / "report.md"
+    if file_size(report) <= 0:
+        status = build_protocol_status(
+            root,
+            tdir,
+            status="finish_refused_missing_report",
+            signal="finish",
+            worker=args.worker,
+            ts=ts,
+            errors=["report.md is missing or empty"],
+            finish_refused_missing_report=True,
+            terminal_state=state,
+        )
+        write_status(root, tdir, status)
+        event(
+            root,
+            tdir,
+            event_name="task_signal_finish_refused",
+            signal="finish",
+            worker=args.worker,
+            ts=ts,
+            state=state,
+            reason="missing_report",
+        )
+        print("ERROR: refusing finish because report.md is missing or empty", file=sys.stderr)
+        return 1
+
+    existing = [name for name in TERMINAL_MARKERS if marker_exists(tdir, name)]
+    if existing:
+        acceptance = terminal_acceptance_status(tdir)
+        if acceptance.get("accepted"):
+            return commit_terminal_marker(
+                root,
+                tdir,
+                marker=marker,
+                state=state,
+                worker=args.worker,
+                ts=ts,
+            )
+        errors = [
+            "existing terminal marker has invalid acceptance evidence: "
+            + ",".join(acceptance.get("mismatched_fields") or [])
+        ]
+        write_status(
+            root,
+            tdir,
+            build_protocol_status(
+                root,
+                tdir,
+                status="invalid_terminal_acceptance_fence",
+                signal="finish",
+                worker=args.worker,
+                ts=ts,
+                errors=errors,
+                terminal_state=state,
+            ),
+        )
+        event(
+            root,
+            tdir,
+            event_name="task_signal_finish_invalid_existing_acceptance",
+            signal="finish",
+            worker=args.worker,
+            ts=ts,
+            state=state,
+            mismatched_fields=acceptance.get("mismatched_fields") or [],
+        )
+        print(f"ERROR: {errors[0]}", file=sys.stderr)
+        return 1
+
+    if args.operator_recovery_closeout:
+        return command_operator_recovery_finish(
+            root,
+            tdir,
+            args,
+            ts=ts,
+            state=state,
+            marker=marker,
+        )
+
+    pending = pending_supplement_ids(tdir, args.worker)
+    if pending:
+        errors = [
+            "pending supplement(s): " + ",".join(pending)
+            + "; consume and acknowledge each with checkpoint --name supplement:<id>, "
+            "complete its outcome/report before retrying finish; if consumption is "
+            "impossible, use the existing authorized stopped-task recovery closeout"
+        ]
+        write_status(
+            root, tdir,
+            build_protocol_status(
+                root, tdir, status="finish_refused_pending_supplement",
+                signal="finish", worker=args.worker, ts=ts, errors=errors,
+                terminal_state=state, error_code="pending_supplement",
+            ),
+        )
+        event(
+            root, tdir, event_name="task_signal_finish_refused_pending_supplement",
+            signal="finish", worker=args.worker, ts=ts, state=state,
+            pending_supplement_ids=pending,
+        )
+        print(f"ERROR: {errors[0]}", file=sys.stderr)
+        return 1
+
+    reconciliation = reconcile_pending_acceptance_fence(
+        root,
+        tdir,
+        args.worker,
+        observed_at=ts,
+        signal="finish",
+    )
+    fence = read_json(tdir / "acceptance_fence.json")
+    acceptance = terminal_acceptance_status(tdir)
+    protocol_classification = str(
+        acceptance.get("protocol_classification") or ""
+    )
+    if protocol_classification == TERMINAL_PROTOCOL_CLASSIFICATION_INVALID or (
+        protocol_classification == TERMINAL_PROTOCOL_CLASSIFICATION_MODERN
+        and not fence
+    ):
+        mismatched = list(acceptance.get("mismatched_fields") or [])
+        if not fence:
+            mismatched.append("acceptance_fence")
+        mismatched = sorted(set(mismatched))
+        errors = [
+            "terminal protocol identity is invalid: "
+            + ",".join(mismatched)
+        ]
+        write_status(
+            root,
+            tdir,
+            build_protocol_status(
+                root,
+                tdir,
+                status="invalid_terminal_acceptance_fence",
+                signal="finish",
+                worker=args.worker,
+                ts=ts,
+                errors=errors,
+                terminal_state=state,
+            ),
+        )
+        event(
+            root,
+            tdir,
+            event_name="task_signal_finish_invalid_terminal_protocol",
+            signal="finish",
+            worker=args.worker,
+            ts=ts,
+            state=state,
+            mismatched_fields=mismatched,
+        )
+        print(f"ERROR: {errors[0]}", file=sys.stderr)
+        return 1
+    if not fence:
+        return commit_terminal_marker(
+            root,
+            tdir,
+            marker=marker,
+            state=state,
+            worker=args.worker,
+            ts=ts,
+        )
+
+    expected_session_id = str(fence.get("session_id") or "").strip()
+    session_fence_state = str(fence.get("session_fence_state") or "")
+    provided = fill_finish_identity_from_fence(args, fence)
+    provided_session_id = str(provided.get("session_id") or "").strip()
+    claim = build_terminal_output_claim(
+        fence,
+        provided,
+        state=state,
+        created_at=ts,
+    )
+    guard_before = acceptance_guard_snapshot(
+        root,
+        tdir,
+        args.worker,
+        fence,
+    )
+    if guard_before.get("ok"):
+        live_session_observation = observe_live_opencode_session(
+            root,
+            args.worker,
+            expected_session_id,
+            observed_at=ts,
+            worker=guard_before.get("worker"),
+        )
+    else:
+        live_session_observation = {
+            "source": "opencode_session_status",
+            "observed_at": ts,
+            "worker_id": args.worker,
+            "expected_session_id": expected_session_id,
+            "session_ids": [],
+            "matches": False,
+            "status": "acceptance_guard_failed",
+            "error": str(guard_before.get("status") or ""),
+        }
+    claim["live_session_observation"] = live_session_observation
+    mismatched = compare_acceptance_identity(fence, claim)
+    mismatched.extend(invalid_generation_fields(fence))
+    mismatched.extend(invalid_generation_fields(claim))
+    if (
+        "session_fence_state" in fence
+        and session_fence_state != "live_observed"
+    ):
+        mismatched.append("session_fence_state")
+    fence_worker = guard_before.get("worker") if isinstance(
+        guard_before.get("worker"), dict) else {}
+    fence_backend = str(fence_worker.get("backend") or "opencode_tui")
+    if fence_backend != "codex_tui" and not expected_session_id.startswith("ses_"):
+        mismatched.append("session_id")
+    if fence_backend == "codex_tui" and not str(
+        fence_worker.get("codex_thread") or ""
+    ):
+        mismatched.append("codex_thread_binding")
+    if not live_session_observation.get("matches"):
+        mismatched.append("live_session_id")
+    mismatched.extend(acceptance_guard_mismatches(guard_before))
+
+    with visible_registry_lock(root):
+        current_fence = read_json(tdir / "acceptance_fence.json")
+        guard_after = acceptance_guard_snapshot(
+            root,
+            tdir,
+            args.worker,
+            current_fence,
+        )
+        mismatched.extend(acceptance_guard_mismatches(guard_after))
+        if current_fence != fence:
+            mismatched.append("acceptance_fence")
+        if (
+            guard_after.get("worker_identity")
+            != guard_before.get("worker_identity")
+        ):
+            mismatched.append("current_binding")
+        if guard_after.get("owner_lock_transition") != guard_before.get(
+            "owner_lock_transition"
+        ):
+            mismatched.append("owner_lock")
+        mismatched = sorted(set(mismatched))
+        if mismatched:
+            rejection = {
+                "schema_version": 1,
+                "rejection_kind": "terminal_output_acceptance_fence",
+                "created_at": ts,
+                "state": state,
+                "worker": args.worker,
+                "mismatched_fields": mismatched,
+                "expected": fence,
+                "claim": claim,
+                "live_session_observation": live_session_observation,
+                "guard_before": guard_before,
+                "guard_after": guard_after,
+            }
+            atomic_write_json(
+                tdir / "terminal_output_rejection.json",
+                rejection,
+            )
+            errors = [
+                "terminal output acceptance fence mismatch: "
+                + ",".join(mismatched)
+            ]
+            write_status(
+                root,
+                tdir,
+                build_protocol_status(
+                    root,
+                    tdir,
+                    status="finish_refused_acceptance_fence",
+                    signal="finish",
+                    worker=args.worker,
+                    ts=ts,
+                    errors=errors,
+                    terminal_state=state,
+                ),
+            )
+            event(
+                root,
+                tdir,
+                event_name="task_signal_finish_refused_acceptance_fence",
+                signal="finish",
+                worker=args.worker,
+                ts=ts,
+                state=state,
+                mismatched_fields=mismatched,
+                acceptance_fence_reconciliation=reconciliation.get("status"),
+            )
+            print(f"ERROR: {errors[0]}", file=sys.stderr)
+            return 1
+
+        barrier = pin_terminal_prerequisites(tdir)
+        if not barrier.get("ok"):
+            return refuse_non_durable_prerequisites(
+                root,
+                tdir,
+                worker=args.worker,
+                ts=ts,
+                state=state,
+                barrier=barrier,
+            )
+        durable_write_json(tdir / "terminal_output_claim.json", claim)
+        return commit_terminal_marker(
+            root,
+            tdir,
+            marker=marker,
+            state=state,
+            worker=args.worker,
+            ts=ts,
+        )
+
+
+def validate_task(root: Path, tdir: Path) -> tuple[list[str], list[str], dict[str, Any]]:
+    errors: list[str] = []
+    warnings: list[str] = []
+    snapshot = task_snapshot(tdir)
+    terminal = snapshot["terminal_markers"]
+    flow = snapshot["flow_markers"]
+    if len(terminal) > 1:
+        errors.append(f"conflicting terminal markers: {','.join(terminal)}")
+    if terminal and snapshot["report_bytes"] <= 0:
+        errors.append("terminal marker exists without non-empty report.md")
+    protocol = snapshot.get("protocol", {})
+    if protocol.get("status") == "finish_refused_missing_report":
+        errors.append("last finish was refused because report.md was missing or empty")
+    if "started" in flow and "received" not in flow:
+        warnings.append("started exists without received")
+    if "heartbeat" in flow and "started" not in flow:
+        warnings.append("heartbeat exists without started")
+    if terminal and "started" not in flow:
+        warnings.append("terminal marker exists without started")
+    return errors, warnings, snapshot
+
+
+STATUS_RECORD_RESERVED_NAMES = frozenset({
+    "task.json",
+    "task.md",
+    "prompt.txt",
+    "report.md",
+    "owner",
+    "events.jsonl",
+    "protocol_status.json",
+    "acceptance_fence.json",
+    "acceptance_fence_reconciliation.json",
+    "acceptance_fence_reconciliations.jsonl",
+    "dispatch.json",
+    "dispatch_claim.json",
+    "delivery.json",
+    "delivery_attempt.json",
+    "receipt_ack.json",
+    "session_action.json",
+    "session_rotation.json",
+    "pre_submit_tui_readiness.json",
+    "terminal_output_claim.json",
+    "terminal_output_rejection.json",
+    "quarantine.json",
+    "recovery_closeout_authorization.json",
+    "recovery_closeout_consumption.json",
+    PROGRESS_CHECKPOINTS_FILENAME,
+})
+
+
+def _reserved_record_basename(basename: str) -> bool:
+    return basename.startswith(".") or basename in STATUS_RECORD_RESERVED_NAMES
+
+
+def status_record_target(tdir: Path, name: str) -> Path:
+    """Resolve an opt-in task-local status evidence write target (#1048).
+
+    Reuses the checkpoint evidence-path shape and scope rules so a wrong
+    parent (already refused by resolve_task_dir) or an escaping, absolute,
+    or already-existing name is refused before anything is written. The
+    reserved-name refusal checks the ACTUAL resolved top-level target
+    inside the task directory, so an in-task alias such as
+    ``TASK_DIR/alias -> TASK_DIR`` cannot route ``alias/.done`` onto the
+    real marker/report/protocol names; the recorded file is evidence,
+    never a marker or protocol artifact.
+    """
+    shape_error = _evidence_shape_error(name)
+    if shape_error:
+        raise SignalError(f"--record name invalid: {shape_error}")
+    if not evidence_path_in_scope(tdir, name):
+        raise SignalError("--record name must resolve inside the task directory")
+    target = tdir / name
+    if target.parent == tdir and _reserved_record_basename(target.name):
+        raise SignalError(f"--record refuses reserved top-level name: {name}")
+    resolved = Path(os.path.realpath(target))
+    if resolved.parent == tdir and _reserved_record_basename(resolved.name):
+        raise SignalError(f"--record refuses reserved top-level name: {name}")
+    if target.is_symlink() or target.exists():
+        raise SignalError(f"--record target already exists: {name}")
+    if not target.parent.is_dir():
+        raise SignalError(f"--record parent directory does not exist: {name}")
+    return target
+
+
+def publish_record_exclusive(target: Path, name: str, tdir: Path, payload: dict[str, Any]) -> None:
+    """Bind the record validation to the actual write (#1048 review).
+
+    Re-checks scope and target absence immediately before an exclusive
+    temporary create and publishes with link(), so a target that appears
+    after validation is refused instead of replaced and no predictable or
+    symlinked temporary path is followed.
+    """
+    if not evidence_path_in_scope(tdir, name):
+        raise SignalError("--record name must resolve inside the task directory")
+    if target.is_symlink() or target.exists():
+        raise SignalError(f"--record target already exists: {name}")
+    data = json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+    tmp = target.with_name(f".{target.name}.record.{os.getpid()}.tmp")
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except FileExistsError as exc:
+        raise SignalError(f"--record failed: temporary path exists for {target.name}") from exc
+    except OSError as exc:
+        raise SignalError(f"--record failed for {target.name}: {exc}") from exc
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(data)
+        try:
+            os.link(tmp, target)
+        except FileExistsError as exc:
+            raise SignalError(f"--record target already exists: {name}") from exc
+        except OSError as exc:
+            raise SignalError(f"--record failed to publish {target.name}: {exc}") from exc
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+
+
+def status_record_owner_check(tdir: Path, worker: str) -> None:
+    """Refuse recording into a task the caller does not own (#1048).
+
+    A different existing task directory passes the shape validation, so the
+    existing owner record is the boundary that keeps a mistyped task path
+    from writing diagnostics into another task's domain.
+    """
+    owner = read_text(tdir / "owner").strip()
+    if not owner:
+        raise SignalError("--record refused: task has no recorded owner")
+    if owner != worker:
+        raise SignalError(
+            f"--record refused: worker {worker} does not match task owner {owner}"
+        )
+
+
+def command_status(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    tdir = resolve_task_dir(root, args.task_dir)
+    snapshot = task_snapshot(tdir)
+    payload = {
+        "schema_version": 1,
+        "task_dir": rel(tdir, root),
+        **snapshot,
+    }
+    record_name = getattr(args, "record", None)
+    if record_name is not None:
+        worker = str(getattr(args, "worker", "") or "")
+        if not worker:
+            raise SignalError("--record requires --worker")
+        status_record_owner_check(tdir, worker)
+        publish_record_exclusive(
+            status_record_target(tdir, record_name), record_name, tdir, payload
+        )
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
+        return 0
+    print(f"task_dir: {payload['task_dir']}")
+    print(f"status: {snapshot['status']}")
+    print(f"reason: {snapshot['reason']}")
+    print(f"flow_markers: {','.join(snapshot['flow_markers']) or '-'}")
+    print(f"terminal_markers: {','.join(snapshot['terminal_markers']) or '-'}")
+    print(f"report_bytes: {snapshot['report_bytes']}")
+    budget = snapshot["evidence_budget"]
+    print(
+        "evidence_budget: "
+        f"state={budget.get('state', '-')} "
+        f"bytes={budget.get('used_bytes', '-')}"
+    )
+    if budget.get("configured"):
+        print(
+            "evidence_scan: "
+            f"entries={budget.get('entry_count', '-')}/{budget.get('entry_limit', '-')} "
+            f"directories={budget.get('directory_count', '-')}/{budget.get('directory_limit', '-')}"
+        )
+    for error in budget.get("errors", []):
+        print(f"evidence_error: {error}")
+    protocol = snapshot.get("protocol", {})
+    if protocol:
+        print(f"last_signal: {protocol.get('last_signal', '-')}")
+        print(f"last_worker: {protocol.get('last_worker', '-')}")
+        print(f"last_ts: {protocol.get('last_ts', '-')}")
+        print(f"finish_refused_missing_report: {str(bool(protocol.get('finish_refused_missing_report'))).lower()}")
+    else:
+        print("protocol_status: absent")
+    return 0
+
+
+def command_validate(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    tdir = resolve_task_dir(root, args.task_dir)
+    errors, warnings, snapshot = validate_task(root, tdir)
+    print(f"task_dir: {rel(tdir, root)}")
+    print(f"status: {snapshot['status']}")
+    if errors:
+        print("Errors:")
+        for item in errors:
+            print(f"  - {item}")
+    else:
+        print("Errors: none")
+    if warnings:
+        print("Warnings:")
+        for item in warnings:
+            print(f"  - {item}")
+    else:
+        print("Warnings: none")
+    return 1 if errors else 0
+
+
+def add_common_task_args(parser: argparse.ArgumentParser, *, worker: bool = True) -> None:
+    parser.add_argument("--root", default=".")
+    parser.add_argument("--task-dir", required=True)
+    if worker:
+        parser.add_argument("--worker", required=True)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="omx_task_signal",
+        description=(
+            "Worker-side helper for visible-runs task markers. "
+            "Writes only marker/events/protocol_status files in one task directory."
+        ),
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    received = sub.add_parser("received", help="write .received and append a protocol event")
+    add_common_task_args(received)
+    received.set_defaults(func=command_received)
+
+    started = sub.add_parser("started", help="write .started and append a protocol event")
+    add_common_task_args(started)
+    started.set_defaults(func=command_started)
+
+    heartbeat = sub.add_parser("heartbeat", help="write .heartbeat and append a protocol event")
+    add_common_task_args(heartbeat)
+    heartbeat.set_defaults(func=command_heartbeat)
+
+    checkpoint = sub.add_parser(
+        "checkpoint",
+        help="append one structured advisory progress checkpoint (never terminal truth)",
+        description=(
+            "Append one validated progress checkpoint for the current "
+            "worker/task/attempt. Advisory only: it never writes terminal "
+            "markers, protocol status, or owner locks."
+        ),
+    )
+    add_common_task_args(checkpoint)
+    checkpoint.add_argument("--name", default="", help="checkpoint name from the task contract")
+    checkpoint.add_argument("--summary", required=True)
+    checkpoint.add_argument(
+        "--evidence-path",
+        action="append",
+        default=[],
+        help=(
+            "optional task-local relative path to an existing real file; "
+            "no symlink escape; external delivery authorization does not widen "
+            "this field; omit it and describe external delivery in --summary"
+        ),
+    )
+    checkpoint.add_argument("--next-action", default="")
+    checkpoint.add_argument("--needs-decision", action="store_true")
+    checkpoint.add_argument("--blocker", default="")
+    checkpoint.add_argument("--key", action="store_true", help="mark as a contract-agreed key checkpoint")
+    checkpoint.add_argument(
+        "--attempt-id",
+        required=True,
+        help="explicit caller attempt identity; must equal the current fence attempt",
+    )
+    checkpoint.add_argument(
+        "--request-id",
+        required=True,
+        help="explicit retry identity; identical retry returns the existing record, new id records a new occurrence",
+    )
+    checkpoint.add_argument("--json", action="store_true")
+    checkpoint.set_defaults(func=command_checkpoint)
+
+    finish = sub.add_parser(
+        "finish",
+        help="write exactly one terminal marker after report.md is non-empty",
+        description=(
+            "Worker must pass --state as explicit finish intent. "
+            "Omitted --session-id is filled from current-attempt "
+            "acceptance_fence.json. task/attempt/contract/instance/"
+            "generation remain pinned. report.md is never auto-finished."
+        ),
+    )
+    add_common_task_args(finish)
+    finish.add_argument("--state", choices=sorted(STATE_TO_MARKER), required=True)
+    finish.add_argument("--session-id", default="")
+    finish.add_argument("--task-id", default="")
+    finish.add_argument("--attempt-id", default="")
+    finish.add_argument("--contract-hash", default="")
+    finish.add_argument("--instance-id", default="")
+    finish.add_argument("--binding-generation", type=int, default=0)
+    finish.add_argument("--fencing-generation", type=int, default=0)
+    finish.add_argument(
+        "--operator-recovery-closeout",
+        action="store_true",
+        help=(
+            "accept a validated operator recovery authorization for "
+            "blocked/fail closeout without claiming the old session is live"
+        ),
+    )
+    finish.set_defaults(func=command_finish)
+
+    status = sub.add_parser("status", help="read marker/report/protocol status")
+    add_common_task_args(status, worker=False)
+    status.add_argument("--json", action="store_true")
+    status.add_argument(
+        "--worker",
+        default="",
+        help="caller worker identity; required with --record",
+    )
+    status.add_argument(
+        "--record",
+        default=None,
+        help=(
+            "optional task-local relative file name (not a dot-prefixed or "
+            "reserved top-level name, also not through an alias onto one); "
+            "requires --worker matching the task's recorded owner. After "
+            "the exact task directory passes the existing "
+            "<run>/tasks/<task> and ownership validation, write this status "
+            "JSON payload into that exact directory as task-local evidence. "
+            "A wrong parent shape, a task owned by a different worker, a "
+            "reserved or escaping name, or an existing target is refused "
+            "with exit 1 before anything is written anywhere. These checks "
+            "do not prove this is the caller's current contract task: a "
+            "different task owned by the same worker still records, so pass "
+            "the task prompt's literal --task-dir"
+        ),
+    )
+    status.set_defaults(func=command_status)
+
+    validate = sub.add_parser("validate", help="validate marker/report/protocol consistency")
+    add_common_task_args(validate, worker=False)
+    validate.set_defaults(func=command_validate)
+
+    for command_parser in sub.choices.values():
+        command_parser.set_defaults(root=None)
+    return parser
+
+
+def main(argv: list[str] | None = None, *, _admission_root: Path | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return invoke_cli_handler("omx_task_signal", args, args.func, admission_root=_admission_root)
+    except SignalError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    except AdmissionError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("ERROR: interrupted", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

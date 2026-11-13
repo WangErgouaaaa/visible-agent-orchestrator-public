@@ -1,0 +1,4229 @@
+#!/usr/bin/env python3
+"""Launch and register one user-visible fixed-port OpenCode TUI worker.
+
+This launcher is intentionally narrow:
+- it creates at most one pane in the current tmux window;
+- it never sends tmux input;
+- it never calls OpenCode mutating HTTP endpoints;
+- it writes only framework metadata under .omx/framework/team.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ctypes
+import fcntl
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+import uuid
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+_THIS_FILE = Path(__file__).resolve()
+for _p in ((_THIS_FILE.parent.parent / "src").resolve(), (_THIS_FILE.parent.parent / "lib").resolve()):
+    if _p.exists() and str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
+
+from visible_agent_orchestrator.runtime.tmux_capabilities import command_shape_supported
+from visible_agent_orchestrator.runtime_paths import runtime_root
+from visible_agent_orchestrator.global_mutation_gate import global_mutation_gate
+from visible_agent_orchestrator.companion_skill_admission import AdmissionError, invoke_cli_handler
+from visible_agent_orchestrator.opencode_visible_registry import (
+    VisibleRegistryError,
+    derive_process_instance,
+    normalize_visible_orphan_fence,
+    normalize_visible_stop_fence,
+    visible_stop_fence_matches,
+)
+from visible_agent_orchestrator.visible_registry_lock import (
+    visible_registry_lock,
+)
+
+
+HOST = "127.0.0.1"
+FALLBACK_COUNT = 5
+LAUNCH_READINESS_TIMEOUT_SECONDS = 20.0
+LAUNCH_READINESS_POLL_SECONDS = 0.25
+STOP_PORT_CLOSE_TIMEOUT_SECONDS = 10.0
+STOP_PORT_POLL_SECONDS = 0.25
+REQUIRED_TUI_ENDPOINTS = ("/tui/clear-prompt", "/tui/append-prompt", "/tui/submit-prompt")
+FORBIDDEN_STATE_DIRS = {"_framework", "demo-run", "dispatch-demo"}
+VISIBLE_LAUNCH_JSON = "opencode_visible_launch.json"
+VISIBLE_REGISTRY_JSON = "opencode_visible_workers.json"
+RUNTIME_SUBSTRATE_AUTO = "auto"
+RUNTIME_SUBSTRATE_CHOICES = (RUNTIME_SUBSTRATE_AUTO, "tmux", "rmux")
+
+class LauncherError(Exception):
+    """Expected operator-facing failure."""
+
+
+class LauncherCandidateConflictError(LauncherError):
+    """Candidate lifecycle evidence is insufficient to select one record."""
+
+    def __init__(self, reason: str, evidence: dict[str, Any]) -> None:
+        self.evidence = evidence
+        super().__init__(reason)
+
+
+def write_candidate_conflict_sidecar(
+    root: Path,
+    worker_id: str,
+    evidence: dict[str, Any],
+) -> None:
+    """Persist compact current-candidate conflict evidence."""
+    write_json(
+        ensure_framework(root) / f"opencode_visible_verify_{worker_id}.json",
+        {
+            "schema_version": 1,
+            "worker_id": worker_id,
+            "binding_confidence": "failed",
+            "error_code": "candidate_conflict",
+            "candidate_presence": evidence.get("candidate_presence", {}),
+            "candidate_instances": evidence.get("candidate_instances", {}),
+            "rejected_candidates": evidence.get("rejected_candidates", {}),
+        },
+    )
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def root_path(value: str | None) -> Path:
+    return runtime_root(value)
+
+
+def framework_root(root: Path) -> Path:
+    return root / ".omx" / "framework" / "team"
+
+
+def team_root(root: Path) -> Path:
+    return root / ".omx" / "state" / "team"
+
+
+def ensure_framework(root: Path) -> Path:
+    path = framework_root(root)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def tmux_caller_pane() -> str:
+    pane = str(os.environ.get("TMUX_PANE") or "")
+    return pane if re.fullmatch(r"%\d+", pane) else ""
+
+
+def tmux_caller_scope() -> dict[str, str]:
+    pane = tmux_caller_pane()
+    if not pane:
+        raise LauncherError(
+            "TMUX_PANE is required for caller-scoped tmux launch"
+        )
+    result = run(
+        guarded_mux_argv(
+            "tmux",
+            "display-message",
+            "-t",
+            pane,
+            "-p",
+            "#{pane_id}\t#{window_id}\t#{session_name}\t"
+            "#{window_index}\t#{pane_index}",
+        ),
+        timeout=5,
+    )
+    parts = result["stdout"].strip().split("\t")
+    if result["returncode"] != 0:
+        detail = result["stderr"].strip() or "targeted tmux lookup failed"
+        raise LauncherError(
+            f"caller tmux pane {pane} is unavailable or stale: {detail}"
+        )
+    if (
+        len(parts) != 5
+        or parts[0] != pane
+        or not parts[1].startswith("@")
+        or not parts[2]
+        or not parts[3].isdigit()
+        or not parts[4].isdigit()
+    ):
+        raise LauncherError(
+            f"caller tmux pane/window evidence mismatch for {pane}: "
+            f"{result['stdout']!r}"
+        )
+    return {
+        "pane_id": parts[0],
+        "window_id": parts[1],
+        "session_name": parts[2],
+        "window_index": parts[3],
+        "pane_index": parts[4],
+        "pane_ref": f"{parts[2]}:{parts[3]}.{parts[4]}",
+    }
+
+
+@contextmanager
+def launch_serialization_lock(root: Path):
+    path = ensure_framework(root) / ".opencode-launch.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def rel(path: Path, root: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(root.resolve()))
+    except Exception:
+        return str(path)
+
+
+def write_json(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def read_json(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def read_json_strict(path: Path, label: str) -> dict[str, Any]:
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise LauncherError(f"{label} read failed: {exc}") from exc
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise LauncherError(f"{label} JSON is invalid: {exc}") from exc
+    if not isinstance(data, dict):
+        raise LauncherError(f"{label} must be a JSON object")
+    return data
+
+
+def append_log(root: Path, message: str) -> None:
+    path = ensure_framework(root) / "opencode_visible_launch.log"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(f"{utc_now()} {message}\n")
+
+
+def resolve_runtime_substrate(
+    preferred: str = RUNTIME_SUBSTRATE_AUTO,
+    *,
+    env: dict[str, str] | None = None,
+) -> str:
+    value = str(preferred or RUNTIME_SUBSTRATE_AUTO)
+    if value not in RUNTIME_SUBSTRATE_CHOICES:
+        raise LauncherError(f"unsupported runtime substrate: {value}")
+    if value != RUNTIME_SUBSTRATE_AUTO:
+        return value
+    env_map = env if env is not None else os.environ
+    if env_map.get("TMUX"):
+        return "tmux"
+    if env_map.get("RMUX"):
+        return "tmux" if shutil.which("tmux") else "rmux"
+    if shutil.which("tmux"):
+        return "tmux"
+    if shutil.which("rmux"):
+        return "rmux"
+    raise LauncherError("neither rmux nor tmux is available")
+
+
+def mux_argv(runtime_substrate: str, *args: str) -> list[str]:
+    return [resolve_runtime_substrate(runtime_substrate), *args]
+
+
+def guarded_mux_argv(runtime_substrate: str, command: str, *args: str) -> list[str]:
+    supported, reason = command_shape_supported(command, list(args))
+    if not supported:
+        raise LauncherError(reason)
+    return mux_argv(runtime_substrate, command, *args)
+
+
+def run(argv: list[str], timeout: float = 10) -> dict[str, Any]:
+    try:
+        proc = subprocess.run(
+            argv,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False,
+        )
+        return {
+            "argv": argv,
+            "returncode": proc.returncode,
+            "stdout": proc.stdout,
+            "stderr": proc.stderr,
+            "timed_out": False,
+        }
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "argv": argv,
+            "returncode": 124,
+            "stdout": exc.stdout or "",
+            "stderr": exc.stderr or "command timed out",
+            "timed_out": True,
+        }
+    except FileNotFoundError as exc:
+        return {"argv": argv, "returncode": 127, "stdout": "", "stderr": str(exc), "timed_out": False}
+
+
+def remaining_deadline(deadline: float | None) -> float | None:
+    if deadline is None:
+        return None
+    return max(0.0, deadline - time.monotonic())
+
+
+def bounded_timeout(
+    deadline: float | None,
+    maximum: float,
+) -> float:
+    remaining = remaining_deadline(deadline)
+    if remaining is None:
+        return maximum
+    if remaining <= 0:
+        raise LauncherError("launch readiness deadline exhausted")
+    return min(maximum, remaining)
+
+
+def safe_worker(value: str) -> str:
+    if not value or value in {".", ".."} or "/" in value or "\\" in value or "\x00" in value:
+        raise LauncherError(f"worker must be a simple id, got {value!r}")
+    return value
+
+
+def safe_pane(value: str) -> str:
+    pane = str(value or "")
+    if not re.fullmatch(r"%[0-9]+", pane):
+        raise LauncherError(f"pane must be a tmux pane id, got {value!r}")
+    return pane
+
+
+
+def merge_opencode_inline_config(existing: str, plugin_path: Path) -> str:
+    try:
+        payload = json.loads(existing) if str(existing or "").strip() else {}
+    except json.JSONDecodeError as exc:
+        raise LauncherError("OPENCODE_CONFIG_CONTENT is invalid JSON") from exc
+    if not isinstance(payload, dict):
+        raise LauncherError("OPENCODE_CONFIG_CONTENT must be a JSON object")
+    plugins = payload.get("plugin", [])
+    if not isinstance(plugins, list) or any(
+        not isinstance(item, str) or not item for item in plugins
+    ):
+        raise LauncherError("OPENCODE_CONFIG_CONTENT.plugin must be a string list")
+    plugin = str(plugin_path)
+    payload["plugin"] = [*plugins, *([] if plugin in plugins else [plugin])]
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def ensure_state_clean(root: Path) -> None:
+    state = team_root(root)
+    if not state.exists():
+        return
+    if not state.is_dir():
+        raise LauncherError(f"{rel(state, root)} exists but is not a directory")
+    polluted = sorted(path.name for path in state.iterdir() if path.is_dir() and path.name in FORBIDDEN_STATE_DIRS)
+    if polluted:
+        raise LauncherError(f".omx/state/team contains framework/internal dirs: {', '.join(polluted)}")
+
+
+def port_live(port: int, host: str = HOST, timeout: float = 0.35) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(timeout)
+        return sock.connect_ex((host, int(port))) == 0
+
+
+def candidate_ports(base_port: int) -> list[int]:
+    base = int(base_port)
+    highest = base + FALLBACK_COUNT - 1
+    if base < 1 or highest > 65535:
+        raise LauncherError(
+            "base port range must stay within 1..65535: "
+            f"{base}..{highest}"
+        )
+    return [base + offset for offset in range(FALLBACK_COUNT)]
+
+
+def choose_free_port(
+    base_port: int,
+    *,
+    reserved_ports: set[int] | None = None,
+) -> tuple[int | None, dict[int, bool]]:
+    reserved = reserved_ports or set()
+    status = {port: port_live(port) for port in candidate_ports(base_port)}
+    for port, occupied in status.items():
+        if not occupied and port not in reserved:
+            return port, status
+    return None, status
+
+
+def mux_display(runtime_substrate: str) -> str:
+    substrate = resolve_runtime_substrate(runtime_substrate)
+    if substrate == "tmux":
+        scope = tmux_caller_scope()
+        return f"{scope['pane_ref']} {scope['pane_id']}"
+    args: list[str] = []
+    args.extend(["-p", "#S:#I.#P #{pane_id}"])
+    return run(
+        guarded_mux_argv(substrate, "display-message", *args),
+        timeout=5,
+    )["stdout"].strip()
+
+
+def mux_list_panes(
+    runtime_substrate: str,
+    *,
+    deadline: float | None = None,
+) -> list[dict[str, Any]]:
+    substrate = resolve_runtime_substrate(runtime_substrate)
+    args: list[str] = []
+    if substrate == "tmux":
+        pane = tmux_caller_pane()
+        if not pane:
+            raise LauncherError(
+                "TMUX_PANE is required for caller-scoped tmux launch"
+            )
+        args.extend(["-t", pane])
+    args.extend(
+        [
+            "-F",
+            "#{session_name}:#{window_index}.#{pane_index}\t#{pane_id}\t"
+            "#{pane_current_command}\t#{pane_title}\t#{pane_active}\t"
+            "#{pane_pid}\t#{pane_current_path}",
+        ]
+    )
+    result = run(
+        guarded_mux_argv(
+            substrate,
+            "list-panes",
+            *args,
+        ),
+        timeout=bounded_timeout(deadline, 5),
+    )
+    if result.get("timed_out") or result.get("returncode") != 0:
+        detail = str(result.get("stderr") or "").strip()
+        if not detail:
+            detail = (
+                "timed out"
+                if result.get("timed_out")
+                else f"exit {result.get('returncode')}"
+            )
+        raise LauncherError(
+            f"{substrate} list-panes probe failed: {detail}"
+        )
+    panes: list[dict[str, Any]] = []
+    for line in result["stdout"].splitlines():
+        parts = line.split("\t", 6)
+        if len(parts) == 7:
+            pane_ref, pane_id, command, title, active, pane_pid, current_path = parts
+        else:
+            parts = line.split()
+        if len(parts) >= 7 and "\t" not in line:
+            pane_ref = parts[0]
+            pane_id = parts[1]
+            command = parts[2]
+            active = parts[-3]
+            pane_pid = parts[-2]
+            current_path = parts[-1]
+            title = " ".join(parts[3:-3])
+        else:
+            padded = parts + [""] * (7 - len(parts))
+            pane_ref, pane_id, command, title, active, pane_pid, current_path = padded[:7]
+        session = pane_ref.split(":", 1)[0] if ":" in pane_ref else ""
+        window = pane_ref.rsplit(".", 1)[0] if "." in pane_ref else pane_ref
+        pane_index = pane_ref.rsplit(".", 1)[1] if "." in pane_ref else ""
+        panes.append({
+            "pane_ref": pane_ref,
+            "pane_id": pane_id,
+            "pane_current_command": command,
+            "pane_title": title,
+            "pane_active": active == "1",
+            "pane_pid": int(pane_pid) if str(pane_pid).isdigit() else None,
+            "pane_current_path": current_path,
+            "tmux_session": session,
+            "tmux_window": window,
+            "tmux_pane_index": pane_index,
+            "raw": line,
+        })
+    return panes
+
+
+def pane_by_id(
+    pane_id: str,
+    runtime_substrate: str,
+    *,
+    deadline: float | None = None,
+) -> dict[str, Any] | None:
+    for pane in mux_list_panes(runtime_substrate, deadline=deadline):
+        if pane.get("pane_id") == pane_id:
+            return pane
+    return None
+
+
+def read_proc_cmdline(pid: int) -> str:
+    try:
+        raw = (Path("/proc") / str(pid) / "cmdline").read_bytes()
+    except Exception:
+        return ""
+    return raw.replace(b"\x00", b" ").decode("utf-8", errors="replace").strip()
+
+
+def process_instance_state(pid: int, expected_start_ticks: int) -> str:
+    try:
+        text = (Path("/proc") / str(int(pid)) / "stat").read_text(
+            encoding="utf-8",
+            errors="replace",
+        )
+    except FileNotFoundError:
+        return "absent"
+    except (OSError, TypeError, ValueError):
+        return "unknown"
+    close = text.rfind(")")
+    if close < 0:
+        return "unknown"
+    fields = text[close + 1 :].strip().split()
+    try:
+        observed_start_ticks = int(fields[19])
+    except (IndexError, TypeError, ValueError):
+        return "unknown"
+    if observed_start_ticks <= 0:
+        return "unknown"
+    return (
+        "same"
+        if observed_start_ticks == int(expected_start_ticks)
+        else "reused"
+    )
+
+
+def process_start_time_ticks(pid: int) -> int:
+    try:
+        text = (Path("/proc") / str(int(pid)) / "stat").read_text(
+            encoding="utf-8",
+            errors="replace",
+        )
+    except (OSError, TypeError, ValueError):
+        return 0
+    close = text.rfind(")")
+    if close < 0:
+        return 0
+    fields = text[close + 1 :].strip().split()
+    try:
+        ticks = int(fields[19])
+    except (IndexError, TypeError, ValueError):
+        return 0
+    return ticks if ticks > 0 else 0
+
+
+def host_boot_id() -> str:
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text(
+            encoding="utf-8",
+            errors="replace",
+        ).strip()
+    except OSError:
+        return ""
+
+
+def tmux_server_pid(*, deadline: float | None = None) -> int:
+    result = run(
+        ["tmux", "display-message", "-p", "#{pid}"],
+        timeout=bounded_timeout(deadline, 5),
+    )
+    try:
+        return int(result.get("stdout", "").strip()) if result.get("returncode") == 0 else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def read_process_environment(pid: int) -> dict[str, str]:
+    try:
+        raw = (Path("/proc") / str(int(pid)) / "environ").read_bytes()
+    except (OSError, TypeError, ValueError):
+        return {}
+    environment: dict[str, str] = {}
+    for item in raw.split(b"\0"):
+        if b"=" not in item:
+            continue
+        key, value = item.split(b"=", 1)
+        environment[key.decode(errors="replace")] = value.decode(
+            errors="replace"
+        )
+    return environment
+
+
+def open_pidfd(pid: int) -> int:
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        function = libc.pidfd_open
+    except AttributeError as exc:
+        raise LauncherError("pidfd_open is unavailable") from exc
+    function.argtypes = [ctypes.c_int, ctypes.c_uint]
+    function.restype = ctypes.c_int
+    pidfd = int(function(int(pid), 0))
+    if pidfd < 0:
+        error = ctypes.get_errno()
+        raise LauncherError(
+            f"pidfd_open failed: {os.strerror(error)}"
+        )
+    return pidfd
+
+
+def send_sigterm_pidfd(pidfd: int) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        function = libc.pidfd_send_signal
+    except AttributeError as exc:
+        raise LauncherError("pidfd_send_signal is unavailable") from exc
+    function.argtypes = [
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_uint,
+    ]
+    function.restype = ctypes.c_int
+    if function(int(pidfd), signal.SIGTERM, None, 0) != 0:
+        error = ctypes.get_errno()
+        raise LauncherError(
+            f"pidfd_send_signal failed: {os.strerror(error)}"
+        )
+
+
+def ps_record(
+    pid: int,
+    *,
+    deadline: float | None = None,
+) -> dict[str, Any]:
+    result = run(
+        ["ps", "-o", "pid,ppid,pgid,stat,comm,args", "-p", str(pid)],
+        timeout=bounded_timeout(deadline, 5),
+    )
+    return {
+        "pid": pid,
+        "returncode": result["returncode"],
+        "ps": result["stdout"].strip(),
+        "stderr": result["stderr"].strip(),
+        "cmdline": read_proc_cmdline(pid),
+    }
+
+
+def process_tree(
+    root_pid: int,
+    max_depth: int = 5,
+    *,
+    deadline: float | None = None,
+) -> dict[str, Any]:
+    nodes: dict[str, dict[str, Any]] = {}
+    edges: list[dict[str, int]] = []
+    frontier: list[tuple[int, int]] = [(root_pid, 0)]
+    seen = {root_pid}
+    while frontier:
+        pid, depth = frontier.pop(0)
+        node = ps_record(pid, deadline=deadline)
+        node["depth"] = depth
+        node["children"] = []
+        nodes[str(pid)] = node
+        if depth >= max_depth:
+            continue
+        children = run(
+            ["pgrep", "-P", str(pid), "-a"],
+            timeout=bounded_timeout(deadline, 5),
+        )
+        if children["returncode"] not in (0, 1):
+            node["pgrep_error"] = children["stderr"].strip()
+            continue
+        for line in children["stdout"].splitlines():
+            match = re.match(r"\s*(\d+)\s+(.*)", line)
+            if not match:
+                continue
+            child_pid = int(match.group(1))
+            node["children"].append(child_pid)
+            edges.append({"parent": pid, "child": child_pid})
+            if child_pid not in seen:
+                seen.add(child_pid)
+                frontier.append((child_pid, depth + 1))
+    return {"root_pid": root_pid, "nodes": nodes, "edges": edges}
+
+
+def process_tree_text(tree: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for node in tree.get("nodes", {}).values():
+        parts.append(str(node.get("ps", "")))
+        parts.append(str(node.get("cmdline", "")))
+    return "\n".join(parts)
+
+
+def find_opencode_pids(tree: dict[str, Any]) -> list[int]:
+    pids: list[int] = []
+    for key, node in tree.get("nodes", {}).items():
+        text = f"{node.get('ps', '')}\n{node.get('cmdline', '')}".lower()
+        if re.search(r"(?:^|\s|/)opencode(?:\s|$)", text):
+            try:
+                pids.append(int(key))
+            except ValueError:
+                pass
+    return sorted(set(pids))
+
+
+def http_get(port: int, path: str, timeout: float = 2.0, limit: int = 8192) -> dict[str, Any]:
+    if path not in {"/global/health", "/doc", "/session/status", "/global/event", "/event"}:
+        raise LauncherError(f"GET path is not allowed: {path}")
+    url = f"http://{HOST}:{int(port)}{path}"
+    request = Request(url, method="GET", headers={"User-Agent": "omx-opencode-visible-launcher/3B-visible-bind"})
+    started = time.time()
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            body = b""
+            timed_out = False
+            try:
+                body = response.read(limit)
+            except socket.timeout:
+                timed_out = True
+            text = body.decode("utf-8", errors="replace")
+            return {
+                "reachable": True,
+                "ok": 200 <= int(getattr(response, "status", 200)) < 300,
+                "status": int(getattr(response, "status", 200)),
+                "content_type": response.headers.get("Content-Type", ""),
+                "bytes_read": len(body),
+                "timed_out": timed_out,
+                "elapsed_seconds": round(time.time() - started, 3),
+                "body": text,
+                "error": "",
+            }
+    except HTTPError as exc:
+        body = exc.read(limit)
+        return {
+            "reachable": True,
+            "ok": 200 <= int(exc.code) < 300,
+            "status": int(exc.code),
+            "content_type": exc.headers.get("Content-Type", ""),
+            "bytes_read": len(body),
+            "timed_out": False,
+            "elapsed_seconds": round(time.time() - started, 3),
+            "body": body.decode("utf-8", errors="replace"),
+            "error": str(exc),
+        }
+    except (URLError, TimeoutError, socket.timeout, OSError) as exc:
+        return {
+            "reachable": False,
+            "ok": False,
+            "status": None,
+            "content_type": "",
+            "bytes_read": 0,
+            "timed_out": isinstance(exc, (TimeoutError, socket.timeout)),
+            "elapsed_seconds": round(time.time() - started, 3),
+            "body": "",
+            "error": str(exc),
+        }
+
+
+def probe_port(
+    port: int,
+    *,
+    deadline: float | None = None,
+    readiness_only: bool = False,
+) -> dict[str, Any]:
+    requests = [
+        ("/global/health", 2.0, 8192),
+        ("/doc", 3.0, 2_000_000),
+        ("/session/status", 2.0, 8192),
+    ]
+    if not readiness_only:
+        requests.extend(
+            [
+                ("/global/event", 2.0, 1024),
+                ("/event", 2.0, 1024),
+            ]
+        )
+    endpoints: dict[str, dict[str, Any]] = {}
+    for path, timeout, limit in requests:
+        remaining = remaining_deadline(deadline)
+        if remaining is not None and remaining <= 0:
+            endpoints[path] = {
+                "reachable": False,
+                "ok": False,
+                "status": None,
+                "content_type": "",
+                "bytes_read": 0,
+                "timed_out": True,
+                "elapsed_seconds": 0.0,
+                "body": "",
+                "error": "launch readiness deadline exhausted",
+            }
+            continue
+        endpoints[path] = http_get(
+            port,
+            path,
+            timeout=(
+                timeout
+                if remaining is None
+                else min(timeout, remaining)
+            ),
+            limit=limit,
+        )
+    doc_text = endpoints["/doc"].get("body", "")
+    detected = [endpoint for endpoint in REQUIRED_TUI_ENDPOINTS if endpoint in doc_text]
+    return {
+        "port": int(port),
+        "base_url": f"http://{HOST}:{int(port)}",
+        "global_health_available": bool(endpoints["/global/health"].get("ok")),
+        "doc_available": bool(endpoints["/doc"].get("ok")),
+        "session_status_available": bool(endpoints["/session/status"].get("ok")),
+        "global_event_available": bool(endpoints.get("/global/event", {}).get("reachable") and endpoints.get("/global/event", {}).get("status") == 200),
+        "event_available": bool(endpoints.get("/event", {}).get("reachable") and endpoints.get("/event", {}).get("status") == 200),
+        "detected_tui_methods": detected,
+        "tui_clear_prompt": "/tui/clear-prompt" in detected,
+        "tui_append_prompt": "/tui/append-prompt" in detected,
+        "tui_submit_prompt": "/tui/submit-prompt" in detected,
+        "endpoint_results": {
+            path: {key: value for key, value in record.items() if key != "body"}
+            for path, record in endpoints.items()
+        },
+    }
+
+
+def socket_listener_pids(
+    port: int,
+    *,
+    deadline: float | None = None,
+) -> dict[str, Any]:
+    commands = [
+        ["ss", "-H", "-ltnp"],
+        ["lsof", "-nP", "-iTCP", "-sTCP:LISTEN"],
+        ["netstat", "-ltnp"],
+    ]
+    matches: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    for argv in commands:
+        remaining = remaining_deadline(deadline)
+        if remaining is not None and remaining <= 0:
+            warnings.append("launch readiness deadline exhausted")
+            break
+        if not shutil.which(argv[0]):
+            warnings.append(f"{argv[0]} unavailable")
+            continue
+        result = run(
+            argv,
+            timeout=(
+                8
+                if remaining is None
+                else min(8, remaining)
+            ),
+        )
+        if result["returncode"] != 0:
+            warnings.append(f"{' '.join(argv)} returned {result['returncode']}")
+            continue
+        for line in result["stdout"].splitlines():
+            if not re.search(rf":{int(port)}(?=\s|$)", line):
+                continue
+            pids = sorted(set(int(item) for item in re.findall(r"pid=(\d+)|\b(\d+)/[^\s]+", line) for item in item if item))
+            parts = line.split()
+            if (
+                argv[0] == "lsof"
+                and len(parts) > 1
+                and parts[1].isdigit()
+            ):
+                pids = sorted({*pids, int(parts[1])})
+            matches.append({"command": argv[0], "line": line, "pids": pids})
+    all_pids = sorted(set(pid for match in matches for pid in match.get("pids", [])))
+    return {"listener_pids": all_pids, "matches": matches, "warnings": warnings}
+
+
+def existing_visible_worker(root: Path, worker_id: str) -> dict[str, Any] | None:
+    registry = read_json(framework_root(root) / VISIBLE_REGISTRY_JSON)
+    for worker in registry.get("workers", []):
+        if isinstance(worker, dict) and str(worker.get("worker_id", "")) == worker_id:
+            return worker
+    return None
+
+
+def visible_port_aliases(
+    root: Path,
+    worker_id: str,
+    ports: list[int],
+) -> dict[int, list[str]]:
+    candidates = set(ports)
+    aliases: dict[int, list[str]] = {}
+    registry = read_json(framework_root(root) / VISIBLE_REGISTRY_JSON)
+    for record in registry.get("workers", []):
+        if not isinstance(record, dict):
+            continue
+        record_worker = str(record.get("worker_id") or "")
+        host = str(record.get("host") or HOST)
+        try:
+            port = int(record.get("port") or 0)
+        except (TypeError, ValueError):
+            continue
+        if (
+            record_worker
+            and record_worker != worker_id
+            and host in {"", HOST, "localhost"}
+            and port in candidates
+        ):
+            aliases.setdefault(port, []).append(record_worker)
+    return {port: sorted(worker_ids) for port, worker_ids in aliases.items()}
+
+
+def worker_launch_record_path(root: Path, worker_id: str) -> Path:
+    return framework_root(root) / f"opencode_visible_launch_{safe_worker(worker_id)}.json"
+
+
+def launch_readiness_failure_path(
+    root: Path,
+    worker_id: str,
+    attempt_id: str,
+) -> Path:
+    if not re.fullmatch(r"[0-9a-f]{32}", attempt_id):
+        raise LauncherError("launch attempt id is invalid")
+    return (
+        framework_root(root)
+        / (
+            "opencode_visible_launch_readiness_failure_"
+            f"{safe_worker(worker_id)}_{attempt_id}.json"
+        )
+    )
+
+
+def launch_record_for_worker(root: Path, worker_id: str) -> dict[str, Any]:
+    worker = safe_worker(worker_id)
+    scoped = read_json(worker_launch_record_path(root, worker))
+    if str(scoped.get("worker_id") or "") == worker:
+        return scoped
+    legacy = read_json(framework_root(root) / VISIBLE_LAUNCH_JSON)
+    return legacy if str(legacy.get("worker_id") or "") == worker else {}
+
+
+def select_launch_candidate(
+    root: Path,
+    worker_id: str,
+    *,
+    caller_scope: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Select a worker record from current lifecycle and binding evidence."""
+    launch = launch_record_for_worker(root, worker_id)
+    registry = existing_visible_worker(root, worker_id) or {}
+    evidence: dict[str, Any] = {
+        "selected_source": "",
+        "rejected_candidates": {},
+        "candidate_presence": {
+            "registry": bool(registry),
+            "launch": bool(launch),
+        },
+    }
+    if not registry and not launch:
+        raise LauncherError(
+            f"worker {worker_id!r} has no visible launch or registry record"
+        )
+
+    records_match = bool(
+        registry
+        and launch
+        and registry.get("project") == launch.get("project")
+        and registry.get("port") == launch.get("port")
+    )
+    candidates: list[tuple[str, dict[str, Any]]] = []
+    if registry:
+        candidates.append(("registry", registry))
+    launch_rejection: dict[str, Any] | None = None
+    if launch:
+        positive_fence_fields = (
+            "port",
+            "pane_pid",
+            "pane_start_time_ticks",
+            "tmux_server_pid",
+        )
+        if launch.get("launch_owned") is not True:
+            launch_rejection = {"reason": "launch is not task-owned"}
+        elif not launch.get("project"):
+            launch_rejection = {"reason": "launch project scope is incomplete"}
+        elif not re.fullmatch(
+            r"[0-9a-f]{32}", str(launch.get("launch_attempt_id") or "")
+        ):
+            launch_rejection = {"reason": "launch attempt fence is invalid"}
+        elif not re.fullmatch(r"%[0-9]+", str(launch.get("pane_id") or "")):
+            launch_rejection = {"reason": "launch pane fence is invalid"}
+        elif any(
+            not str(launch.get(field) or "").isdigit()
+            or int(launch.get(field) or 0) <= 0
+            for field in positive_fence_fields
+        ):
+            launch_rejection = {"reason": "launch process fence is incomplete"}
+        elif not launch.get("host_boot_id"):
+            launch_rejection = {"reason": "launch host boot fence is incomplete"}
+        elif not launch.get("tmux_session") or not launch.get("tmux_window"):
+            launch_rejection = {"reason": "launch session/window scope is incomplete"}
+        elif caller_scope and not (
+            launch.get("tmux_session") == caller_scope.get("session_name")
+            and launch.get("tmux_window")
+            == f"{caller_scope.get('session_name')}:{caller_scope.get('window_index')}"
+        ):
+            launch_rejection = {
+                "reason": "foreign caller session/window",
+                "evidence": {
+                    "launch_session": launch.get("tmux_session"),
+                    "launch_window": launch.get("tmux_window"),
+                    "caller_session": caller_scope.get("session_name"),
+                    "caller_window": (
+                        f"{caller_scope.get('session_name')}:{caller_scope.get('window_index')}"
+                    ),
+                },
+            }
+        elif registry and not records_match:
+            launch_rejection = {
+                "reason": "worker project or port mismatch",
+                "evidence": {
+                    "registry_project": registry.get("project"),
+                    "launch_project": launch.get("project"),
+                    "registry_port": registry.get("port"),
+                    "launch_port": launch.get("port"),
+                },
+            }
+        if launch_rejection is None:
+            candidates.append(("launch", launch))
+        else:
+            evidence["rejected_candidates"]["launch"] = launch_rejection
+    if not candidates:
+        conflict = {**evidence, "error_code": "candidate_conflict"}
+        write_candidate_conflict_sidecar(root, worker_id, conflict)
+        raise LauncherCandidateConflictError(
+            "candidate lifecycle evidence is ambiguous or outside caller scope",
+            conflict,
+        )
+
+    observations: dict[str, dict[str, Any]] = {}
+    for source_name, record in candidates:
+        observations[source_name] = verify_worker(
+            root,
+            worker_id,
+            _source_name=source_name,
+            _source_record=record,
+            _write_sidecar=False,
+        )
+    trustworthy = {
+        source_name: result
+        for source_name, result in observations.items()
+        if result.get("binding_confidence") == "strong"
+        and result.get("process_identity_confidence") == "strong"
+    }
+    if len(trustworthy) == 2:
+        instances = {
+            source_name: derive_process_instance(result)["instance_id"]
+            for source_name, result in trustworthy.items()
+        }
+        if instances["registry"] == instances["launch"]:
+            evidence["selected_source"] = "registry"
+            evidence["record"] = registry
+            evidence["observation"] = observations["registry"]
+            evidence["evidence"] = {
+                "merged_sources": ["launch", "registry"],
+                "process_instance_id": instances["registry"],
+            }
+            return evidence
+        conflict = {
+            **evidence,
+            "error_code": "candidate_conflict",
+            "candidate_instances": instances,
+        }
+        write_candidate_conflict_sidecar(root, worker_id, conflict)
+        raise LauncherCandidateConflictError(
+            "registry and launch resolve to different current process instances",
+            conflict,
+        )
+    if len(trustworthy) == 1:
+        selected_source, observation = next(iter(trustworthy.items()))
+        evidence["selected_source"] = selected_source
+        evidence["record"] = registry if selected_source == "registry" else launch
+        evidence["observation"] = observation
+        for source_name in observations:
+            if source_name != selected_source:
+                evidence["rejected_candidates"].setdefault(
+                    source_name,
+                    {"reason": "current verification failed"},
+                )
+        return evidence
+    if len(candidates) == 1 and sum(evidence["candidate_presence"].values()) == 1:
+        selected_source, observation = next(iter(observations.items()))
+        evidence["selected_source"] = selected_source
+        evidence["record"] = registry if selected_source == "registry" else launch
+        evidence["observation"] = observation
+        return evidence
+    conflict = {**evidence, "error_code": "candidate_conflict"}
+    write_candidate_conflict_sidecar(root, worker_id, conflict)
+    raise LauncherCandidateConflictError(
+        "candidate lifecycle evidence is ambiguous or outside caller scope",
+        conflict,
+    )
+
+
+def existing_visible_worker_strict(
+    root: Path,
+    worker_id: str,
+) -> dict[str, Any] | None:
+    registry = read_json_strict(
+        framework_root(root) / VISIBLE_REGISTRY_JSON,
+        "visible worker registry",
+    )
+    workers = registry.get("workers")
+    if not isinstance(workers, list):
+        raise LauncherError(
+            "visible worker registry workers must be a list"
+        )
+    for worker in workers:
+        if not isinstance(worker, dict):
+            raise LauncherError(
+                "visible worker registry contains a non-object worker"
+            )
+        current_worker_id = worker.get("worker_id")
+        if (
+            not isinstance(current_worker_id, str)
+            or not current_worker_id
+            or current_worker_id != current_worker_id.strip()
+        ):
+            raise LauncherError(
+                "visible worker registry contains an invalid worker_id"
+            )
+        if current_worker_id == worker_id:
+            return worker
+    return None
+
+
+def owner_lock_paths(root: Path) -> list[Path]:
+    lock_root = framework_root(root) / "visible-runs" / "_locks"
+    return sorted(path for path in lock_root.glob("*.lock.json") if path.is_file())
+
+
+def status_view_worker(worker: dict[str, Any]) -> dict[str, Any]:
+    updated = dict(worker)
+    try:
+        port = int(worker.get("port", 0))
+    except Exception:
+        port = 0
+    if not (1 <= port <= 65535):
+        updated.update({
+            "server_live": False,
+            "doc_available": False,
+            "session_status_available": False,
+            "global_event_available": False,
+            "event_available": False,
+            "detected_tui_methods": [],
+            "tui_clear_prompt": False,
+            "tui_append_prompt": False,
+            "tui_submit_prompt": False,
+            "status_probe_error": "invalid port",
+            "status_last_checked_at": utc_now(),
+        })
+        return updated
+    try:
+        probe = probe_port(port)
+    except Exception as exc:
+        updated.update({
+            "server_live": False,
+            "doc_available": False,
+            "session_status_available": False,
+            "global_event_available": False,
+            "event_available": False,
+            "detected_tui_methods": [],
+            "tui_clear_prompt": False,
+            "tui_append_prompt": False,
+            "tui_submit_prompt": False,
+            "status_probe_error": str(exc),
+            "status_last_checked_at": utc_now(),
+        })
+        return updated
+    updated.update({
+        "server_live": bool(probe.get("global_health_available")),
+        "doc_available": bool(probe.get("doc_available")),
+        "session_status_available": bool(probe.get("session_status_available")),
+        "global_event_available": bool(probe.get("global_event_available")),
+        "event_available": bool(probe.get("event_available")),
+        "detected_tui_methods": list(probe.get("detected_tui_methods", [])),
+        "tui_clear_prompt": bool(probe.get("tui_clear_prompt")),
+        "tui_append_prompt": bool(probe.get("tui_append_prompt")),
+        "tui_submit_prompt": bool(probe.get("tui_submit_prompt")),
+        "status_probe_error": "",
+        "status_last_checked_at": utc_now(),
+    })
+    return updated
+
+
+def status_view_registry(registry: dict[str, Any]) -> dict[str, Any]:
+    updated = dict(registry)
+    workers = [worker for worker in registry.get("workers", []) if isinstance(worker, dict)]
+    updated["workers"] = [status_view_worker(worker) for worker in workers]
+    return updated
+
+
+def build_command(
+    worker: str,
+    project: Path,
+    port: int,
+    root: Path,
+    launch_attempt_id: str = "",
+    opencode_path: str = "opencode",
+) -> str:
+    if launch_attempt_id and not re.fullmatch(
+        r"[0-9a-f]{32}",
+        launch_attempt_id,
+    ):
+        raise LauncherError("launch attempt id is invalid")
+    attempt_export = (
+        f"export OMX_LAUNCH_ATTEMPT_ID={launch_attempt_id}; "
+        if launch_attempt_id
+        else ""
+    )
+    body = (
+        f"export OMX_WORKER_ID={shlex.quote(worker)}; "
+        "export OMX_WORKER_BACKEND=opencode_tui; "
+        f"export OMX_OPENCODE_HOST={HOST}; "
+        f"export OMX_OPENCODE_PORT={int(port)}; "
+        f"{attempt_export}"
+        f"exec {shlex.quote(opencode_path)} {shlex.quote(str(project))} "
+        f"--hostname {HOST} --port {int(port)}"
+    )
+    return f"bash -lc {shlex.quote(body)}"
+
+
+def launch_plan(
+    root: Path,
+    worker: str,
+    project: Path,
+    base_port: int,
+    runtime_substrate: str,
+) -> dict[str, Any]:
+    port = int(base_port)
+    runtime_substrate = resolve_runtime_substrate(runtime_substrate)
+    return {
+        "schema_version": 1,
+        "generated_at": utc_now(),
+        "root": str(root),
+        "worker_id": worker,
+        "runtime_substrate": runtime_substrate,
+        "backend": "opencode_tui",
+        "project": str(project),
+        "host": HOST,
+        "preferred_port": port,
+        "fallback_ports": candidate_ports(port)[1:],
+        "command_template": shlex.join(
+            ["opencode", str(project), "--hostname", HOST, "--port", "<port>"]
+        ),
+        "launch_mode": f"current {runtime_substrate} session/window visible split pane",
+        "planned_command": build_command(
+            worker,
+            project,
+            port,
+            root=root,
+        ),
+        "notes": [
+            "This phase only launches/registers a visible worker and does not submit a task.",
+            f"No {runtime_substrate} send-keys/paste-buffer is used.",
+            "No OpenCode POST endpoint is called.",
+        ],
+    }
+
+
+def render_plan_md(plan: dict[str, Any]) -> str:
+    lines = [
+        "# OpenCode Visible Worker Launch Plan",
+        "",
+        f"- worker_id: `{plan['worker_id']}`",
+        f"- runtime_substrate: `{plan.get('runtime_substrate') or '-'}`",
+        "- backend: `opencode_tui`",
+        f"- project: `{plan['project']}`",
+        f"- host: `{plan['host']}`",
+        f"- preferred_port: `{plan['preferred_port']}`",
+        f"- fallback_ports: `{plan['fallback_ports']}`",
+        f"- launch mode: {plan.get('launch_mode')}",
+        "",
+        "## Command",
+        "",
+        "```bash",
+        str(plan["command_template"]),
+        "```",
+        "",
+        "This stage only registers the visible fixed-port TUI. It does not submit a task or call `/tui/*` POST endpoints.",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def run_preflight(
+    root: Path,
+    worker: str,
+    project: Path,
+    base_port: int,
+    runtime_substrate: str,
+) -> dict[str, Any]:
+    candidate_port_values = candidate_ports(base_port)
+    runtime_substrate = resolve_runtime_substrate(runtime_substrate)
+    errors: list[str] = []
+    warnings: list[str] = []
+    tmux_scope_proven = runtime_substrate != "tmux"
+    if runtime_substrate == "rmux":
+        if not os.environ.get("RMUX"):
+            errors.append("not running inside rmux")
+        if not shutil.which("rmux"):
+            errors.append("rmux command not found")
+    else:
+        if not os.environ.get("TMUX"):
+            errors.append("not running inside tmux")
+        if not shutil.which("tmux"):
+            errors.append("tmux command not found")
+        if not tmux_caller_pane():
+            errors.append(
+                "TMUX_PANE is required for caller-scoped tmux launch"
+            )
+        if (
+            os.environ.get("TMUX")
+            and shutil.which("tmux")
+            and tmux_caller_pane()
+        ):
+            try:
+                display = mux_display(runtime_substrate)
+                tmux_scope_proven = True
+            except LauncherError as exc:
+                display = ""
+                errors.append(str(exc))
+        else:
+            display = ""
+    if not shutil.which("opencode"):
+        errors.append("opencode command not found")
+    if not project.exists() or not project.is_dir():
+        errors.append(f"project does not exist or is not a directory: {project}")
+    try:
+        ensure_state_clean(root)
+    except LauncherError as exc:
+        errors.append(str(exc))
+
+    if runtime_substrate == "rmux":
+        scoped_mux_ready = bool(os.environ.get("RMUX"))
+        display = mux_display(runtime_substrate) if scoped_mux_ready else ""
+    else:
+        scoped_mux_ready = tmux_scope_proven
+    panes = mux_list_panes(runtime_substrate) if scoped_mux_ready else []
+    if not panes and scoped_mux_ready:
+        errors.append(f"{runtime_substrate} list-panes returned no panes")
+        if runtime_substrate == "tmux":
+            tmux_scope_proven = False
+
+    existing: dict[str, Any] = {}
+    existing_live = False
+    selected_port: int | None = None
+    port_status: dict[int, bool] = {}
+    if runtime_substrate != "tmux" or tmux_scope_proven:
+        existing = existing_visible_worker(root, worker)
+        if existing:
+            try:
+                existing_live = bool(port_live(int(existing.get("port", 0))) and existing.get("binding_confidence") == "strong")
+            except Exception:
+                existing_live = False
+            if existing_live:
+                warnings.append("already_registered_live")
+            else:
+                warnings.append("stale_visible_registry")
+
+        reserved_port_aliases = visible_port_aliases(
+            root,
+            worker,
+            candidate_port_values,
+        )
+        selected_port, port_status = choose_free_port(
+            base_port,
+            reserved_ports=set(reserved_port_aliases),
+        )
+        if reserved_port_aliases:
+            warnings.append("reserved_visible_port_alias")
+        if selected_port is None and not existing_live:
+            errors.append(
+                "all visible candidate ports are occupied or registered: "
+                f"{candidate_port_values}"
+            )
+    else:
+        reserved_port_aliases = {}
+
+    return {
+        "schema_version": 1,
+        "checked_at": utc_now(),
+        "root": str(root),
+        "worker_id": worker,
+        "runtime_substrate": runtime_substrate,
+        "project": str(project),
+        "base_port": int(base_port),
+        "selected_port": selected_port,
+        "port_status": {str(port): {"occupied": occupied} for port, occupied in port_status.items()},
+        "reserved_port_aliases": {
+            str(port): worker_ids
+            for port, worker_ids in reserved_port_aliases.items()
+        },
+        "in_tmux": bool(os.environ.get("TMUX")),
+        "in_rmux": bool(os.environ.get("RMUX")),
+        "tmux_display": display,
+        "tmux_panes": panes,
+        "opencode_path": shutil.which("opencode") or "",
+        "existing_worker": existing or {},
+        "already_registered_live": existing_live,
+        "errors": errors,
+        "warnings": warnings,
+    }
+
+
+def command_plan(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    worker = safe_worker(args.worker)
+    project = Path(args.project).resolve()
+    plan = launch_plan(
+        root,
+        worker,
+        project,
+        args.base_port,
+        getattr(args, "runtime_substrate", RUNTIME_SUBSTRATE_AUTO),
+    )
+    fw = ensure_framework(root)
+    write_json(fw / "opencode_visible_launch_plan.json", plan)
+    (fw / "OPENCODE_VISIBLE_LAUNCH_PLAN.md").write_text(render_plan_md(plan), encoding="utf-8")
+    print(f"plan: {rel(fw / 'opencode_visible_launch_plan.json', root)}")
+    print(f"doc: {rel(fw / 'OPENCODE_VISIBLE_LAUNCH_PLAN.md', root)}")
+    return 0
+
+
+def command_preflight(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    worker = safe_worker(args.worker)
+    project = Path(args.project).resolve()
+    result = run_preflight(
+        root,
+        worker,
+        project,
+        args.base_port,
+        getattr(args, "runtime_substrate", RUNTIME_SUBSTRATE_AUTO),
+    )
+    print(f"root: {root}")
+    print(f"worker: {worker}")
+    print(f"project: {project}")
+    print(f"runtime_substrate: {result['runtime_substrate']}")
+    print(f"in_tmux: {str(result['in_tmux']).lower()}")
+    print(f"in_rmux: {str(result['in_rmux']).lower()}")
+    print(f"opencode_path: {result['opencode_path']}")
+    print(f"selected_port: {result['selected_port']}")
+    print(f"already_registered_live: {str(result['already_registered_live']).lower()}")
+    print(f"port_status: {result['port_status']}")
+    if result["errors"]:
+        print("Errors:")
+        for error in result["errors"]:
+            print(f"  - {error}")
+    else:
+        print("Errors: none")
+    if result["warnings"]:
+        print("Warnings:")
+        for warning in result["warnings"]:
+            print(f"  - {warning}")
+    else:
+        print("Warnings: none")
+    return 1 if result["errors"] else 0
+
+
+def command_launch(args: argparse.Namespace) -> int:
+    if not args.allow_launch:
+        raise LauncherError("launch requires --allow-launch")
+    runtime_substrate = resolve_runtime_substrate(
+        getattr(
+            args,
+            "runtime_substrate",
+            RUNTIME_SUBSTRATE_AUTO,
+        )
+    )
+    if runtime_substrate == "tmux":
+        tmux_caller_scope()
+    root = root_path(args.root)
+    with launch_serialization_lock(root):
+        return _command_launch_locked(args, root)
+
+
+def _command_launch_locked(
+    args: argparse.Namespace,
+    root: Path,
+) -> int:
+    worker = safe_worker(args.worker)
+    project = Path(args.project).resolve()
+    preflight = run_preflight(
+        root,
+        worker,
+        project,
+        args.base_port,
+        getattr(args, "runtime_substrate", RUNTIME_SUBSTRATE_AUTO),
+    )
+    if preflight["errors"]:
+        raise LauncherError("; ".join(preflight["errors"]))
+    if preflight.get("already_registered_live"):
+        print("already_registered_live: true")
+        return command_verify(args)
+
+    port = int(preflight["selected_port"])
+    runtime_substrate = str(preflight.get("runtime_substrate") or resolve_runtime_substrate(RUNTIME_SUBSTRATE_AUTO))
+    launch_scope = (
+        tmux_caller_scope()
+        if runtime_substrate == "tmux"
+        else {}
+    )
+    port_was_free = not bool(preflight["port_status"][str(port)]["occupied"])
+    launch_attempt_id = uuid.uuid4().hex
+    opencode_path = str(preflight.get("opencode_path") or "")
+    if not Path(opencode_path).is_absolute():
+        raise LauncherError(
+            "preflight opencode path must be absolute"
+        )
+    command = build_command(
+        worker,
+        project,
+        port,
+        root=root,
+        launch_attempt_id=launch_attempt_id,
+        opencode_path=opencode_path,
+    )
+    title = f"visible-opencode-{worker}-{port}"
+    append_log(root, f"launch_start substrate={runtime_substrate} worker={worker} port={port} command={command}")
+    split_args = ["-d", "-P", "-F", "#{pane_id}"]
+    if runtime_substrate == "tmux":
+        split_args.extend(["-t", tmux_caller_pane()])
+    split_args.extend(["-c", str(project), command])
+    split = run(
+        guarded_mux_argv(
+            runtime_substrate,
+            "split-window",
+            *split_args,
+        ),
+        timeout=10,
+    )
+    if split["returncode"] != 0:
+        append_log(root, f"launch_failed returncode={split['returncode']} stderr={split['stderr']!r}")
+        raise LauncherError(f"{runtime_substrate} split-window failed: {split['stderr'].strip()}")
+    pane_id = split["stdout"].strip().splitlines()[-1].strip()
+    if not pane_id.startswith("%"):
+        raise LauncherError(f"{runtime_substrate} did not return a pane id: {split['stdout']!r}")
+    run(guarded_mux_argv(runtime_substrate, "select-pane", "-t", pane_id, "-T", title), timeout=5)
+    run(
+        guarded_mux_argv(
+            runtime_substrate,
+            "select-layout",
+            "-t",
+            pane_id,
+            "tiled",
+        ),
+        timeout=5,
+    )
+    panes_after = mux_list_panes(runtime_substrate)
+    launched_pane = next(
+        (
+            pane
+            for pane in panes_after
+            if pane.get("pane_id") == pane_id
+        ),
+        {},
+    )
+    launch_pane_pid = int(launched_pane.get("pane_pid") or 0)
+    launch = {
+        "schema_version": 1,
+        "created_at": utc_now(),
+        "launch_state": "starting",
+        "launch_attempt_id": launch_attempt_id,
+        "root": str(root),
+        "worker_id": worker,
+        "runtime_substrate": runtime_substrate,
+        "backend": "opencode_tui",
+        "project": str(project),
+        "host": HOST,
+        "port": port,
+        "base_url": f"http://{HOST}:{port}",
+        "command": command,
+        "pane_id": pane_id,
+        "pane_pid": launch_pane_pid,
+        "pane_start_time_ticks": process_start_time_ticks(
+            launch_pane_pid
+        ),
+        "pane_title": title,
+        "tmux_session": str(
+            launched_pane.get("tmux_session")
+            or launch_scope.get("session_name")
+            or ""
+        ),
+        "tmux_window": str(
+            launched_pane.get("tmux_window")
+            or (
+                f"{launch_scope['session_name']}:"
+                f"{launch_scope['window_index']}"
+                if launch_scope
+                else ""
+            )
+        ),
+        "tmux_pane_index": str(
+            launched_pane.get("tmux_pane_index") or ""
+        ),
+        "host_boot_id": host_boot_id(),
+        "tmux_server_pid": (
+            tmux_server_pid()
+            if runtime_substrate == "tmux"
+            else 0
+        ),
+        "launch_owned": True,
+        "user_started": False,
+        "user_visible": True,
+        "port_was_free_before_launch": port_was_free,
+        "tmux_display_before_launch": preflight.get("tmux_display", ""),
+        "tmux_display_after_launch": mux_display(runtime_substrate),
+        "tmux_panes_before_launch": preflight.get("tmux_panes", []),
+        "tmux_panes_after_launch": panes_after,
+        "notes": [
+            f"Created by explicit --allow-launch in the current {runtime_substrate} session/window.",
+            f"No {runtime_substrate} send-keys/paste-buffer was used.",
+            "No OpenCode POST endpoint was called.",
+        ],
+    }
+    framework = ensure_framework(root)
+    write_json(worker_launch_record_path(root, worker), launch)
+    write_json(framework / VISIBLE_LAUNCH_JSON, launch)
+    time.sleep(1)
+    readiness = wait_for_launch_readiness(
+        root,
+        worker,
+        launch_attempt_id=launch_attempt_id,
+    )
+    verified_opencode_pid = int(
+        readiness.get("opencode_pid") or 0
+    )
+    verified_opencode_start = int(
+        readiness.get("opencode_start_time_ticks") or 0
+    )
+    ready = (
+        readiness.get("binding_confidence") == "strong"
+        and readiness.get("process_identity_confidence") == "strong"
+        and verified_opencode_pid > 0
+        and verified_opencode_start > 0
+    )
+    readiness_receipt = (
+        framework / f"opencode_visible_verify_{worker}.json"
+    )
+    if not ready:
+        readiness_receipt = launch_readiness_failure_path(
+            root,
+            worker,
+            launch_attempt_id,
+        )
+        write_json(
+            readiness_receipt,
+            {
+                **readiness,
+                "schema_version": 1,
+                "receipt_kind": "launch_readiness_failure",
+                "launch_state": "readiness_failed",
+                "launch_attempt_id": launch_attempt_id,
+                "launch_created_at": launch["created_at"],
+                "worker_id": worker,
+                "project": str(project),
+                "pane_id": pane_id,
+                "pane_pid": (
+                    int(
+                        launch.get("pane_pid")
+                        or readiness.get("pane_pid")
+                        or 0
+                    )
+                ),
+                "pane_start_time_ticks": (
+                    int(
+                        launch.get("pane_start_time_ticks")
+                        or readiness.get(
+                            "pane_start_time_ticks"
+                        )
+                        or 0
+                    )
+                ),
+                "tmux_session": (
+                    launch.get("tmux_session")
+                    or readiness.get("tmux_session")
+                ),
+                "tmux_window": (
+                    launch.get("tmux_window")
+                    or readiness.get("tmux_window")
+                ),
+                "tmux_pane_index": (
+                    launch.get("tmux_pane_index")
+                    or readiness.get("tmux_pane_index")
+                ),
+                "host_boot_id": (
+                    launch.get("host_boot_id")
+                    or readiness.get("host_boot_id")
+                ),
+                "tmux_server_pid": (
+                    launch.get("tmux_server_pid")
+                    or readiness.get("tmux_server_pid")
+                ),
+                "port": port,
+            },
+        )
+    launch.update(
+        {
+            "launch_state": "ready" if ready else "readiness_failed",
+            "binding_confidence": readiness.get(
+                "binding_confidence",
+                "failed",
+            ),
+            "process_identity_confidence": readiness.get(
+                "process_identity_confidence",
+                "failed",
+            ),
+            "opencode_pid": verified_opencode_pid,
+            "opencode_start_time_ticks": verified_opencode_start,
+            "readiness_attempts": readiness.get(
+                "readiness_attempts",
+                0,
+            ),
+            "readiness_elapsed_seconds": readiness.get(
+                "readiness_elapsed_seconds",
+                0.0,
+            ),
+            "readiness_receipt": rel(
+                readiness_receipt,
+                root,
+            ),
+            "readiness_errors": list(
+                readiness.get(
+                    "readiness_last_errors",
+                    readiness.get("errors", []),
+                )
+            ),
+        }
+    )
+    write_json(worker_launch_record_path(root, worker), launch)
+    write_json(framework / VISIBLE_LAUNCH_JSON, launch)
+    if not ready:
+        detail = "; ".join(launch["readiness_errors"]) or (
+            "binding confidence is not strong"
+        )
+        append_log(
+            root,
+            f"launch_not_ready worker={worker} pane={pane_id} "
+            f"port={port} detail={detail}",
+        )
+        raise LauncherError(f"launch readiness failed: {detail}")
+    append_log(root, f"launch_ok worker={worker} pane={pane_id} port={port}")
+    print(f"launched_visible: {worker}")
+    print(f"pane: {pane_id}")
+    print(f"port: {port}")
+    print(f"title: {title}")
+    print(f"launch_registry: {rel(ensure_framework(root) / VISIBLE_LAUNCH_JSON, root)}")
+    return 0
+
+
+def replacement_worker(
+    root: Path,
+    worker_id: str,
+    pane_id: str,
+    caller_scope: dict[str, str],
+) -> tuple[dict[str, Any], int]:
+    worker = existing_visible_worker(root, worker_id)
+    if not worker:
+        raise LauncherError(f"worker {worker_id!r} is not registered")
+    if str(worker.get("backend") or "") != "opencode_tui":
+        raise LauncherError("replacement requires an opencode_tui worker")
+    if str(worker.get("runtime_substrate") or "tmux") != "tmux":
+        raise LauncherError("replacement requires a tmux-registered worker")
+    if str(worker.get("binding_confidence") or "") != "strong":
+        raise LauncherError("replacement requires a strong registry binding")
+    if str(worker.get("pane_id") or "") != pane_id:
+        raise LauncherError("replacement pane does not match the registered worker")
+    try:
+        registered_pane_pid = int(worker.get("pane_pid") or 0)
+    except (TypeError, ValueError):
+        registered_pane_pid = 0
+    if registered_pane_pid <= 0:
+        raise LauncherError(
+            "replacement requires a positive registered pane_pid"
+        )
+    try:
+        port = int(worker.get("port") or 0)
+    except (TypeError, ValueError):
+        port = 0
+    if not 1 <= port <= 65535:
+        raise LauncherError("registered worker has an invalid port")
+    if pane_id == caller_scope["pane_id"]:
+        raise LauncherError("replacement target pane must differ from the caller pane")
+    current_window = (
+        f"{caller_scope['session_name']}:{caller_scope['window_index']}"
+    )
+    pane = next(
+        (
+            item
+            for item in mux_list_panes("tmux")
+            if str(item.get("pane_id") or "") == pane_id
+        ),
+        None,
+    )
+    if not pane:
+        raise LauncherError("replacement target pane is not in the caller window")
+    if (
+        str(pane.get("tmux_session") or "") != caller_scope["session_name"]
+        or str(pane.get("tmux_window") or "") != current_window
+    ):
+        raise LauncherError("replacement target pane is outside the caller window")
+    return worker, port
+
+
+def command_json(
+    argv: list[str],
+    *,
+    timeout: int,
+    label: str,
+) -> dict[str, Any]:
+    result = run(argv, timeout=timeout)
+    if result["returncode"] != 0:
+        detail = str(result.get("stderr") or "").strip() or str(
+            result.get("stdout") or ""
+        ).strip()
+        raise LauncherError(f"{label} failed: {detail or 'no detail'}")
+    try:
+        payload = json.loads(str(result.get("stdout") or ""))
+    except json.JSONDecodeError as exc:
+        raise LauncherError(f"{label} returned invalid JSON") from exc
+    if not isinstance(payload, dict):
+        raise LauncherError(f"{label} returned a non-object JSON result")
+    return payload
+
+
+def replace_failure_path(root: Path, worker_id: str) -> Path:
+    return ensure_framework(root) / f"opencode_visible_replace_failure_{worker_id}.json"
+
+
+def replacement_project(worker: dict[str, Any], requested_project: Path) -> Path:
+    raw_project = str(worker.get("project") or "").strip()
+    if not raw_project:
+        raise LauncherError("replacement requires a nonempty registered project")
+    try:
+        registered_project = Path(raw_project).expanduser().resolve()
+    except (OSError, RuntimeError) as exc:
+        raise LauncherError(
+            f"registered worker project is invalid: {raw_project!r}"
+        ) from exc
+    if not registered_project.is_dir():
+        raise LauncherError(
+            "registered worker project does not exist or is not a directory: "
+            f"{registered_project}"
+        )
+    if requested_project != registered_project:
+        raise LauncherError(
+            "replacement project must match the registered worker project"
+        )
+    return registered_project
+
+
+def pending_worker_doctor_finalize(root: Path, worker_id: str) -> bool:
+    failure = read_json(replace_failure_path(root, worker_id))
+    return (
+        failure.get("failure_stage") == "worker_doctor"
+        and not failure.get("finalized_at")
+    )
+
+
+def ready_worker_doctor(root: Path, worker_id: str) -> tuple[dict[str, Any], bool]:
+    doctor = command_json(
+        [
+            str(root / "bin" / "omx_visible_dispatch"),
+            "doctor",
+            "--root",
+            str(root),
+            "--worker",
+            worker_id,
+            "--json",
+        ],
+        timeout=90,
+        label="worker doctor",
+    )
+    if not doctor.get("ok"):
+        raise LauncherError("worker doctor requires ok=true")
+    return doctor, True
+
+
+def require_current_binding(
+    root: Path,
+    worker_id: str,
+    pane_id: str,
+    port: int,
+    *,
+    label: str,
+) -> dict[str, Any]:
+    binding = command_json(
+        [
+            sys.executable,
+            str(root / "bin" / "omx_visible_rebind"),
+            "check",
+            "--root",
+            str(root),
+            "--worker",
+            worker_id,
+            "--json",
+        ],
+        timeout=30,
+        label=label,
+    )
+    registry = binding.get("registry")
+    live = binding.get("live")
+    try:
+        matches = (
+            binding.get("status") == "current_binding_ok"
+            and isinstance(registry, dict)
+            and isinstance(live, dict)
+            and str(registry.get("pane_id") or "") == pane_id
+            and int(registry.get("port") or 0) == port
+            and str(live.get("pane_id") or "") == pane_id
+            and int(live.get("port") or 0) == port
+        )
+    except (TypeError, ValueError):
+        matches = False
+    if not matches:
+        raise LauncherError(f"{label} does not match selected worker")
+    return binding
+
+
+def replace_admission_binding(
+    root: Path,
+    worker_id: str,
+    pane_id: str,
+    port: int,
+    worker: dict[str, Any],
+) -> dict[str, Any]:
+    result = run(
+        [
+            sys.executable,
+            str(root / "bin" / "omx_visible_rebind"),
+            "check",
+            "--root",
+            str(root),
+            "--worker",
+            worker_id,
+            "--json",
+        ],
+        timeout=30,
+    )
+    if result.get("timed_out"):
+        raise LauncherError("pre-replace binding check timed out")
+    try:
+        payload = json.loads(str(result.get("stdout") or ""))
+    except json.JSONDecodeError as exc:
+        raise LauncherError(
+            "pre-replace binding check returned invalid JSON"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise LauncherError(
+            "pre-replace binding check returned a non-object JSON result"
+        )
+    registry = payload.get("registry")
+    live = payload.get("live")
+    registry = registry if isinstance(registry, dict) else {}
+    live = live if isinstance(live, dict) else {}
+    checks = live.get("checks")
+    checks = checks if isinstance(checks, dict) else {}
+
+    def _pid(value: Any) -> int:
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    healthy = bool(
+        result["returncode"] == 0
+        and payload.get("status") == "current_binding_ok"
+        and str(registry.get("pane_id") or "") == pane_id
+        and _pid(registry.get("port")) == port
+        and str(live.get("pane_id") or "") == pane_id
+        and _pid(live.get("port")) == port
+    )
+    if healthy:
+        return {"admission": "current_binding_ok", "binding": payload}
+    worker_pane_pid = _pid(worker.get("pane_pid"))
+    worker_pane_ticks = _pid(worker.get("pane_start_time_ticks"))
+    worker_opencode_pid = _pid(worker.get("opencode_pid"))
+    worker_opencode_ticks = _pid(worker.get("opencode_start_time_ticks"))
+    worker_boot_id = str(worker.get("host_boot_id") or "")
+    worker_server_pid = _pid(worker.get("tmux_server_pid"))
+    current_boot_id = host_boot_id()
+    current_server_pid = tmux_server_pid()
+    observed_pane_pid = 0
+    pane = next(
+        (
+            item
+            for item in mux_list_panes("tmux")
+            if str(item.get("pane_id") or "") == pane_id
+        ),
+        None,
+    )
+    if isinstance(pane, dict):
+        observed_pane_pid = _pid(pane.get("pane_pid"))
+    pane_instance = (
+        process_instance_state(worker_pane_pid, worker_pane_ticks)
+        if worker_pane_pid > 0
+        else "unknown"
+    )
+    opencode_instance = (
+        process_instance_state(
+            worker_opencode_pid,
+            worker_opencode_ticks,
+        )
+        if worker_opencode_pid > 0
+        else "unknown"
+    )
+    port_observation = payload.get("port_listener_observation")
+    port_observation = (
+        port_observation if isinstance(port_observation, dict) else {}
+    )
+    conditions = {
+        "check_exit_is_documented": result["returncode"] == 1,
+        "evidence_worker_matches": (
+            str(payload.get("worker_id") or "") == worker_id
+        ),
+        "status_is_port_not_live": (
+            str(payload.get("status") or "") == "port_not_live"
+        ),
+        "no_conflicting_workers": (
+            list(payload.get("conflicting_worker_ids") or []) == []
+        ),
+        "registry_matches_selected_pane": (
+            str(registry.get("pane_id") or "") == pane_id
+            and _pid(registry.get("port")) == port
+            and _pid(registry.get("pane_pid")) == worker_pane_pid
+        ),
+        "registry_pane_in_current_window": (
+            payload.get("registry_pane_exists_in_current_window") is True
+        ),
+        "same_host_boot": bool(
+            worker_boot_id
+            and current_boot_id
+            and worker_boot_id == current_boot_id
+        ),
+        "same_tmux_server": bool(
+            worker_server_pid > 0
+            and current_server_pid > 0
+            and worker_server_pid == current_server_pid
+        ),
+        "registered_pane_generation_confirmed": (
+            worker_pane_pid > 0
+            and worker_pane_ticks > 0
+            and observed_pane_pid == worker_pane_pid
+            and pane_instance == "same"
+        ),
+        "recorded_opencode_instance_gone": (
+            worker_opencode_pid > 0
+            and worker_opencode_ticks > 0
+            and opencode_instance in {"absent", "reused"}
+        ),
+        "live_pane_absent": (
+            not str(live.get("pane_id") or "")
+            and _pid(live.get("pane_pid")) == 0
+        ),
+        "port_listener_absent": (
+            checks.get("port_live") is False
+            and checks.get("listener_pid_found") is False
+            and checks.get("opencode_pid_in_current_window_pane_tree") is False
+            and _pid(live.get("opencode_pid")) == 0
+            and _pid(live.get("port")) == port
+            and port_observation.get("scan_succeeded") is True
+            and list(port_observation.get("listener_pids") or []) == []
+            and _pid(port_observation.get("listener_lines")) == 0
+        ),
+    }
+    failed = [
+        name for name, ok in sorted(conditions.items()) if not ok
+    ]
+    if failed:
+        raise LauncherError(
+            "pre-replace binding check does not match selected worker; "
+            "confirmed-exit conditions failed: " + ", ".join(failed)
+        )
+    return {
+        "admission": "confirmed_exit",
+        "binding": payload,
+        "conditions": conditions,
+    }
+
+
+def replace_receipt(
+    worker_id: str,
+    pane_id: str,
+    port: int,
+    rebind: dict[str, Any],
+    doctor: dict[str, Any],
+    doctor_ready: bool,
+    *,
+    recovery: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    receipt = {
+        "schema_version": 1,
+        "replaced_at": utc_now(),
+        "worker_id": worker_id,
+        "pane_id": pane_id,
+        "port": port,
+        "session_action": "rotate",
+        "rotation_reason": "contract_breaking_changed",
+        "rehydration_packet_type": "new-task",
+        "rebind": {
+            "respawn_transition": bool(rebind.get("respawn_transition")),
+            "post_rebind_status": rebind.get("post_rebind_status"),
+        },
+        "doctor": {
+            "ok": bool(doctor.get("ok")),
+        },
+    }
+    if recovery:
+        receipt["recovery"] = recovery
+    return receipt
+
+
+def write_replace_failure(
+    root: Path,
+    worker_id: str,
+    pane_id: str,
+    port: int,
+    failure_stage: str,
+    error: str,
+    *,
+    project: Path,
+    rebind: dict[str, Any],
+) -> Path:
+    if failure_stage == "worker_doctor":
+        recovery_argv = [
+            str(root / "bin" / "omx_opencode_visible_launcher"),
+            "replace-finalize",
+            "--root",
+            str(root),
+            "--worker",
+            worker_id,
+            "--allow-finalize",
+        ]
+    else:
+        recovery_argv = [
+            str(root / "bin" / "omx_visible_rebind"),
+            "rebind",
+            "--root",
+            str(root),
+            "--worker",
+            worker_id,
+            "--port",
+            str(port),
+            "--allow-rebind",
+        ]
+    path = replace_failure_path(root, worker_id)
+    write_json(
+        path,
+        {
+            "schema_version": 1,
+            "failed_at": utc_now(),
+            "root": str(root),
+            "worker_id": worker_id,
+            "pane_id": pane_id,
+            "port": port,
+            "project": str(project),
+            "failure_stage": failure_stage,
+            "error": error,
+            "rebind": rebind,
+            "recovery_command": " ".join(
+                shlex.quote(part) for part in recovery_argv
+            ),
+        },
+    )
+    return path
+
+
+def command_replace(args: argparse.Namespace) -> int:
+    if not getattr(args, "allow_replace", False):
+        raise LauncherError("replace requires --allow-replace")
+    root = root_path(args.root)
+    worker_id = safe_worker(args.worker)
+    pane_id = safe_pane(args.pane)
+    project = Path(args.project).expanduser().resolve()
+    if not project.is_dir():
+        raise LauncherError(f"project does not exist or is not a directory: {project}")
+    caller_scope = tmux_caller_scope()
+
+    with launch_serialization_lock(root):
+        return _command_replace_locked(
+            root,
+            worker_id,
+            pane_id,
+            project,
+            caller_scope,
+        )
+
+
+def _command_replace_locked(
+    root: Path,
+    worker_id: str,
+    pane_id: str,
+    project: Path,
+    caller_scope: dict[str, str],
+) -> int:
+    with global_mutation_gate(root, exclusive=True):
+        locks = owner_lock_paths(root)
+        if locks:
+            raise LauncherError(
+                "global owner lock present; refusing replacement: "
+                + ", ".join(path.name for path in locks)
+            )
+        if pending_worker_doctor_finalize(root, worker_id):
+            raise LauncherError(
+                "prior worker doctor failure requires replace-finalize before "
+                "another replacement"
+            )
+        worker, port = replacement_worker(
+            root,
+            worker_id,
+            pane_id,
+            caller_scope,
+        )
+        project = replacement_project(worker, project)
+        admission = replace_admission_binding(
+            root,
+            worker_id,
+            pane_id,
+            port,
+            worker,
+        )
+        command = build_command(
+            worker_id,
+            project,
+            port,
+            root=root,
+        )
+        respawn = run(
+            guarded_mux_argv(
+                "tmux",
+                "respawn-pane",
+                "-k",
+                "-t",
+                pane_id,
+                "-c",
+                str(project),
+                command,
+            ),
+            timeout=10,
+        )
+        if respawn["returncode"] != 0:
+            detail = str(respawn.get("stderr") or "").strip()
+            raise LauncherError(f"tmux respawn-pane failed: {detail or 'no detail'}")
+
+    failure_stage = "strict_rebind"
+    rebind: dict[str, Any] = {}
+    post_rebind: dict[str, Any] = {}
+    try:
+        time.sleep(1)
+        rebind = command_json(
+            [
+                sys.executable,
+                str(root / "bin" / "omx_visible_rebind"),
+                "rebind",
+                "--root",
+                str(root),
+                "--worker",
+                worker_id,
+                "--port",
+                str(port),
+                "--allow-rebind",
+                "--json",
+            ],
+            timeout=90,
+            label="strict rebind",
+        )
+        post_rebind = rebind.get("post_rebind_check", {})
+        if (
+            not rebind.get("respawn_transition")
+            or not isinstance(post_rebind, dict)
+            or post_rebind.get("status") != "current_binding_ok"
+        ):
+            raise LauncherError(
+                "strict rebind did not prove respawn_transition/current_binding_ok"
+            )
+        failure_stage = "worker_doctor"
+        doctor, doctor_ready = ready_worker_doctor(root, worker_id)
+    except LauncherError as exc:
+        write_replace_failure(
+            root,
+            worker_id,
+            pane_id,
+            port,
+            failure_stage,
+            str(exc),
+            project=project,
+            rebind={
+                "respawn_transition": bool(rebind.get("respawn_transition")),
+                "post_rebind_status": post_rebind.get("status"),
+            },
+        )
+        raise
+
+    receipt = replace_receipt(
+        worker_id,
+        pane_id,
+        port,
+        {
+            "respawn_transition": bool(rebind.get("respawn_transition")),
+            "post_rebind_status": post_rebind.get("status"),
+        },
+        doctor,
+        doctor_ready,
+        recovery=(
+            {
+                "mode": "confirmed-exit-replacement",
+                "admission_conditions": dict(
+                    admission.get("conditions") or {}
+                ),
+            }
+            if admission.get("admission") == "confirmed_exit"
+            else None
+        ),
+    )
+    receipt_path = (
+        ensure_framework(root)
+        / f"opencode_visible_replace_{worker_id}.json"
+    )
+    write_json(receipt_path, receipt)
+    print(f"replaced_visible: {worker_id}")
+    print(f"pane: {pane_id}")
+    print(f"port: {port}")
+    print(f"receipt: {rel(receipt_path, root)}")
+    return 0
+
+
+def command_replace_finalize(args: argparse.Namespace) -> int:
+    if not getattr(args, "allow_finalize", False):
+        raise LauncherError("replace-finalize requires --allow-finalize")
+    root = root_path(args.root)
+    worker_id = safe_worker(args.worker)
+    failure_path = replace_failure_path(root, worker_id)
+
+    with global_mutation_gate(root, exclusive=True):
+        locks = owner_lock_paths(root)
+        if locks:
+            raise LauncherError(
+                "global owner lock present; refusing replacement finalization: "
+                + ", ".join(path.name for path in locks)
+            )
+        failure = read_json(failure_path)
+        if not failure:
+            raise LauncherError("missing replacement failure sidecar")
+        if failure.get("failure_stage") != "worker_doctor":
+            raise LauncherError(
+                "replace-finalize only accepts a worker_doctor failure sidecar"
+            )
+        if failure.get("finalized_at"):
+            raise LauncherError("replacement failure sidecar is already finalized")
+        if str(failure.get("root") or "") != str(root):
+            raise LauncherError("replacement failure sidecar root does not match --root")
+        if str(failure.get("worker_id") or "") != worker_id:
+            raise LauncherError("replacement failure sidecar worker does not match")
+        pane_id = safe_pane(str(failure.get("pane_id") or ""))
+        try:
+            port = int(failure.get("port") or 0)
+        except (TypeError, ValueError):
+            port = 0
+        if not 1 <= port <= 65535:
+            raise LauncherError("replacement failure sidecar has an invalid port")
+        rebind = failure.get("rebind")
+        if (
+            not isinstance(rebind, dict)
+            or not rebind.get("respawn_transition")
+            or rebind.get("post_rebind_status") != "current_binding_ok"
+        ):
+            raise LauncherError(
+                "replacement failure sidecar lacks strict rebind proof"
+            )
+        worker = existing_visible_worker(root, worker_id)
+        if not worker:
+            raise LauncherError("replacement worker is no longer registered")
+        raw_project = str(failure.get("project") or "").strip()
+        if not raw_project:
+            raise LauncherError("replacement failure sidecar has no project")
+        try:
+            sidecar_project = Path(raw_project).expanduser().resolve()
+        except (OSError, RuntimeError) as exc:
+            raise LauncherError(
+                f"replacement failure sidecar project is invalid: {raw_project!r}"
+            ) from exc
+        if not sidecar_project.is_dir():
+            raise LauncherError(
+                "replacement failure sidecar project does not exist or is not a "
+                f"directory: {sidecar_project}"
+            )
+        replacement_project(worker, sidecar_project)
+        try:
+            registered_port = int(worker.get("port") or 0)
+        except (TypeError, ValueError):
+            registered_port = 0
+        if (
+            str(worker.get("pane_id") or "") != pane_id
+            or registered_port != port
+            or str(worker.get("binding_confidence") or "") != "strong"
+        ):
+            raise LauncherError(
+                "registered worker no longer matches the post-respawn sidecar"
+            )
+        require_current_binding(
+            root,
+            worker_id,
+            pane_id,
+            port,
+            label="replacement finalize binding check",
+        )
+        doctor, doctor_ready = ready_worker_doctor(root, worker_id)
+        receipt = replace_receipt(
+            worker_id,
+            pane_id,
+            port,
+            rebind,
+            doctor,
+            doctor_ready,
+            recovery={
+                "mode": "doctor-recovery-finalize",
+                "failure_stage": "worker_doctor",
+                "no_respawn": True,
+            },
+        )
+        receipt["replaced_at"] = str(failure.get("failed_at") or receipt["replaced_at"])
+        receipt["finalized_at"] = utc_now()
+        receipt_path = (
+            ensure_framework(root)
+            / f"opencode_visible_replace_{worker_id}.json"
+        )
+        write_json(receipt_path, receipt)
+        failure["finalized_at"] = receipt["finalized_at"]
+        failure["finalize_doctor"] = receipt["doctor"]
+        write_json(failure_path, failure)
+
+    print(f"finalized_visible: {worker_id}")
+    print(f"pane: {pane_id}")
+    print(f"port: {port}")
+    print(f"receipt: {rel(receipt_path, root)}")
+    return 0
+
+
+def verify_worker(
+    root: Path,
+    worker: str,
+    *,
+    deadline: float | None = None,
+    launch_attempt_id: str | None = None,
+    caller_scope: dict[str, str] | None = None,
+    _source_name: str = "",
+    _source_record: dict[str, Any] | None = None,
+    _write_sidecar: bool = True,
+) -> dict[str, Any]:
+    launch = launch_record_for_worker(root, worker)
+    if _source_record is not None:
+        source = _source_record
+        candidate_selection = {
+            "selected_source": _source_name or ("launch" if source is launch else "registry"),
+            "record": source,
+            "rejected_candidates": {},
+            "candidate_presence": {
+                "registry": bool(existing_visible_worker(root, worker)),
+                "launch": bool(launch),
+            },
+        }
+    elif launch_attempt_id is not None:
+        if (
+            not re.fullmatch(r"[0-9a-f]{32}", launch_attempt_id)
+            or launch.get("launch_attempt_id") != launch_attempt_id
+        ):
+            raise LauncherError(
+                "launch readiness attempt does not match current launch record"
+            )
+        source = launch
+        candidate_selection = {
+            "selected_source": "launch",
+            "record": launch,
+            "rejected_candidates": {},
+            "candidate_presence": {"registry": bool(existing_visible_worker(root, worker)), "launch": True},
+        }
+    else:
+        candidate_selection = select_launch_candidate(
+            root,
+            worker,
+            caller_scope=caller_scope,
+        )
+        source = candidate_selection["record"]
+        observation = candidate_selection.get("observation")
+        if isinstance(observation, dict):
+            result = dict(observation)
+            result["candidate_selection"] = {
+                key: value
+                for key, value in candidate_selection.items()
+                if key not in {"record", "observation"}
+            }
+            if _write_sidecar:
+                write_json(
+                    ensure_framework(root) / f"opencode_visible_verify_{worker}.json",
+                    result,
+                )
+            return result
+    runtime_substrate = resolve_runtime_substrate(str(source.get("runtime_substrate") or RUNTIME_SUBSTRATE_AUTO))
+    pane_id = str(source.get("pane_id", ""))
+    port = int(source.get("port", 0) or 0)
+    pane = (
+        pane_by_id(
+            pane_id,
+            runtime_substrate,
+            deadline=deadline,
+        )
+        if pane_id
+        else None
+    )
+    errors: list[str] = []
+    warnings: list[str] = []
+    tree: dict[str, Any] = {"nodes": {}, "edges": []}
+    opencode_pids: list[int] = []
+    cmdline_contains_port = False
+    if not pane:
+        errors.append(f"pane {pane_id} not found in current {runtime_substrate} window")
+    else:
+        pane_pid = pane.get("pane_pid")
+        if not pane_pid:
+            errors.append(f"pane {pane_id} has no pane_pid")
+        else:
+            tree = process_tree(
+                int(pane_pid),
+                deadline=deadline,
+            )
+            opencode_pids = find_opencode_pids(tree)
+            text = process_tree_text(tree)
+            cmdline_contains_port = bool(re.search(rf"--port(?:=|\s+){port}(?:\s|$)", text))
+            if not opencode_pids:
+                errors.append(f"pane {pane_id} process tree does not contain opencode")
+            if not cmdline_contains_port:
+                errors.append(f"pane {pane_id} opencode cmdline does not contain --port {port}")
+    tmux_pid = 0
+    if runtime_substrate == "tmux":
+        try:
+            tmux_pid = tmux_server_pid(deadline=deadline)
+        except LauncherError as exc:
+            warnings.append(str(exc))
+    socket_evidence = (
+        socket_listener_pids(port, deadline=deadline)
+        if port
+        else {"listener_pids": [], "matches": [], "warnings": []}
+    )
+    warnings.extend(socket_evidence.get("warnings", []))
+    related_pids = sorted(int(pid) for pid in tree.get("nodes", {}).keys() if str(pid).isdigit())
+    listener_pids = sorted(
+        {
+            int(pid)
+            for pid in socket_evidence.get("listener_pids", [])
+            if str(pid).isdigit()
+        }
+    )
+    strong_pid_matches = sorted(set(listener_pids).intersection(set(related_pids).union(opencode_pids)))
+    if len(opencode_pids) != 1 or len(listener_pids) != 1:
+        errors.append(
+            "process identity is ambiguous: expected one opencode process "
+            "and one port listener"
+        )
+    opencode_pid = (
+        strong_pid_matches[0]
+        if strong_pid_matches
+        else listener_pids[0]
+        if len(listener_pids) == 1
+        else opencode_pids[0]
+        if opencode_pids
+        else 0
+    )
+    launch_owned = bool(source.get("launch_owned", False))
+    user_started = bool(source.get("user_started", not launch_owned))
+    port_was_free = bool(source.get("port_was_free_before_launch", False))
+    pane_pid = int(pane.get("pane_pid") or 0) if pane else 0
+    pane_start_time_ticks = process_start_time_ticks(pane_pid)
+    opencode_start_time_ticks = process_start_time_ticks(opencode_pid)
+    current_boot_id = host_boot_id()
+    process_environment = (
+        read_process_environment(opencode_pid)
+        if opencode_pid > 0
+        else {}
+    )
+    expected_launch_attempt = str(
+        source.get("launch_attempt_id") or ""
+    )
+    environment_required = bool(expected_launch_attempt)
+    environment_matches = bool(
+        not environment_required
+        or (
+            process_environment.get("OMX_WORKER_ID") == worker
+            and process_environment.get("OMX_OPENCODE_HOST") == HOST
+            and process_environment.get("OMX_OPENCODE_PORT") == str(port)
+            and process_environment.get(
+                "OMX_LAUNCH_ATTEMPT_ID"
+            )
+            == expected_launch_attempt
+        )
+    )
+    if opencode_pid > 0 and not environment_matches:
+        errors.append(
+            "opencode process environment does not match worker/host/port"
+        )
+    identity_fence_required = bool(
+        launch_attempt_id
+        or any(
+            field in source
+            for field in (
+                "launch_attempt_id",
+                "pane_pid",
+                "pane_start_time_ticks",
+                "host_boot_id",
+                "tmux_server_pid",
+                "tmux_session",
+                "tmux_window",
+                "opencode_pid",
+                "opencode_start_time_ticks",
+            )
+        )
+    )
+    identity_fence_matches = True
+    if identity_fence_required:
+        expected_pane_pid = int(source.get("pane_pid") or 0)
+        expected_pane_start = int(
+            source.get("pane_start_time_ticks") or 0
+        )
+        expected_boot_id = str(source.get("host_boot_id") or "")
+        expected_tmux_pid = int(source.get("tmux_server_pid") or 0)
+        expected_session = str(source.get("tmux_session") or "")
+        expected_window = str(source.get("tmux_window") or "")
+        identity_fence_matches = bool(
+            expected_pane_pid > 0
+            and pane_pid == expected_pane_pid
+            and expected_pane_start > 0
+            and pane_start_time_ticks == expected_pane_start
+            and expected_boot_id
+            and current_boot_id == expected_boot_id
+            and expected_session
+            and pane
+            and pane.get("tmux_session") == expected_session
+            and expected_window
+            and pane.get("tmux_window") == expected_window
+            and (
+                runtime_substrate != "tmux"
+                or (
+                    expected_tmux_pid > 0
+                    and tmux_pid == expected_tmux_pid
+                )
+            )
+        )
+        expected_opencode_pid = int(source.get("opencode_pid") or 0)
+        expected_opencode_start = int(
+            source.get("opencode_start_time_ticks") or 0
+        )
+        if expected_opencode_pid or expected_opencode_start:
+            identity_fence_matches = bool(
+                identity_fence_matches
+                and expected_opencode_pid == opencode_pid
+                and expected_opencode_start > 0
+                and expected_opencode_start
+                == opencode_start_time_ticks
+            )
+        if not identity_fence_matches:
+            errors.append(
+                "current process identity does not match launch/registry fence"
+            )
+    pane_process_identity_strong = bool(
+        pane
+        and pane_pid > 0
+        and pane_start_time_ticks > 0
+        and opencode_pid > 0
+        and opencode_start_time_ticks > 0
+        and opencode_pids == [opencode_pid]
+        and listener_pids == [opencode_pid]
+        and strong_pid_matches == [opencode_pid]
+        and cmdline_contains_port
+        and environment_matches
+        and identity_fence_matches
+    )
+    process_cmdline = (
+        read_proc_cmdline(opencode_pid)
+        if opencode_pid > 0
+        else ""
+    )
+    attempt_process_identity_strong = bool(
+        expected_launch_attempt
+        and listener_pids == [opencode_pid]
+        and opencode_pid > 0
+        and opencode_start_time_ticks > 0
+        and re.search(
+            r"(?:^|\s|/)opencode(?:\s|$)",
+            process_cmdline.lower(),
+        )
+        and re.search(
+            rf"--port(?:=|\s+){port}(?:\s|$)",
+            process_cmdline,
+        )
+        and environment_matches
+    )
+    process_identity_strong = bool(
+        pane_process_identity_strong
+        or attempt_process_identity_strong
+    )
+    probe = (
+        probe_port(
+            port,
+            deadline=deadline,
+            readiness_only=deadline is not None,
+        )
+        if port
+        else {}
+    )
+    if not probe.get("global_health_available"):
+        errors.append(f"/global/health is not available on port {port}")
+    if not probe.get("doc_available"):
+        errors.append(f"/doc is not available on port {port}")
+    missing = [
+        endpoint
+        for endpoint in REQUIRED_TUI_ENDPOINTS
+        if endpoint not in probe.get("detected_tui_methods", [])
+    ]
+    if missing:
+        errors.append(
+            f"/doc missing required TUI endpoints: {', '.join(missing)}"
+        )
+    binding = (
+        "strong"
+        if not errors and process_identity_strong
+        else ("failed" if errors else "weak")
+    )
+    result = {
+        "schema_version": 1,
+        "verified_at": utc_now(),
+        "worker_id": worker,
+        "runtime_substrate": runtime_substrate,
+        "backend": "opencode_tui",
+        "project": source.get("project", ""),
+        "host": HOST,
+        "port": port,
+        "base_url": f"http://{HOST}:{port}",
+        "pane_id": pane_id,
+        "pane_exists": pane is not None,
+        "pane_pid": pane_pid or None,
+        "pane_start_time_ticks": pane_start_time_ticks,
+        "pane_title": pane.get("pane_title", "") if pane else str(source.get("pane_title", "")),
+        "host_boot_id": current_boot_id,
+        "tmux_server_pid": tmux_pid,
+        "opencode_pid": opencode_pid,
+        "opencode_start_time_ticks": opencode_start_time_ticks,
+        "tmux_session": pane.get("tmux_session", "") if pane else "",
+        "tmux_window": pane.get("tmux_window", "") if pane else "",
+        "tmux_pane_index": pane.get("tmux_pane_index", "") if pane else "",
+        "opencode_pids": opencode_pids,
+        "opencode_cmdline_contains_port": cmdline_contains_port,
+        "listener_pids": listener_pids,
+        "strong_pid_matches": strong_pid_matches,
+        "process_environment_required": environment_required,
+        "process_environment_matches": environment_matches,
+        "process_environment_projection": {
+            key: process_environment.get(key, "")
+            for key in (
+                "OMX_WORKER_ID",
+                "OMX_OPENCODE_HOST",
+                "OMX_OPENCODE_PORT",
+                "OMX_LAUNCH_ATTEMPT_ID",
+            )
+        },
+        "identity_fence_matches": identity_fence_matches,
+        "attempt_process_identity": (
+            attempt_process_identity_strong
+        ),
+        "launch_attempt_id": str(
+            source.get("launch_attempt_id") or ""
+        ),
+        "candidate_selection": {
+            key: value
+            for key, value in candidate_selection.items()
+            if key not in {"record", "observation"}
+        },
+        "launch_owned": launch_owned,
+        "user_started": user_started,
+        "port_was_free_before_launch": port_was_free,
+        "process_identity_confidence": (
+            "strong" if process_identity_strong else "failed"
+        ),
+        "server_live": bool(probe.get("global_health_available")),
+        "doc_available": bool(probe.get("doc_available")),
+        "session_status_available": bool(probe.get("session_status_available")),
+        "global_event_available": bool(probe.get("global_event_available")),
+        "event_available": bool(probe.get("event_available")),
+        "detected_tui_methods": probe.get("detected_tui_methods", []),
+        "tui_clear_prompt": bool(probe.get("tui_clear_prompt")),
+        "tui_append_prompt": bool(probe.get("tui_append_prompt")),
+        "tui_submit_prompt": bool(probe.get("tui_submit_prompt")),
+        "binding_confidence": binding,
+        "probe": probe,
+        "socket_evidence": socket_evidence,
+        "process_tree": tree,
+        "errors": errors,
+        "warnings": warnings,
+    }
+    if _write_sidecar:
+        write_json(ensure_framework(root) / f"opencode_visible_verify_{worker}.json", result)
+    return result
+
+
+def wait_for_launch_readiness(
+    root: Path,
+    worker: str,
+    *,
+    launch_attempt_id: str | None = None,
+) -> dict[str, Any]:
+    started = time.monotonic()
+    deadline = started + LAUNCH_READINESS_TIMEOUT_SECONDS
+    observed = started
+    attempts = 0
+    strongest_process_identity: dict[str, Any] = {}
+    while True:
+        try:
+            verify_kwargs: dict[str, Any] = {"deadline": deadline}
+            if launch_attempt_id is not None:
+                verify_kwargs["launch_attempt_id"] = launch_attempt_id
+            latest = verify_worker(root, worker, **verify_kwargs)
+        except LauncherError as exc:
+            observed = time.monotonic()
+            latest = {
+                "binding_confidence": "failed",
+                "process_identity_confidence": "failed",
+                "errors": [str(exc)],
+            }
+        else:
+            observed = time.monotonic()
+        attempts += 1
+        if latest.get("process_identity_confidence") == "strong":
+            latest_identity = (
+                int(latest.get("opencode_pid") or 0),
+                int(
+                    latest.get("opencode_start_time_ticks")
+                    or 0
+                ),
+            )
+            strongest_identity = (
+                int(
+                    strongest_process_identity.get(
+                        "opencode_pid"
+                    )
+                    or 0
+                ),
+                int(
+                    strongest_process_identity.get(
+                        "opencode_start_time_ticks"
+                    )
+                    or 0
+                ),
+            )
+            if (
+                strongest_process_identity
+                and latest_identity != strongest_identity
+            ):
+                latest = dict(latest)
+                latest["binding_confidence"] = "failed"
+                latest["process_identity_confidence"] = "failed"
+                latest["errors"] = [
+                    *latest.get("errors", []),
+                    "opencode process identity changed during launch readiness",
+                ]
+            else:
+                strongest_process_identity = dict(latest)
+        ready = (
+            latest.get("binding_confidence") == "strong"
+            and latest.get("process_identity_confidence") == "strong"
+            and observed < deadline
+        )
+        if ready:
+            break
+        if observed >= deadline:
+            break
+        time.sleep(
+            min(
+                LAUNCH_READINESS_POLL_SECONDS,
+                deadline - observed,
+            )
+        )
+    result = (
+        strongest_process_identity
+        if not ready
+        and strongest_process_identity
+        else dict(latest)
+    )
+    if not ready:
+        result["binding_confidence"] = "failed"
+    result["readiness_attempts"] = attempts
+    result["readiness_elapsed_seconds"] = round(
+        observed - started,
+        3,
+    )
+    result["readiness_last_errors"] = list(
+        latest.get("errors", [])
+    )
+    result["readiness_last_binding_confidence"] = latest.get(
+        "binding_confidence",
+        "failed",
+    )
+    result["readiness_last_process_identity_confidence"] = latest.get(
+        "process_identity_confidence",
+        "failed",
+    )
+    result["readiness_timed_out"] = bool(
+        observed >= deadline
+    )
+    write_json(
+        ensure_framework(root)
+        / f"opencode_visible_verify_{worker}.json",
+        result,
+    )
+    return result
+
+
+def command_verify(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    worker = safe_worker(args.worker)
+    result = verify_worker(root, worker)
+    print(f"visible_worker: {worker}")
+    print(f"runtime_substrate: {result.get('runtime_substrate')}")
+    print(f"pane: {result.get('pane_id')}")
+    print(f"pane_pid: {result.get('pane_pid')}")
+    print(f"port: {result.get('port')}")
+    print(f"server_live: {str(bool(result.get('server_live'))).lower()}")
+    print(f"doc_available: {str(bool(result.get('doc_available'))).lower()}")
+    print(f"session_status_available: {str(bool(result.get('session_status_available'))).lower()}")
+    print(f"tui_clear_prompt: {str(bool(result.get('tui_clear_prompt'))).lower()}")
+    print(f"tui_append_prompt: {str(bool(result.get('tui_append_prompt'))).lower()}")
+    print(f"tui_submit_prompt: {str(bool(result.get('tui_submit_prompt'))).lower()}")
+    print(f"opencode_pids: {result.get('opencode_pids')}")
+    print(f"opencode_cmdline_contains_port: {str(bool(result.get('opencode_cmdline_contains_port'))).lower()}")
+    print(f"binding_confidence: {result.get('binding_confidence')}")
+    if result["errors"]:
+        print("Errors:")
+        for error in result["errors"]:
+            print(f"  - {error}")
+    if result["warnings"]:
+        print("Warnings:")
+        for warning in result["warnings"]:
+            print(f"  - {warning}")
+    return 0 if result.get("binding_confidence") == "strong" else 1
+
+
+def command_register(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    worker = safe_worker(args.worker)
+    launch = launch_record_for_worker(root, worker)
+    caller_scope = tmux_caller_scope() if launch else None
+    result = verify_worker(root, worker, caller_scope=caller_scope)
+    candidate_selection = result["candidate_selection"]
+    selected_source = str(candidate_selection["selected_source"])
+    launch_attempt_id = (
+        str(result.get("launch_attempt_id") or "")
+        if selected_source == "launch"
+        else ""
+    )
+    if result.get("binding_confidence") != "strong":
+        raise LauncherError("visible worker binding is not strong; refusing allow_auto_submit registration")
+    adapter = root / "bin" / "omx_opencode_tui_adapter"
+    if not adapter.is_file():
+        raise LauncherError("missing bin/omx_opencode_tui_adapter")
+    proc = run([
+        sys.executable,
+        str(adapter),
+        "register-visible",
+        "--root",
+        str(root),
+        "--worker",
+        worker,
+        "--pane",
+        str(result["pane_id"]),
+        "--host",
+        HOST,
+        "--port",
+        str(result["port"]),
+        "--allow-auto-submit",
+        "--expected-launch-attempt-id",
+        launch_attempt_id,
+        "--expected-runtime-substrate",
+        str(result["runtime_substrate"]),
+        "--expected-pane-pid",
+        str(result["pane_pid"]),
+        "--expected-pane-start-time-ticks",
+        str(result["pane_start_time_ticks"]),
+        "--expected-opencode-pid",
+        str(result["opencode_pid"]),
+        "--expected-opencode-start-time-ticks",
+        str(result["opencode_start_time_ticks"]),
+        "--expected-host-boot-id",
+        str(result["host_boot_id"]),
+        "--expected-tmux-server-pid",
+        str(result["tmux_server_pid"]),
+        "--expected-tmux-session",
+        str(result["tmux_session"]),
+        "--expected-tmux-window",
+        str(result["tmux_window"]),
+    ], timeout=30)
+    append_log(root, f"register worker={worker} returncode={proc['returncode']}")
+    if proc["stdout"].strip():
+        print(proc["stdout"].strip())
+    if proc["stderr"].strip():
+        print(proc["stderr"].strip(), file=sys.stderr)
+    if proc["returncode"] != 0:
+        raise LauncherError("adapter register-visible failed")
+    return 0
+
+
+def command_status(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    registry = status_view_registry(read_json(framework_root(root) / VISIBLE_REGISTRY_JSON))
+    workers = registry.get("workers", [])
+    print(f"registry: {rel(framework_root(root) / VISIBLE_REGISTRY_JSON, root)}")
+    print(f"runtime_substrate: {registry.get('runtime_substrate') or '-'}")
+    if not workers:
+        print("visible_workers: none")
+        return 0
+    print("WORKER  PANE   PORT  LIVE  DOC  CLEAR  APPEND  SUBMIT  BINDING  AUTO_SUBMIT")
+    for worker in workers:
+        print(
+            f"{str(worker.get('worker_id', '-')):<7} "
+            f"{str(worker.get('pane_id', '-')):<6} "
+            f"{str(worker.get('port', '-')):<5} "
+            f"{str(bool(worker.get('server_live'))).lower():<5} "
+            f"{str(bool(worker.get('doc_available'))).lower():<4} "
+            f"{str('/tui/clear-prompt' in worker.get('detected_tui_methods', [])).lower():<6} "
+            f"{str('/tui/append-prompt' in worker.get('detected_tui_methods', [])).lower():<7} "
+            f"{str('/tui/submit-prompt' in worker.get('detected_tui_methods', [])).lower():<6} "
+            f"{str(worker.get('binding_confidence', '-')):<8} "
+            f"{str(bool(worker.get('allow_auto_submit'))).lower()}"
+        )
+    return 0
+
+
+def orphan_binding_record(root: Path, worker_id: str) -> dict[str, Any]:
+    launch_path = worker_launch_record_path(root, worker_id)
+    launch = (
+        read_json_strict(
+            launch_path,
+            "visible worker launch record",
+        )
+        if launch_path.is_file()
+        else {}
+    )
+    if launch.get("launch_state") == "readiness_failed":
+        attempt_id = str(launch.get("launch_attempt_id") or "")
+        receipt_path = launch_readiness_failure_path(
+            root,
+            worker_id,
+            attempt_id,
+        )
+        if launch.get("readiness_receipt") != rel(receipt_path, root):
+            raise LauncherError(
+                "visible worker launch readiness receipt path mismatch"
+            )
+        receipt = read_json_strict(
+            receipt_path,
+            "visible worker launch readiness failure receipt",
+        )
+        if (
+            receipt.get("receipt_kind")
+            != "launch_readiness_failure"
+            or receipt.get("launch_state") != "readiness_failed"
+            or receipt.get("launch_attempt_id") != attempt_id
+            or receipt.get("launch_created_at")
+            != launch.get("created_at")
+            or receipt.get("worker_id") != worker_id
+            or receipt.get("pane_id") != launch.get("pane_id")
+            or receipt.get("port") != launch.get("port")
+            or receipt.get("project") != launch.get("project")
+        ):
+            raise LauncherError(
+                "visible worker launch readiness failure receipt "
+                "does not match the launch attempt"
+            )
+        return normalize_launch_orphan_record(
+            receipt,
+            worker_id,
+        )
+    path = (
+        framework_root(root)
+        / f"opencode_visible_binding_{worker_id}.json"
+    )
+    if path.is_file():
+        sidecar = read_json_strict(
+            path,
+            "visible worker binding sidecar",
+        )
+        record = (
+            sidecar.get("previous_binding")
+            if sidecar.get("transaction_state") == "unregistered"
+            else sidecar.get("registered_binding", sidecar)
+        )
+        if not isinstance(record, dict):
+            raise LauncherError(
+                "visible worker binding sidecar has no recoverable binding"
+            )
+        try:
+            normalized = normalize_visible_orphan_fence(
+                record,
+                worker_id,
+            )
+        except VisibleRegistryError as exc:
+            raise LauncherError(str(exc)) from exc
+        tmux_pid = record.get("tmux_server_pid")
+        if type(tmux_pid) is not int or tmux_pid <= 0:
+            raise LauncherError(
+                "visible worker binding sidecar tmux_server_pid "
+                "is invalid"
+            )
+        normalized["tmux_server_pid"] = tmux_pid
+        normalized["identity_source"] = "registered_binding_sidecar"
+        return normalized
+    if launch:
+        raise LauncherError(
+            "visible worker launch record is not a failed readiness attempt"
+        )
+    read_json_strict(
+        launch_path,
+        "visible worker launch record",
+    )
+    raise AssertionError("unreachable")
+
+
+def normalize_launch_orphan_record(
+    record: dict[str, Any],
+    worker_id: str,
+) -> dict[str, Any]:
+    if record.get("worker_id") != worker_id:
+        raise LauncherError(
+            "launch verification receipt worker_id mismatch"
+        )
+    if record.get("launch_owned") is not True:
+        raise LauncherError(
+            "launch verification receipt requires launch_owned=true"
+        )
+    if record.get("user_started") is not False:
+        raise LauncherError(
+            "launch verification receipt requires user_started=false"
+        )
+    if record.get("process_identity_confidence") != "strong":
+        raise LauncherError(
+            "launch verification receipt "
+            "process_identity_confidence must be strong"
+        )
+    if (
+        record.get("receipt_kind") != "launch_readiness_failure"
+        or record.get("launch_state") != "readiness_failed"
+        or not re.fullmatch(
+            r"[0-9a-f]{32}",
+            str(record.get("launch_attempt_id") or ""),
+        )
+    ):
+        raise LauncherError(
+            "launch verification receipt is not a failed readiness receipt"
+        )
+    attempt_id = str(record["launch_attempt_id"])
+    environment = record.get("process_environment_projection")
+    nonce_backed = bool(
+        record.get("attempt_process_identity") is True
+        and record.get("process_environment_matches") is True
+        and isinstance(environment, dict)
+        and environment.get("OMX_WORKER_ID") == worker_id
+        and environment.get("OMX_OPENCODE_HOST") == HOST
+        and environment.get("OMX_OPENCODE_PORT")
+        == str(record.get("port"))
+        and environment.get("OMX_LAUNCH_ATTEMPT_ID")
+        == attempt_id
+    )
+    normalized: dict[str, Any] = {
+        "launch_owned": True,
+        "user_started": False,
+        "process_identity_confidence": "strong",
+        "identity_source": "launch_readiness_failure_receipt",
+        "launch_attempt_id": attempt_id,
+    }
+    for field in (
+        "worker_id",
+        "pane_id",
+        "tmux_session",
+        "tmux_window",
+        "backend",
+        "host",
+        "host_boot_id",
+    ):
+        value = record.get(field)
+        if (
+            not isinstance(value, str)
+            or not value
+            or value != value.strip()
+        ):
+            raise LauncherError(
+                f"launch verification receipt {field} "
+                "must be a nonempty string"
+            )
+        normalized[field] = value
+    if not re.fullmatch(r"%\d+", normalized["pane_id"]):
+        raise LauncherError(
+            "launch verification receipt pane_id is invalid"
+        )
+    if normalized["backend"] != "opencode_tui":
+        raise LauncherError(
+            "launch verification receipt backend must be opencode_tui"
+        )
+    if normalized["host"] != HOST:
+        raise LauncherError(
+            f"launch verification receipt host must be {HOST}"
+        )
+    tmux_pid = record.get("tmux_server_pid")
+    if type(tmux_pid) is not int or tmux_pid <= 0:
+        raise LauncherError(
+            "launch verification receipt tmux_server_pid is invalid"
+        )
+    normalized["tmux_server_pid"] = tmux_pid
+    pane_identity_missing = (
+        record.get("pane_pid") in {None, 0}
+        and record.get("pane_start_time_ticks") in {None, 0}
+    )
+    for field in (
+        "pane_pid",
+        "port",
+        "pane_start_time_ticks",
+        "opencode_pid",
+        "opencode_start_time_ticks",
+    ):
+        value = record.get(field)
+        if (
+            field in {"pane_pid", "pane_start_time_ticks"}
+            and nonce_backed
+            and pane_identity_missing
+        ):
+            normalized[field] = 0
+            continue
+        if type(value) is not int or value <= 0:
+            raise LauncherError(
+                f"launch verification receipt {field} is invalid"
+            )
+        normalized[field] = value
+    if normalized["port"] > 65535:
+        raise LauncherError(
+            "launch verification receipt port is invalid"
+        )
+    listener_pids = record.get("listener_pids")
+    if (
+        not isinstance(listener_pids, list)
+        or len(listener_pids) != 1
+        or any(type(pid) is not int or pid <= 0 for pid in listener_pids)
+        or len(set(listener_pids)) != len(listener_pids)
+        or normalized["opencode_pid"] not in listener_pids
+    ):
+        raise LauncherError(
+            "launch verification receipt listener_pids is invalid"
+        )
+    normalized["listener_pids"] = list(listener_pids)
+    normalized["binding_confidence"] = str(
+        record.get("binding_confidence") or "failed"
+    )
+    return normalized
+
+
+def inspect_orphan_worker(
+    root: Path,
+    worker_id: str,
+) -> dict[str, Any]:
+    record = orphan_binding_record(root, worker_id)
+    identity_source = str(record["identity_source"])
+    port = int(record["port"])
+    expected_pid = int(record["opencode_pid"])
+    scope = tmux_caller_scope()
+    current_window = (
+        f"{scope['session_name']}:{scope['window_index']}"
+    )
+    registry_worker = existing_visible_worker_strict(root, worker_id)
+    pane = pane_by_id(str(record["pane_id"]), "tmux")
+    probe = (
+        probe_port(port)
+        if identity_source == "registered_binding_sidecar"
+        else {}
+    )
+    socket_evidence = socket_listener_pids(port)
+    listener_pids = [
+        int(pid)
+        for pid in socket_evidence.get("listener_pids", [])
+        if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0
+    ]
+    listener_pid = listener_pids[0] if len(listener_pids) == 1 else 0
+    tree = (
+        process_tree(listener_pid)
+        if listener_pid
+        else {"root_pid": 0, "nodes": {}, "edges": []}
+    )
+    opencode_pids = find_opencode_pids(tree)
+    cmdline = read_proc_cmdline(listener_pid) if listener_pid else ""
+    environment = (
+        read_process_environment(listener_pid)
+        if listener_pid
+        else {}
+    )
+    observed_tmux_server_pid = tmux_server_pid()
+    pane_pid = int(record["pane_pid"])
+    pane_process_state = (
+        process_instance_state(
+            pane_pid,
+            int(record["pane_start_time_ticks"]),
+        )
+        if pane_pid > 0
+        else "absent"
+    )
+    listener_process_state = (
+        process_instance_state(
+            listener_pid,
+            int(record["opencode_start_time_ticks"]),
+        )
+        if listener_pid
+        else "absent"
+    )
+    recorded_listeners = {
+        int(pid) for pid in record.get("listener_pids", [])
+    }
+    checks = {
+        "registry_absent": registry_worker is None,
+        "caller_window_matches_original": (
+            scope["session_name"] == record["tmux_session"]
+            and current_window == record["tmux_window"]
+        ),
+        "original_pane_absent": pane is None,
+        "original_pane_process_gone": pane_process_state
+        in {"absent", "reused"},
+        "single_listener_pid": len(listener_pids) == 1,
+        "listener_pid_matches_original": (
+            listener_pid == expected_pid
+            and listener_pid in recorded_listeners
+        ),
+        "process_start_matches_original": (
+            listener_process_state == "same"
+        ),
+        "host_boot_matches_original": (
+            host_boot_id() == str(record["host_boot_id"])
+        ),
+        "current_tmux_server_known": (
+            observed_tmux_server_pid > 0
+        ),
+        "process_tree_confirms_opencode": (
+            listener_pid > 0 and listener_pid in opencode_pids
+        ),
+        "cmdline_contains_port": bool(
+            re.search(
+                rf"--port(?:=|\s+){port}(?:\s|$)",
+                cmdline,
+            )
+        ),
+        "cmdline_contains_hostname": bool(
+            re.search(
+                r"--hostname(?:=|\s+)(?:127\.0\.0\.1|localhost)"
+                r"(?:\s|$)",
+                cmdline,
+            )
+        ),
+        "worker_environment_matches_original": (
+            environment.get("OMX_WORKER_ID") == worker_id
+        ),
+        "host_environment_matches_original": (
+            environment.get("OMX_OPENCODE_HOST") == str(record["host"])
+        ),
+        "port_environment_matches_original": (
+            environment.get("OMX_OPENCODE_PORT") == str(port)
+        ),
+    }
+    launch_attempt_id = str(
+        record.get("launch_attempt_id") or ""
+    )
+    if launch_attempt_id:
+        checks["attempt_environment_matches_original"] = (
+            environment.get("OMX_LAUNCH_ATTEMPT_ID")
+            == launch_attempt_id
+        )
+    if identity_source == "registered_binding_sidecar":
+        checks.update(
+            {
+                "port_live": bool(
+                    probe.get("global_health_available")
+                ),
+                "doc_is_opencode": bool(
+                    probe.get("doc_available")
+                ),
+                "required_tui_present": all(
+                    endpoint
+                    in probe.get("detected_tui_methods", [])
+                    for endpoint in REQUIRED_TUI_ENDPOINTS
+                ),
+            }
+        )
+    errors = [
+        f"{name}=false"
+        for name, passed in checks.items()
+        if not passed
+    ]
+    return {
+        "schema_version": 1,
+        "generated_at": utc_now(),
+        "root": str(root),
+        "worker_id": worker_id,
+        "identity_source": identity_source,
+        "pane_id": record["pane_id"],
+        "port": port,
+        "listener_pid": listener_pid,
+        "expected_listener_pid": expected_pid,
+        "expected_process_start_time_ticks": int(
+            record["opencode_start_time_ticks"]
+        ),
+        "identity_fence": {
+            "identity_source": identity_source,
+            "launch_attempt_id": str(
+                record.get("launch_attempt_id") or ""
+            ),
+            "worker_id": worker_id,
+            "instance_id": str(
+                record.get("instance_id") or ""
+            ),
+            "binding_generation": int(
+                record.get("binding_generation") or 0
+            ),
+            "fencing_generation": int(
+                record.get("fencing_generation") or 0
+            ),
+            "binding_lease_id": str(
+                record.get("binding_lease_id") or ""
+            ),
+            "pane_id": str(record["pane_id"]),
+            "pane_pid": int(record["pane_pid"]),
+            "pane_start_time_ticks": int(
+                record["pane_start_time_ticks"]
+            ),
+            "host_boot_id": str(record["host_boot_id"]),
+            "source_tmux_server_pid": int(
+                record["tmux_server_pid"]
+            ),
+            "observed_tmux_server_pid": (
+                observed_tmux_server_pid
+            ),
+            "tmux_session": str(record["tmux_session"]),
+            "tmux_window": str(record["tmux_window"]),
+            "port": port,
+            "opencode_pid": expected_pid,
+            "opencode_start_time_ticks": int(
+                record["opencode_start_time_ticks"]
+            ),
+            "listener_pid": listener_pid,
+        },
+        "original_pane_process_state": pane_process_state,
+        "listener_process_state": listener_process_state,
+        "ready_for_authorized_stop": not errors,
+        "checks": checks,
+        "errors": errors,
+        "warnings": list(socket_evidence.get("warnings", [])),
+        "process_tree": tree,
+        "environment_projection": {
+            key: environment.get(key, "")
+            for key in (
+                "OMX_WORKER_ID",
+                "OMX_OPENCODE_HOST",
+                "OMX_OPENCODE_PORT",
+            )
+        },
+        "binding_sidecar": rel(
+            framework_root(root)
+            / f"opencode_visible_binding_{worker_id}.json",
+            root,
+        ),
+    }
+
+
+def command_orphan_stop_plan(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    worker_id = safe_worker(args.worker)
+    plan = inspect_orphan_worker(root, worker_id)
+    framework = ensure_framework(root)
+    json_path = (
+        framework
+        / f"opencode_visible_orphan_stop_plan_{worker_id}.json"
+    )
+    markdown_path = (
+        framework
+        / f"OPENCODE_VISIBLE_ORPHAN_STOP_PLAN_{worker_id}.md"
+    )
+    write_json(json_path, plan)
+    lines = [
+        "# OpenCode Visible Worker Orphan Stop Plan",
+        "",
+        "This is a plan only. No signal or lifecycle action was executed.",
+        "",
+        f"- worker_id: `{worker_id}`",
+        f"- pane_id: `{plan['pane_id']}`",
+        f"- port: `{plan['port']}`",
+        f"- listener_pid: `{plan['listener_pid']}`",
+        "- ready_for_authorized_stop: "
+        f"`{str(plan['ready_for_authorized_stop']).lower()}`",
+        "",
+        "## Checks",
+        "",
+        *[
+            f"- {name}: `{str(passed).lower()}`"
+            for name, passed in plan["checks"].items()
+        ],
+        "",
+        "Cleanup still requires the explicit `orphan-stop` command with "
+        "`--allow-orphan-stop`, the planned port, and the planned listener PID.",
+    ]
+    markdown_path.write_text(
+        "\n".join(lines) + "\n",
+        encoding="utf-8",
+    )
+    print(f"orphan_stop_plan: {rel(json_path, root)}")
+    print(f"orphan_stop_doc: {rel(markdown_path, root)}")
+    print(
+        "ready_for_authorized_stop: "
+        f"{str(plan['ready_for_authorized_stop']).lower()}"
+    )
+    return 0 if plan["ready_for_authorized_stop"] else 1
+
+
+def command_stop_plan(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    worker = safe_worker(args.worker)
+    launch = launch_record_for_worker(root, worker)
+    registry = existing_visible_worker(root, worker) or {}
+    if registry:
+        record = registry
+    elif launch:
+        record = verify_worker(root, worker)
+        if record.get("binding_confidence") != "strong":
+            raise LauncherError(
+                "unregistered visible worker no longer has a strong binding"
+            )
+    else:
+        raise LauncherError(
+            f"no visible launch or registry record for worker: {worker}"
+        )
+    lines = [
+        "# OpenCode Visible Worker Stop Plan",
+        "",
+        "This is a plan only. No cleanup command was executed.",
+        "",
+        f"- worker_id: `{worker}`",
+        f"- runtime_substrate: `{record.get('runtime_substrate') or 'tmux'}`",
+        f"- pane_id: `{record.get('pane_id', '')}`",
+        f"- port: `{record.get('port', '')}`",
+        f"- pane_title: `{record.get('pane_title', '')}`",
+        "",
+        *(
+            [
+                "The unregistered launch binding was revalidated before this "
+                "plan was written.",
+                "",
+            ]
+            if not registry
+            else []
+        ),
+        "Before any future manual cleanup, verify this pane is still the visible worker intended by the user.",
+        "This stop-plan invocation does not execute `kill-pane`, `kill-window`, `C-c`, `exit`, or any lifecycle action.",
+    ]
+    path = ensure_framework(root) / "opencode_visible_worker_stop_plan.md"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"stop_plan: {rel(path, root)}")
+    return 0
+
+
+def stop_binding_fence(
+    record: dict[str, Any],
+    worker_id: str,
+) -> dict[str, Any]:
+    try:
+        return normalize_visible_stop_fence(record, worker_id)
+    except VisibleRegistryError as exc:
+        raise LauncherError(str(exc)) from exc
+
+
+def stop_binding_fence_matches(
+    expected: dict[str, Any],
+    current: dict[str, Any] | None,
+    worker_id: str,
+) -> bool:
+    return visible_stop_fence_matches(expected, current, worker_id)
+
+
+def validate_stop_target(
+    root: Path,
+    worker_id: str,
+    pane_id: str,
+    port: int,
+    fence: dict[str, Any],
+) -> None:
+    current_scope = tmux_caller_scope()
+    current_window = (
+        f"{current_scope['session_name']}:{current_scope['window_index']}"
+    )
+    if current_scope["pane_id"] == pane_id:
+        raise LauncherError("stop target pane must differ from the caller pane")
+    if (
+        fence["pane_id"] != pane_id
+        or fence["port"] != port
+        or fence["tmux_session"] != current_scope["session_name"]
+        or fence["tmux_window"] != current_window
+    ):
+        raise LauncherError("stop binding fence is outside the caller window")
+    current = existing_visible_worker_strict(root, worker_id)
+    if not stop_binding_fence_matches(fence, current, worker_id):
+        raise LauncherError("stop binding changed before kill-pane")
+    pane = pane_by_id(pane_id, "tmux")
+    if (
+        pane is None
+        or int(pane.get("pane_pid") or 0) != fence["pane_pid"]
+        or str(pane.get("tmux_session") or "") != fence["tmux_session"]
+        or str(pane.get("tmux_window") or "") != fence["tmux_window"]
+    ):
+        raise LauncherError("stop pane identity changed before kill-pane")
+
+
+def raise_stop_failure(
+    root: Path,
+    worker_id: str,
+    pane_id: str,
+    port: int,
+    adapter: Path,
+    fence: dict[str, Any],
+    detail: str,
+) -> None:
+    try:
+        pane_stopped: bool | None = pane_by_id(pane_id, "tmux") is None
+    except Exception:
+        pane_stopped = None
+    try:
+        port_is_live: bool | None = bool(port_live(port))
+    except Exception:
+        port_is_live = None
+    try:
+        current = existing_visible_worker_strict(root, worker_id)
+        registry_present: bool | None = current is not None
+        registry_matches: bool | None = stop_binding_fence_matches(
+            fence,
+            current,
+            worker_id,
+        )
+    except Exception:
+        registry_present = None
+        registry_matches = None
+
+    def state_text(value: bool | None) -> str:
+        if value is None:
+            return "unknown"
+        return str(value).lower()
+
+    message = (
+        "stop partial failure; "
+        f"pane_stopped={state_text(pane_stopped)} "
+        f"port_live={state_text(port_is_live)} "
+        f"registry_present={state_text(registry_present)} "
+        f"registry_matches_fence={state_text(registry_matches)}; "
+        f"{detail.strip() or 'no detail'}"
+    )
+    if (
+        pane_stopped is True
+        and port_is_live is False
+        and registry_present is True
+        and registry_matches is True
+    ):
+        follow_up = shlex.join(
+            [
+                str(adapter),
+                "unregister-visible",
+                "--root",
+                str(root),
+                "--worker",
+                worker_id,
+                "--expected-stop-fence-json",
+                json.dumps(
+                    fence,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            ]
+        )
+        message += f"; safe_follow_up: {follow_up}"
+    raise LauncherError(message)
+
+
+def _stop_verified_pane(
+    root: Path,
+    worker_id: str,
+    pane_id: str,
+    port: int,
+    adapter: Path,
+    fence: dict[str, Any],
+) -> int:
+    validate_stop_target(
+        root,
+        worker_id,
+        pane_id,
+        port,
+        fence,
+    )
+    killed = run(
+        guarded_mux_argv("tmux", "kill-pane", "-t", pane_id),
+        timeout=10,
+    )
+    if killed["returncode"] != 0:
+        detail = str(killed.get("stderr") or "").strip()
+        raise_stop_failure(
+            root,
+            worker_id,
+            pane_id,
+            port,
+            adapter,
+            fence,
+            detail or "tmux kill-pane failed",
+        )
+    try:
+        pane = pane_by_id(pane_id, "tmux")
+    except LauncherError as exc:
+        raise_stop_failure(
+            root,
+            worker_id,
+            pane_id,
+            port,
+            adapter,
+            fence,
+            f"pane verification failed: {exc}",
+        )
+    if pane is not None:
+        raise_stop_failure(
+            root,
+            worker_id,
+            pane_id,
+            port,
+            adapter,
+            fence,
+            f"pane {pane_id} still exists",
+        )
+    deadline = time.monotonic() + STOP_PORT_CLOSE_TIMEOUT_SECONDS
+    while port_live(port):
+        if time.monotonic() >= deadline:
+            raise_stop_failure(
+                root,
+                worker_id,
+                pane_id,
+                port,
+                adapter,
+                fence,
+                f"port {port} did not close before timeout",
+            )
+        time.sleep(STOP_PORT_POLL_SECONDS)
+
+
+def _unregister_stopped_worker(
+    root: Path,
+    worker_id: str,
+    pane_id: str,
+    port: int,
+    adapter: Path,
+    fence: dict[str, Any],
+) -> int:
+    unregistered = run(
+        [
+            sys.executable,
+            str(adapter),
+            "unregister-visible",
+            "--root",
+            str(root),
+            "--worker",
+            worker_id,
+            "--expected-stop-fence-json",
+            json.dumps(
+                fence,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        ],
+        timeout=30,
+    )
+    if unregistered["returncode"] != 0:
+        detail = (
+            str(unregistered.get("stderr") or "").strip()
+            or str(unregistered.get("stdout") or "").strip()
+        )
+        raise_stop_failure(
+            root,
+            worker_id,
+            pane_id,
+            port,
+            adapter,
+            fence,
+            f"unregister-visible failed: {detail or 'no detail'}",
+        )
+    try:
+        current = existing_visible_worker_strict(root, worker_id)
+    except LauncherError as exc:
+        raise_stop_failure(
+            root,
+            worker_id,
+            pane_id,
+            port,
+            adapter,
+            fence,
+            f"registry verification failed: {exc}",
+        )
+    if current:
+        raise_stop_failure(
+            root,
+            worker_id,
+            pane_id,
+            port,
+            adapter,
+            fence,
+            "unregister-visible did not remove the target worker",
+        )
+    print(f"stopped_visible: {worker_id}")
+    print(f"pane: {pane_id}")
+    print(f"port: {port}")
+    print("pane_stopped: true")
+    print("port_live: false")
+    print("registry_removed: true")
+    return 0
+
+
+def _stop_verified_worker(
+    root: Path,
+    worker_id: str,
+    pane_id: str,
+    port: int,
+    adapter: Path,
+    fence: dict[str, Any],
+) -> int:
+    _stop_verified_pane(root, worker_id, pane_id, port, adapter, fence)
+    return _unregister_stopped_worker(
+        root,
+        worker_id,
+        pane_id,
+        port,
+        adapter,
+        fence,
+    )
+
+
+def _command_stop_locked(
+    root: Path,
+    worker_id: str,
+    pane_id: str,
+) -> int:
+    with launch_serialization_lock(root):
+        with global_mutation_gate(root, exclusive=True):
+            caller_scope = tmux_caller_scope()
+            locks = owner_lock_paths(root)
+            if locks:
+                raise LauncherError(
+                    "global owner lock present; refusing stop: "
+                    + ", ".join(path.name for path in locks)
+                )
+            worker, port = replacement_worker(
+                root,
+                worker_id,
+                pane_id,
+                caller_scope,
+            )
+            if (
+                worker.get("launch_owned") is not True
+                or worker.get("user_started") is not False
+            ):
+                raise LauncherError(
+                    "stop requires a task-owned, non-user-started worker"
+                )
+            adapter = root / "bin" / "omx_opencode_tui_adapter"
+            if not adapter.is_file():
+                raise LauncherError("missing bin/omx_opencode_tui_adapter")
+            verified = verify_worker(root, worker_id)
+            fence = stop_binding_fence(worker, worker_id)
+            if (
+                verified.get("binding_confidence") != "strong"
+                or str(verified.get("pane_id") or "") != pane_id
+                or int(verified.get("port") or 0) != port
+                or verified.get("launch_owned") is not True
+                or int(verified.get("pane_pid") or 0) != fence["pane_pid"]
+                or str(verified.get("tmux_session") or "")
+                != fence["tmux_session"]
+                or str(verified.get("tmux_window") or "")
+                != fence["tmux_window"]
+            ):
+                raise LauncherError(
+                    "stop preflight does not match the task-owned worker"
+                )
+            _stop_verified_pane(
+                root,
+                worker_id,
+                pane_id,
+                port,
+                adapter,
+                fence,
+            )
+        # The adapter takes this same gate to perform the fenced registry CAS.
+        return _unregister_stopped_worker(
+            root,
+            worker_id,
+            pane_id,
+            port,
+            adapter,
+            fence,
+        )
+
+
+def command_stop(args: argparse.Namespace) -> int:
+    if not getattr(args, "allow_stop", False):
+        raise LauncherError("stop requires --allow-stop")
+    root = root_path(args.root)
+    worker_id = safe_worker(args.worker)
+    pane_id = safe_pane(args.pane)
+    return _command_stop_locked(root, worker_id, pane_id)
+
+
+def command_orphan_stop(args: argparse.Namespace) -> int:
+    if not getattr(args, "allow_orphan_stop", False):
+        raise LauncherError(
+            "orphan-stop requires --allow-orphan-stop"
+        )
+    root = root_path(args.root)
+    worker_id = safe_worker(args.worker)
+    port = int(args.port)
+    listener_pid = int(args.listener_pid)
+    if not 1 <= port <= 65535 or listener_pid <= 0:
+        raise LauncherError(
+            "orphan-stop requires a valid port and positive listener pid"
+        )
+    with launch_serialization_lock(root):
+        with global_mutation_gate(root, exclusive=True):
+            locks = owner_lock_paths(root)
+            if locks:
+                raise LauncherError(
+                    "global owner lock present; refusing orphan stop: "
+                    + ", ".join(path.name for path in locks)
+                )
+            with visible_registry_lock(root):
+                plan_path = (
+                    framework_root(root)
+                    / (
+                        "opencode_visible_orphan_stop_plan_"
+                        f"{worker_id}.json"
+                    )
+                )
+                try:
+                    plan = read_json_strict(
+                        plan_path,
+                        "orphan-stop plan",
+                    )
+                except LauncherError as exc:
+                    raise LauncherError(
+                        "matching ready orphan-stop-plan required: "
+                        f"{exc}"
+                    ) from exc
+                plan_checks = plan.get("checks")
+                planned_fence = plan.get("identity_fence")
+                if (
+                    plan.get("worker_id") != worker_id
+                    or plan.get("port") != port
+                    or plan.get("listener_pid") != listener_pid
+                    or plan.get("expected_listener_pid")
+                    != listener_pid
+                    or not plan.get("ready_for_authorized_stop")
+                    or not isinstance(plan_checks, dict)
+                    or not plan_checks
+                    or not all(
+                        value is True
+                        for value in plan_checks.values()
+                    )
+                    or plan.get("errors")
+                    or not isinstance(planned_fence, dict)
+                    or not planned_fence
+                ):
+                    raise LauncherError(
+                        "matching ready orphan-stop-plan required"
+                    )
+                pidfd = open_pidfd(listener_pid)
+                try:
+                    observation = inspect_orphan_worker(
+                        root,
+                        worker_id,
+                    )
+                    checks = observation.get("checks")
+                    if (
+                        observation.get("worker_id") != worker_id
+                        or observation.get("port") != port
+                        or observation.get("listener_pid")
+                        != listener_pid
+                        or observation.get("expected_listener_pid")
+                        != listener_pid
+                        or not observation.get(
+                            "ready_for_authorized_stop"
+                        )
+                        or not isinstance(checks, dict)
+                        or not checks
+                        or not all(
+                            value is True for value in checks.values()
+                        )
+                        or observation.get("errors")
+                        or observation.get("identity_fence")
+                        != planned_fence
+                    ):
+                        raise LauncherError(
+                            "orphan-stop identity revalidation failed: "
+                            + ", ".join(
+                                observation.get("errors")
+                                or ["fence mismatch"]
+                            )
+                        )
+                    expected_start = int(
+                        observation[
+                            "expected_process_start_time_ticks"
+                        ]
+                    )
+                    send_sigterm_pidfd(pidfd)
+                    deadline = (
+                        time.monotonic()
+                        + STOP_PORT_CLOSE_TIMEOUT_SECONDS
+                    )
+                    while True:
+                        process_state = process_instance_state(
+                            listener_pid,
+                            expected_start,
+                        )
+                        port_is_live = port_live(port)
+                        if (
+                            process_state in {"absent", "reused"}
+                            and not port_is_live
+                        ):
+                            break
+                        if process_state == "unknown":
+                            raise LauncherError(
+                                "orphan-stop partial failure; "
+                                "pid_state=unknown"
+                            )
+                        if time.monotonic() >= deadline:
+                            raise LauncherError(
+                                "orphan-stop partial failure; "
+                                f"pid_state={process_state} "
+                                "port_live="
+                                f"{str(port_is_live).lower()}"
+                            )
+                        time.sleep(STOP_PORT_POLL_SECONDS)
+                    registry_worker = existing_visible_worker_strict(
+                        root,
+                        worker_id,
+                    )
+                    pane = pane_by_id(
+                        str(observation["pane_id"]),
+                        "tmux",
+                    )
+                    post_process_state = process_instance_state(
+                        listener_pid,
+                        expected_start,
+                    )
+                    process_stopped = post_process_state in {
+                        "absent",
+                        "reused",
+                    }
+                    port_closed = not port_live(port)
+                    registry_absent = registry_worker is None
+                    pane_absent = pane is None
+                    if not all(
+                        (
+                            process_stopped,
+                            port_closed,
+                            registry_absent,
+                            pane_absent,
+                        )
+                    ):
+                        raise LauncherError(
+                            "orphan-stop postcondition failed; "
+                            f"process_stopped={str(process_stopped).lower()} "
+                            f"port_closed={str(port_closed).lower()} "
+                            f"registry_absent={str(registry_absent).lower()} "
+                            f"pane_absent={str(pane_absent).lower()}"
+                        )
+                    receipt = {
+                        "schema_version": 1,
+                        "stopped_at": utc_now(),
+                        "root": str(root),
+                        "worker_id": worker_id,
+                        "pane_id": observation["pane_id"],
+                        "port": port,
+                        "listener_pid": listener_pid,
+                        "signal": "SIGTERM",
+                        "signal_transport": "pidfd",
+                        "post_process_state": post_process_state,
+                        "process_stopped": process_stopped,
+                        "port_closed": port_closed,
+                        "registry_absent": registry_absent,
+                        "pane_absent": pane_absent,
+                        "pre_stop_observation": observation,
+                    }
+                    receipt_path = (
+                        ensure_framework(root)
+                        / (
+                            "opencode_visible_orphan_stop_receipt_"
+                            f"{worker_id}.json"
+                        )
+                    )
+                    write_json(receipt_path, receipt)
+                finally:
+                    os.close(pidfd)
+    print(f"orphan_stopped_visible: {worker_id}")
+    print(f"listener_pid: {listener_pid}")
+    print(f"port: {port}")
+    print("process_stopped: true")
+    print("port_closed: true")
+    print("registry_absent: true")
+    print("pane_absent: true")
+    print(f"receipt: {rel(receipt_path, root)}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Launch/register one user-visible fixed-port OpenCode TUI worker without mux input or OpenCode POST calls."
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    plan = sub.add_parser("plan", help="write a visible worker launch plan without starting anything")
+    plan.add_argument("--root", default=".")
+    plan.add_argument("--worker", required=True)
+    plan.add_argument("--project", required=True)
+    plan.add_argument("--base-port", type=int, default=4201)
+    plan.add_argument("--runtime-substrate", default=RUNTIME_SUBSTRATE_AUTO, choices=RUNTIME_SUBSTRATE_CHOICES)
+    plan.set_defaults(func=command_plan)
+
+    preflight = sub.add_parser("preflight", help="check tmux/opencode/project/port readiness without launching")
+    preflight.add_argument("--root", default=".")
+    preflight.add_argument("--worker", required=True)
+    preflight.add_argument("--project", required=True)
+    preflight.add_argument("--base-port", type=int, default=4201)
+    preflight.add_argument("--runtime-substrate", default=RUNTIME_SUBSTRATE_AUTO, choices=RUNTIME_SUBSTRATE_CHOICES)
+    preflight.set_defaults(func=command_preflight)
+
+    launch = sub.add_parser("launch", help="create one visible split pane with fixed-port OpenCode")
+    launch.add_argument("--root", default=".")
+    launch.add_argument("--worker", required=True)
+    launch.add_argument("--project", required=True)
+    launch.add_argument("--base-port", type=int, default=4201)
+    launch.add_argument("--runtime-substrate", default=RUNTIME_SUBSTRATE_AUTO, choices=RUNTIME_SUBSTRATE_CHOICES)
+    launch.add_argument("--allow-launch", action="store_true")
+    launch.set_defaults(func=command_launch)
+
+    replace = sub.add_parser(
+        "replace",
+        help="explicitly respawn one current-window tmux worker",
+    )
+    replace.add_argument("--root", default=".")
+    replace.add_argument("--worker", required=True)
+    replace.add_argument("--pane", required=True)
+    replace.add_argument("--project", required=True)
+    replace.add_argument("--allow-replace", action="store_true")
+    replace.set_defaults(func=command_replace)
+
+    finalize = sub.add_parser(
+        "replace-finalize",
+        help="validate and record a worker-doctor replacement recovery without respawning",
+    )
+    finalize.add_argument("--root", default=".")
+    finalize.add_argument("--worker", required=True)
+    finalize.add_argument("--allow-finalize", action="store_true")
+    finalize.set_defaults(func=command_replace_finalize)
+
+    verify = sub.add_parser("verify", help="verify the visible pane/process/port binding without POSTing")
+    verify.add_argument("--root", default=".")
+    verify.add_argument("--worker", required=True)
+    verify.set_defaults(func=command_verify)
+
+    register = sub.add_parser("register", help="register a strong visible binding for auto-submit")
+    register.add_argument("--root", default=".")
+    register.add_argument("--worker", required=True)
+    register.set_defaults(func=command_register)
+
+    status = sub.add_parser("status", help="show visible worker registry status")
+    status.add_argument("--root", default=".")
+    status.set_defaults(func=command_status)
+
+    stop_plan = sub.add_parser("stop-plan", help="write a non-executing stop plan for the visible worker")
+    stop_plan.add_argument("--root", default=".")
+    stop_plan.add_argument("--worker", required=True)
+    stop_plan.set_defaults(func=command_stop_plan)
+
+    orphan_stop_plan = sub.add_parser(
+        "orphan-stop-plan",
+        help="revalidate and write a non-executing orphan process stop plan",
+    )
+    orphan_stop_plan.add_argument("--root", default=".")
+    orphan_stop_plan.add_argument("--worker", required=True)
+    orphan_stop_plan.set_defaults(func=command_orphan_stop_plan)
+
+    orphan_stop = sub.add_parser(
+        "orphan-stop",
+        help="SIGTERM one identity-fenced task-owned orphan process",
+    )
+    orphan_stop.add_argument("--root", default=".")
+    orphan_stop.add_argument("--worker", required=True)
+    orphan_stop.add_argument("--port", required=True, type=int)
+    orphan_stop.add_argument(
+        "--listener-pid",
+        required=True,
+        type=int,
+    )
+    orphan_stop.add_argument(
+        "--allow-orphan-stop",
+        action="store_true",
+    )
+    orphan_stop.set_defaults(func=command_orphan_stop)
+
+    stop = sub.add_parser(
+        "stop",
+        help="stop and unregister one task-owned current-window tmux worker",
+    )
+    stop.add_argument("--root", default=".")
+    stop.add_argument("--worker", required=True)
+    stop.add_argument("--pane", required=True)
+    stop.add_argument("--allow-stop", action="store_true")
+    stop.set_defaults(func=command_stop)
+    for command_parser in sub.choices.values():
+        command_parser.set_defaults(root=None)
+    return parser
+
+
+def main(argv: list[str] | None = None, *, _admission_root: Path | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return invoke_cli_handler("omx_opencode_visible_launcher", args, args.func, admission_root=_admission_root)
+    except LauncherError as exc:
+        if isinstance(exc, LauncherCandidateConflictError):
+            compact = json.dumps(exc.evidence, sort_keys=True, separators=(",", ":"))
+            print(f"ERROR: candidate_conflict {compact}", file=sys.stderr)
+        else:
+            print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    except AdmissionError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("ERROR: interrupted", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

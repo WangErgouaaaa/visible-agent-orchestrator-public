@@ -1,0 +1,128 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/omx/opencode-evidence-runner-plan.schema.json",
+  "title": "OpenCode Evidence Runner Plan",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "runner_plan_id",
+    "source_package_id",
+    "source_package_path",
+    "target_worker_id",
+    "execution_mode",
+    "runner_steps",
+    "safety_gates",
+    "allowed_write_roots",
+    "forbidden_paths",
+    "future_entrypoints",
+    "validation_requirements",
+    "would_execute_live",
+    "would_touch_worker",
+    "would_write_registry",
+    "blocked_reasons",
+    "warnings",
+    "safe_next_actions",
+    "forbidden_next_actions"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "plan_kind": { "const": "opencode-evidence-runner-plan" },
+    "runner_plan_id": { "type": "string", "minLength": 1 },
+    "source_package_id": { "type": "string", "minLength": 1 },
+    "source_package_path": { "type": "string", "minLength": 1 },
+    "source_package_target_worker_id": { "type": "string" },
+    "target_worker_id": { "type": "string", "minLength": 1 },
+    "backend_kind": { "const": "opencode_tui" },
+    "execution_mode": { "const": "no-live" },
+    "future_execution_order": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "runner_steps": {
+      "type": "array",
+      "minItems": 5,
+      "items": {
+        "type": "object",
+        "required": [
+          "step_id",
+          "step_kind",
+          "target_worker_id",
+          "expected_terminal_marker",
+          "expected_report_nonempty",
+          "allowed_write_root",
+          "forbidden_paths",
+          "future_entrypoint",
+          "future_validation",
+          "stop_conditions",
+          "rollback_or_recovery_policy"
+        ],
+        "properties": {
+          "step_id": { "type": "string", "minLength": 1 },
+          "step_kind": {
+            "enum": [
+              "done_smoke",
+              "blocked_smoke",
+              "fail_smoke",
+              "worker_scoped_lock_evidence",
+              "worker_scoped_settle_evidence"
+            ]
+          },
+          "target_worker_id": { "type": "string", "minLength": 1 },
+          "expected_terminal_marker": { "type": "string" },
+          "expected_report_nonempty": { "const": true },
+          "allowed_write_root": { "type": "string", "minLength": 1 },
+          "forbidden_paths": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "future_entrypoint": { "type": "string", "minLength": 1 },
+          "future_validation": { "type": "object" },
+          "stop_conditions": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "rollback_or_recovery_policy": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        }
+      }
+    },
+    "safety_gates": {
+      "type": "array",
+      "items": { "type": "object" }
+    },
+    "allowed_write_roots": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "forbidden_paths": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "future_entrypoints": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "validation_requirements": { "type": "object" },
+    "would_execute_live": { "const": false },
+    "would_touch_worker": { "const": false },
+    "would_write_registry": { "const": false },
+    "blocked_reasons": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "warnings": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "safe_next_actions": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "forbidden_next_actions": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  }
+}

@@ -1,0 +1,1537 @@
+#!/usr/bin/env python3
+"""Recovery diagnosis and explicit close/archive helpers for visible OpenCode workflow.
+
+This tool defaults to read-only diagnosis and planning. Explicit recovery writes
+only under .omx/framework/team plus the targeted visible task directory.
+It never sends tmux input, never calls OpenCode POST APIs, and never writes
+.omx/state/team.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import time
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+_THIS_FILE = Path(__file__).resolve()
+for _path in (
+    (_THIS_FILE.parent.parent / "src").resolve(),
+    (_THIS_FILE.parent.parent / "lib").resolve(),
+):
+    if _path.exists() and str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
+
+import omx_visible_task_state as visible_task_state
+from visible_agent_orchestrator.terminal_acceptance import (
+    acceptance_fence_hash,
+    recovery_activity_snapshot,
+)
+from visible_agent_orchestrator.terminal_protocol import (
+    TERMINAL_PROTOCOL_CLASSIFICATION_INVALID,
+    classify_terminal_protocol,
+)
+from visible_agent_orchestrator.runtime.registry import (
+    resolve_worker_record,
+)
+from visible_agent_orchestrator.runtime_paths import runtime_root
+from visible_agent_orchestrator.visible_registry_lock import (
+    owner_lock_transition_fence,
+    visible_registry_lock,
+    write_json_atomic,
+)
+from visible_agent_orchestrator.companion_skill_admission import AdmissionError, invoke_cli_handler
+
+
+TERMINAL_MARKERS = ("done", "fail", "blocked")
+FLOW_MARKERS = ("submitted", "received", "started", "heartbeat")
+TERMINAL_STATUSES = {"completed", "failed", "blocked"}
+DEFAULT_MIN_ACTIVE_AGE_SECONDS = 600
+
+
+class RecoveryError(Exception):
+    """Expected operator-facing failure."""
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def stamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def root_path(value: str | None) -> Path:
+    return runtime_root(value)
+
+
+def framework_root(root: Path) -> Path:
+    return root / ".omx" / "framework" / "team"
+
+
+def visible_runs_root(root: Path) -> Path:
+    return framework_root(root) / "visible-runs"
+
+
+def locks_root(root: Path) -> Path:
+    return visible_runs_root(root) / "_locks"
+
+
+def recovery_root(root: Path) -> Path:
+    return framework_root(root) / "recovery"
+
+
+def registry_path(root: Path) -> Path:
+    return framework_root(root) / "opencode_visible_workers.json"
+
+
+def rel(path: Path, root: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(root.resolve()))
+    except Exception:
+        return str(path)
+
+
+def safe_id(value: str, label: str) -> str:
+    if not value or value in {".", ".."} or "/" in value or "\\" in value or "\x00" in value:
+        raise RecoveryError(f"{label} must be a simple id, got: {value!r}")
+    return value
+
+
+def read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+
+
+def read_json(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def write_json(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def marker(path: Path, name: str) -> Path:
+    return path / f".{name}"
+
+
+def file_nonempty(path: Path) -> bool:
+    try:
+        return path.is_file() and path.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def task_activity_snapshot(
+    tdir: Path,
+    *,
+    now: float | None = None,
+    include_report: bool = True,
+) -> dict[str, Any]:
+    now_value = time.time() if now is None else now
+    snapshot = recovery_activity_snapshot(
+        tdir,
+        include_report=include_report,
+    )
+    records = [
+        {
+            **record,
+            "mtime": float(record["mtime_ns"]) / 1_000_000_000,
+            "age_seconds": max(
+                0.0,
+                round(
+                    now_value
+                    - float(record["mtime_ns"]) / 1_000_000_000,
+                    3,
+                ),
+            ),
+        }
+        for record in snapshot["activity_files"]
+    ]
+    latest = max(
+        records,
+        key=lambda item: float(item.get("mtime_ns") or 0),
+        default={},
+    )
+    return {
+        "activity_files": records,
+        "activity_snapshot_hash": snapshot["activity_snapshot_hash"],
+        "latest_activity_path": latest.get("path", ""),
+        "latest_activity_age_seconds": latest.get("age_seconds"),
+    }
+
+
+def ensure_safe_closeout_age(tdir: Path, before: dict[str, Any], min_active_age_seconds: int) -> dict[str, Any]:
+    activity = task_activity_snapshot(tdir)
+    activity["min_active_age_seconds"] = min_active_age_seconds
+    if min_active_age_seconds <= 0:
+        return activity
+    if before.get("status") in TERMINAL_STATUSES or before.get("terminal_markers"):
+        return activity
+    latest_age = activity.get("latest_activity_age_seconds")
+    latest_path = activity.get("latest_activity_path") or "-"
+    if latest_age is not None and float(latest_age) < min_active_age_seconds:
+        raise RecoveryError(
+            "refusing close-interrupted-task for recently active task: "
+            f"latest_activity={latest_path} "
+            f"age_seconds={latest_age} "
+            f"min_active_age_seconds={min_active_age_seconds} "
+            "(wait for the cooldown, or pass an explicitly justified "
+            "--min-active-age-seconds <seconds> under current recovery "
+            "authority only with identified residual child/tool/"
+            "remote-writer exit evidence and either an accepted cancel of "
+            "the exact fenced session or a separately proven stopped task; "
+            "session idle alone is insufficient and unknown writers block)"
+        )
+    return activity
+
+
+def task_dir(root: Path, run: str, task: str) -> Path:
+    safe_id(run, "run")
+    safe_id(task, "task")
+    return visible_runs_root(root) / run / "tasks" / task
+
+
+def task_state(tdir: Path) -> dict[str, Any]:
+    terminal = [name for name in TERMINAL_MARKERS if marker(tdir, name).is_file()]
+    flows = [name for name in FLOW_MARKERS if marker(tdir, name).is_file()]
+    report = tdir / "report.md"
+    report_nonempty = file_nonempty(report)
+    report_bytes = report.stat().st_size if report.exists() else 0
+    terminal_acceptance = visible_task_state.terminal_acceptance_status(tdir)
+    status = "created"
+    reason = "task directory exists"
+    if len(terminal) > 1:
+        status = "invalid_conflicting_terminal_markers"
+        reason = "multiple terminal markers exist"
+    elif terminal:
+        term = terminal[0]
+        if not report_nonempty:
+            status = "invalid_terminal_no_report"
+            reason = f".{term} without non-empty report.md"
+        elif not terminal_acceptance["accepted"]:
+            status = "invalid_terminal_acceptance_fence"
+            reason = str(terminal_acceptance["reason"])
+        elif term == "done":
+            status = "completed"
+            reason = "report.md plus .done"
+        elif term == "fail":
+            status = "failed"
+            reason = "report.md plus .fail"
+        elif term == "blocked":
+            status = "blocked"
+            reason = "report.md plus .blocked"
+    elif "submitted" in flows and "received" not in flows:
+        status = "delivery_uncertain"
+        reason = ".submitted exists without .received"
+    elif "received" in flows and "started" not in flows:
+        status = "received"
+        reason = ".received exists without .started"
+    elif "started" in flows or "heartbeat" in flows:
+        status = "running"
+        reason = ".started or .heartbeat exists"
+    elif (tdir / "owner").is_file():
+        status = "assigned"
+        reason = "owner exists without lifecycle marker"
+    elif (tdir / "task.md").is_file():
+        status = "created"
+        reason = "task.md exists"
+    owner = read_text(tdir / "owner").strip()
+    backend = read_text(tdir / "backend").strip()
+    return {
+        "status": status,
+        "reason": reason,
+        "terminal_markers": terminal,
+        "flow_markers": flows,
+        "report_bytes": report_bytes,
+        "report_nonempty": report_nonempty,
+        "owner": owner,
+        "backend": backend,
+    }
+
+
+def lock_path(root: Path, worker_id: str) -> Path:
+    safe_id(worker_id, "worker")
+    return locks_root(root) / f"{worker_id}.lock.json"
+
+
+def archive_lock(root: Path, lock_file: Path, reason: str) -> Path:
+    expected = read_json(lock_file)
+    expected_fence = owner_lock_transition_fence(expected)
+    with visible_registry_lock(root):
+        data = read_json(lock_file)
+        actual_fence = owner_lock_transition_fence(data)
+        if actual_fence != expected_fence:
+            raise RecoveryError(
+                "owner lock identity changed"
+                f" before archive: expected={expected_fence!r}"
+                f" actual={actual_fence!r}"
+            )
+        now = utc_now()
+        data["status"] = "released"
+        data["released_at"] = now
+        data["release_reason"] = reason
+        worker = safe_id(
+            str(data.get("worker_id") or lock_file.stem.replace(".lock", "")),
+            "worker",
+        )
+        run = str(data.get("run") or "unknown")
+        task = str(data.get("task") or "unknown")
+        provider_error = read_json(
+            task_dir(root, run, task)
+            / "provider_error_observation.json"
+        )
+        try:
+            visible_task_state.record_provider_error_rotation_requirement_locked(
+                root,
+                worker,
+                run=run,
+                task=task,
+                provider_error=provider_error,
+            )
+        except visible_task_state.TaskStateError as exc:
+            raise RecoveryError(str(exc)) from exc
+        safe_run = "".join(
+            ch if ch.isalnum() or ch in {"-", "_"} else "_"
+            for ch in run
+        )
+        safe_task = "".join(
+            ch if ch.isalnum() or ch in {"-", "_"} else "_"
+            for ch in task
+        )
+        archive = (
+            locks_root(root)
+            / "archive"
+            / (
+                f"{worker}.{safe_run}.{safe_task}."
+                f"{now.replace(':', '').replace('-', '')}.lock.json"
+            )
+        )
+        write_json_atomic(archive, data)
+        lock_file.unlink(missing_ok=True)
+        return archive
+
+
+def run_command(argv: list[str], cwd: Path, timeout: int = 90) -> dict[str, Any]:
+    started = time.time()
+    try:
+        proc = subprocess.run(
+            argv,
+            cwd=str(cwd),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False,
+        )
+        return {
+            "argv": argv,
+            "returncode": proc.returncode,
+            "stdout": proc.stdout,
+            "stderr": proc.stderr,
+            "elapsed_seconds": round(time.time() - started, 3),
+        }
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "argv": argv,
+            "returncode": 124,
+            "stdout": exc.stdout or "",
+            "stderr": exc.stderr or "command timed out",
+            "elapsed_seconds": round(time.time() - started, 3),
+        }
+    except FileNotFoundError as exc:
+        return {
+            "argv": argv,
+            "returncode": 127,
+            "stdout": "",
+            "stderr": str(exc),
+            "elapsed_seconds": round(time.time() - started, 3),
+        }
+
+
+def parse_json_output(result: dict[str, Any]) -> dict[str, Any]:
+    try:
+        data = json.loads(str(result.get("stdout") or ""))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def short_result(result: dict[str, Any], *, stdout_limit: int = 800, stderr_limit: int = 600) -> dict[str, Any]:
+    return {
+        "argv": result.get("argv", []),
+        "returncode": result.get("returncode"),
+        "elapsed_seconds": result.get("elapsed_seconds"),
+        "stdout_head": str(result.get("stdout") or "")[:stdout_limit],
+        "stderr_head": str(result.get("stderr") or "")[:stderr_limit],
+    }
+
+
+def load_visible_workers(root: Path) -> list[dict[str, Any]]:
+    data = read_json(registry_path(root))
+    workers = data.get("workers", [])
+    return [item for item in workers if isinstance(item, dict)]
+
+
+def default_worker_record(root: Path) -> dict[str, Any]:
+    candidates = [
+        worker for worker in load_visible_workers(root)
+        if worker.get("default_for_new_tasks") and worker.get("allow_auto_submit")
+    ]
+    if len(candidates) != 1:
+        raise RecoveryError(f"expected exactly one default visible worker, found {len(candidates)}")
+    return candidates[0]
+
+
+def load_active_locks(root: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if not locks_root(root).is_dir():
+        return rows
+    for path in sorted(locks_root(root).glob("*.lock.json")):
+        data = read_json(path)
+        run = str(data.get("run") or "")
+        task = str(data.get("task") or "")
+        truth = {}
+        if run and task:
+            try:
+                truth = visible_task_state.truth_for_task(root, run, task)
+            except visible_task_state.TaskStateError:
+                truth = {}
+        rows.append({
+            **data,
+            "path": rel(path, root),
+            "task_truth": truth,
+        })
+    return rows
+
+
+def load_last_run_summary(root: Path) -> dict[str, Any]:
+    result = run_command([str(root / "bin" / "omx_visible_dispatch"), "last", "--root", str(root), "--json"], root, timeout=30)
+    data = parse_json_output(result)
+    summary_rel = str(data.get("summary_json") or "")
+    summary = read_json(root / summary_rel) if summary_rel else {}
+    return {
+        "command": short_result(result),
+        "last_run": data,
+        "summary": summary,
+    }
+
+
+def load_fixture_payload(root: Path, fixture: str) -> tuple[dict[str, Any], str]:
+    fixture_path = (root / fixture).resolve()
+    payload = read_json(fixture_path / "diagnose_input.json")
+    if not payload:
+        raise RecoveryError(f"fixture diagnose_input.json missing or invalid: {fixture_path}")
+    return payload, rel(fixture_path, root)
+
+
+def live_diagnose_input(root: Path) -> dict[str, Any]:
+    worker = default_worker_record(root)
+    worker_id = str(worker.get("worker_id") or "")
+    rebind_result = run_command([str(root / "bin" / "omx_visible_rebind"), "check", "--root", str(root), "--worker", worker_id, "--json"], root, timeout=45)
+    doctor_result = run_command([str(root / "bin" / "omx_visible_dispatch"), "doctor", "--root", str(root), "--json"], root, timeout=60)
+    daemon_status = run_command([str(root / "bin" / "omx_visible_watcher"), "daemon-status", "--root", str(root), "--json"], root, timeout=45)
+    daemon_health = run_command([str(root / "bin" / "omx_visible_watcher"), "daemon-health", "--root", str(root), "--json"], root, timeout=45)
+    alerts = run_command([str(root / "bin" / "omx_visible_watcher"), "alerts", "--root", str(root), "--json"], root, timeout=45)
+    last_run = load_last_run_summary(root)
+    return {
+        "default_worker": worker,
+        "rebind_check": parse_json_output(rebind_result),
+        "doctor": parse_json_output(doctor_result),
+        "watcher_daemon_status": parse_json_output(daemon_status),
+        "watcher_daemon_health": parse_json_output(daemon_health),
+        "current_alerts": parse_json_output(alerts),
+        "locks": load_active_locks(root),
+        "latest_run_summary": last_run.get("summary", {}),
+        "latest_run": last_run.get("last_run", {}),
+        "commands": {
+            "rebind_check": short_result(rebind_result),
+            "doctor": short_result(doctor_result),
+            "watcher_daemon_status": short_result(daemon_status),
+            "watcher_daemon_health": short_result(daemon_health),
+            "alerts": short_result(alerts),
+            "last": last_run.get("command", {}),
+        },
+    }
+
+
+def build_diagnose_payload(root: Path, raw: dict[str, Any], *, source: str, fixture_path: str = "") -> dict[str, Any]:
+    worker = raw.get("default_worker", {}) if isinstance(raw.get("default_worker"), dict) else {}
+    rebind = raw.get("rebind_check", {}) if isinstance(raw.get("rebind_check"), dict) else {}
+    doctor = raw.get("doctor", {}) if isinstance(raw.get("doctor"), dict) else {}
+    daemon_status = raw.get("watcher_daemon_status", {}) if isinstance(raw.get("watcher_daemon_status"), dict) else {}
+    daemon_health = raw.get("watcher_daemon_health", {}) if isinstance(raw.get("watcher_daemon_health"), dict) else {}
+    current_alerts = raw.get("current_alerts", {}) if isinstance(raw.get("current_alerts"), dict) else {}
+    latest_summary = raw.get("latest_run_summary", {}) if isinstance(raw.get("latest_run_summary"), dict) else {}
+    latest_run = raw.get("latest_run", {}) if isinstance(raw.get("latest_run"), dict) else {}
+    latest_tasks = latest_run.get("tasks", []) if isinstance(latest_run.get("tasks"), list) else []
+    latest_task = latest_tasks[0] if latest_tasks else {}
+    latest_truth_state = str(latest_task.get("protocol_terminal_state") or latest_task.get("status") or "")
+    latest_summary_state = str(
+        latest_summary.get("final_protocol_terminal_state")
+        or latest_summary.get("protocol_terminal_state")
+        or latest_summary.get("terminal_state")
+        or latest_run.get("summary_state")
+        or ""
+    )
+    locks = raw.get("locks", []) if isinstance(raw.get("locks"), list) else []
+    rebind_commands = raw.get("commands", {}) if isinstance(raw.get("commands"), dict) else {}
+    rebind_command = (
+        rebind_commands.get("rebind_check", {})
+        if isinstance(rebind_commands.get("rebind_check"), dict)
+        else {}
+    )
+    rebind_returncode = (
+        rebind_command.get("returncode")
+        if isinstance(rebind_command.get("returncode"), int)
+        else None
+    )
+    rebind_command_failed = rebind_returncode not in (None, 0)
+    rebind_status = str(rebind.get("status") or "")
+    live = rebind.get("live", {}) if isinstance(rebind.get("live"), dict) else {}
+    live_checks = live.get("checks", {}) if isinstance(live.get("checks"), dict) else {}
+    port_live_observed = isinstance(live_checks.get("port_live"), bool)
+    rebind_probe_unknown = (
+        (not rebind_status and not port_live_observed)
+        or (rebind_command_failed and rebind_status == "current_binding_ok")
+    )
+    watcher_status = str(daemon_status.get("status") or daemon_health.get("status") or "")
+    status_flags = {
+        "binding_ok": rebind_status == "current_binding_ok" and not rebind_command_failed,
+        "binding_stale": rebind_status in {"stale_pane_rebind_available", "rebind_available"},
+        "binding_identity_mismatch": rebind_status == "registry_identity_mismatch_rebind_available",
+        "binding_check_failed": rebind_status == "binding_failed",
+        "binding_unhealthy_observed": (
+            bool(rebind_status) and rebind_status != "current_binding_ok"
+        ),
+        "rebind_probe_unknown": rebind_probe_unknown,
+        "pane_missing": not bool(rebind.get("registry_pane_exists_in_current_window", True)),
+        "port_live": live_checks.get("port_live") is True,
+        "port_unreachable": (
+            live_checks.get("port_live") is False
+            or (rebind_status == "port_not_live" and live_checks.get("port_live") is not True)
+        ),
+        "active_nonterminal_lock": any(
+            isinstance(item, dict) and item.get("task_truth", {}).get("lock_state") == "active_lock"
+            for item in locks
+        ),
+        "stale_terminal_lock": any(
+            isinstance(item, dict) and item.get("task_truth", {}).get("lock_state") == "stale_terminal_lock"
+            for item in locks
+        ),
+        "watcher_running": watcher_status == "running" and bool(daemon_status.get("looks_like_watcher")) and bool(daemon_status.get("root_matches")),
+        "watcher_stale_pid": watcher_status == "stale_pid",
+        "current_alerts": int(current_alerts.get("active_alerts", 0) or 0),
+        "post_terminal_busy": str(latest_summary.get("post_terminal_warning") or "") == "post_terminal_tui_busy",
+        "summary_stale_running_but_task_terminal": bool(
+            latest_truth_state in TERMINAL_STATUSES
+            and latest_summary_state in {"running", "received", "delivery_uncertain", "prepared"}
+            and latest_truth_state != latest_summary_state
+        ),
+        "invalid_terminal_no_report": bool(
+            latest_truth_state == "invalid_terminal_no_report"
+            or any(
+                isinstance(item, dict) and item.get("task_truth", {}).get("protocol_terminal_state") == "invalid_terminal_no_report"
+                for item in locks
+            )
+        ),
+        "invalid_conflicting_terminal_markers": bool(
+            latest_truth_state == "invalid_conflicting_terminal_markers"
+            or any(
+                isinstance(item, dict) and item.get("task_truth", {}).get("protocol_terminal_state") == "invalid_conflicting_terminal_markers"
+                for item in locks
+            )
+        ),
+        "invalid_terminal_acceptance_fence": bool(
+            latest_truth_state == "invalid_terminal_acceptance_fence"
+            or any(
+                isinstance(item, dict)
+                and item.get("task_truth", {}).get("protocol_terminal_state")
+                == "invalid_terminal_acceptance_fence"
+                for item in locks
+            )
+        ),
+        "terminal_task_with_active_lock": any(
+            isinstance(item, dict) and item.get("task_truth", {}).get("lock_state") == "stale_terminal_lock"
+            for item in locks
+        ),
+        "late_terminal_after_wait": bool(
+            latest_truth_state in TERMINAL_STATUSES
+            and latest_summary_state in {"running", "received", "delivery_uncertain", "prepared"}
+            and latest_truth_state != latest_summary_state
+        ),
+        "terminal_marker_without_summary_update": bool(
+            latest_truth_state in TERMINAL_STATUSES
+            and latest_summary_state
+            and latest_truth_state != latest_summary_state
+        ),
+    }
+    return {
+        "schema_version": 1,
+        "generated_at": utc_now(),
+        "root": str(root),
+        "source": source,
+        "fixture_path": fixture_path,
+        "default_worker": {
+            "worker_id": worker.get("worker_id", ""),
+            "pane_id": worker.get("pane_id", ""),
+            "port": worker.get("port", ""),
+            "binding_confidence": live.get("binding_confidence") or worker.get("binding_confidence", ""),
+        },
+        "rebind_check": rebind,
+        "doctor": doctor,
+        "watcher_daemon_status": daemon_status,
+        "watcher_daemon_health": daemon_health,
+        "current_alerts": current_alerts,
+        "locks": locks,
+        "latest_run_summary": {
+            "protocol_terminal_state": latest_summary.get("protocol_terminal_state") or latest_summary.get("terminal_state", ""),
+            "latest_task_truth": latest_truth_state,
+            "summary_state": latest_summary_state,
+            "post_terminal_tui_readiness": (
+                latest_summary.get("post_terminal_tui_readiness", {}).get("readiness")
+                if isinstance(latest_summary.get("post_terminal_tui_readiness"), dict)
+                else ""
+            ),
+            "post_terminal_warning": latest_summary.get("post_terminal_warning", ""),
+        },
+        "latest_run": latest_run,
+        "status_flags": status_flags,
+        "commands": raw.get("commands", {}),
+    }
+
+
+def render_diagnose_text(payload: dict[str, Any]) -> str:
+    worker = payload.get("default_worker", {})
+    flags = payload.get("status_flags", {})
+    lines = [
+        f"generated_at: {payload.get('generated_at')}",
+        f"source: {payload.get('source')}",
+        f"worker_id: {worker.get('worker_id') or '-'}",
+        f"pane: {worker.get('pane_id') or '-'}",
+        f"port: {worker.get('port') or '-'}",
+        f"binding_confidence: {worker.get('binding_confidence') or '-'}",
+        "status_flags:",
+    ]
+    for key in (
+        "binding_ok",
+        "binding_stale",
+        "binding_identity_mismatch",
+        "binding_check_failed",
+        "binding_unhealthy_observed",
+        "rebind_probe_unknown",
+        "pane_missing",
+        "port_live",
+        "port_unreachable",
+        "active_nonterminal_lock",
+        "stale_terminal_lock",
+        "summary_stale_running_but_task_terminal",
+        "invalid_terminal_no_report",
+        "invalid_conflicting_terminal_markers",
+        "invalid_terminal_acceptance_fence",
+        "terminal_task_with_active_lock",
+        "late_terminal_after_wait",
+        "terminal_marker_without_summary_update",
+        "watcher_running",
+        "watcher_stale_pid",
+        "post_terminal_busy",
+    ):
+        lines.append(f"  {key}: {flags.get(key)}")
+    lines.append(f"  current_alerts: {flags.get('current_alerts')}")
+    locks = payload.get("locks", [])
+    if isinstance(locks, list) and locks:
+        lines.append("locks:")
+        for item in locks:
+            if not isinstance(item, dict):
+                continue
+            truth = item.get("task_truth", {}) if isinstance(item.get("task_truth"), dict) else {}
+            task_state_display = str(truth.get("protocol_terminal_state") or "-")
+            lock_state_display = str(truth.get("lock_state") or "-")
+            lines.append(
+                "  - "
+                f"{item.get('worker_id')} run={item.get('run')} task={item.get('task')} "
+                f"task_state={task_state_display} lock_state={lock_state_display}"
+            )
+    else:
+        lines.append("locks: none")
+    return "\n".join(lines) + "\n"
+
+
+def write_diagnose_outputs(root: Path, payload: dict[str, Any]) -> None:
+    out = recovery_root(root)
+    write_json(out / "latest_diagnose.json", payload)
+    write_text(out / "latest_diagnose.txt", render_diagnose_text(payload))
+
+
+def diagnose_payload(root: Path, fixture: str | None) -> dict[str, Any]:
+    if fixture:
+        raw, fixture_path = load_fixture_payload(root, fixture)
+        return build_diagnose_payload(root, raw, source="fixture", fixture_path=fixture_path)
+    return build_diagnose_payload(root, live_diagnose_input(root), source="live")
+
+
+def build_plan(payload: dict[str, Any]) -> dict[str, Any]:
+    worker = payload.get("default_worker", {})
+    worker_id = str(worker.get("worker_id") or "")
+    port = int(worker.get("port") or 0)
+    if not worker_id or not 0 < port <= 65535:
+        raise RecoveryError("default worker identity and listener port are required")
+    flags = payload.get("status_flags", {})
+    locks = payload.get("locks", [])
+    actions: list[dict[str, Any]] = []
+    notes: list[str] = []
+    if flags.get("binding_stale"):
+        actions.append({
+            "priority": "high",
+            "condition": "binding_stale",
+            "command": f"./bin/omx_visible_rebind rebind --root . --worker {worker_id} --port {port} --allow-rebind",
+            "reason": "registry/default-worker no longer matches the live current-window binding",
+        })
+    if flags.get("rebind_probe_unknown"):
+        rebind_command = (
+            payload.get("commands", {}).get("rebind_check", {})
+            if isinstance(payload.get("commands", {}).get("rebind_check"), dict)
+            else {}
+        )
+        returncode = rebind_command.get("returncode")
+        returncode_note = (
+            f", direct check returncode={returncode}"
+            if isinstance(returncode, int)
+            else ""
+        )
+        actions.append({
+            "priority": "high",
+            "condition": "rebind_probe_unknown",
+            "command": f"./bin/omx_visible_rebind check --root . --worker {worker_id} --json",
+            "reason": (
+                "rebind probe produced no usable binding result (missing, timed out or "
+                f"failed{returncode_note}); the binding observation is unknown or "
+                "unreliable, reachability is not inferred from the failed command, and "
+                "no healthy no-op conclusion may be drawn before this targeted re-check"
+            ),
+        })
+    if flags.get("binding_check_failed"):
+        actions.append({
+            "priority": "high",
+            "condition": "binding_check_failed",
+            "command": f"./bin/omx_visible_rebind check --root . --worker {worker_id} --json",
+            "reason": (
+                "the direct rebind check reported a confirmed binding failure "
+                "(binding_failed); re-verify with this read-only targeted check before "
+                "any recovery decision"
+            ),
+        })
+    if flags.get("port_unreachable"):
+        actions.append({
+            "priority": "high",
+            "condition": "port_unreachable",
+            "command": f"./bin/omx_visible_rebind check --root . --worker {worker_id} --json",
+            "reason": (
+                "the worker port was observed not live; this is a confirmed observation, "
+                "not an unknown probe; re-verify with this read-only targeted check "
+                "before any recovery decision"
+            ),
+        })
+    if flags.get("binding_identity_mismatch"):
+        rebind = payload.get("rebind_check", {}) if isinstance(payload.get("rebind_check"), dict) else {}
+        raw_mismatches = rebind.get("identity_mismatches", [])
+        mismatch_fields = (
+            ", ".join(str(item) for item in raw_mismatches if str(item))
+            if isinstance(raw_mismatches, list)
+            else ""
+        ) or "unspecified fields"
+        actions.append({
+            "priority": "high",
+            "condition": "binding_identity_mismatch",
+            "command": f"./bin/omx_visible_rebind check --root . --worker {worker_id} --json",
+            "reason": (
+                "registry lifecycle identity fields differ from the live strong binding "
+                f"({mismatch_fields}); re-run the targeted check and confirm which "
+                "identity is actually live before any rebind"
+            ),
+        })
+        actions.append({
+            "priority": "manual",
+            "condition": "binding_identity_mismatch",
+            "command": f"./bin/omx_visible_rebind rebind --root . --worker {worker_id} --port {port} --allow-rebind",
+            "reason": (
+                "only after the targeted check confirms the observed live identity and "
+                "explicit authorization; rebind records the live identity and must not "
+                "be run on presumption"
+            ),
+        })
+    if flags.get("binding_unhealthy_observed") and not any(
+        "omx_visible_rebind" in item["command"] for item in actions
+    ):
+        rebind = payload.get("rebind_check", {}) if isinstance(payload.get("rebind_check"), dict) else {}
+        direct_status = str(rebind.get("status") or "")
+        actions.append({
+            "priority": "high",
+            "condition": "binding_unhealthy_observed",
+            "command": f"./bin/omx_visible_rebind check --root . --worker {worker_id} --json",
+            "reason": (
+                f"direct rebind check reported non-healthy binding status "
+                f"'{direct_status}' with no more specific guidance; "
+                "re-verify with this read-only targeted check before any recovery decision"
+            ),
+        })
+    if flags.get("watcher_stale_pid"):
+        actions.append({
+            "priority": "high",
+            "condition": "watcher_stale_pid",
+            "command": "./bin/omx_visible_watcher daemon --root . --interval 5 --allow-daemon",
+            "reason": "watcher pid is stale; restart only the watcher daemon",
+        })
+    if flags.get("active_nonterminal_lock"):
+        for item in locks:
+            if not isinstance(item, dict):
+                continue
+            truth = item.get("task_truth", {}) if isinstance(item.get("task_truth"), dict) else {}
+            if truth.get("lock_state") != "active_lock":
+                continue
+            if str(truth.get("protocol_terminal_state") or "") in TERMINAL_STATUSES:
+                continue
+            run = str(item.get("run") or "")
+            task = str(item.get("task") or "")
+            actions.extend([
+                {
+                    "priority": "high",
+                    "condition": "active_nonterminal_lock",
+                    "command": f"./bin/omx_visible_dispatch collect --root . --run {run} --task {task}",
+                    "reason": "collect evidence before any recovery closeout",
+                },
+                {
+                    "priority": "high",
+                    "condition": "active_nonterminal_lock",
+                    "command": "./bin/omx_visible_watcher alerts --root .",
+                    "reason": "read current alerts before deciding whether the task is interrupted or still running",
+                },
+                {
+                    "priority": "manual",
+                    "condition": "active_nonterminal_lock",
+                    "command": (
+                        f"./bin/omx_visible_recovery close-interrupted-task --root . --run {run} "
+                        f"--task {task} --state blocked --reason '<reason>' --allow-recovery"
+                    ),
+                    "reason": "only after explicit user authorization; never auto-resubmit while the owner lock is active",
+                },
+            ])
+    if flags.get("stale_terminal_lock"):
+        for item in locks:
+            if not isinstance(item, dict):
+                continue
+            truth = item.get("task_truth", {}) if isinstance(item.get("task_truth"), dict) else {}
+            if truth.get("lock_state") != "stale_terminal_lock":
+                continue
+            lock_worker = str(item.get("worker_id") or "")
+            if not lock_worker:
+                continue
+            actions.append({
+                "priority": "medium",
+                "condition": "stale_terminal_lock",
+                "command": f"./bin/omx_visible_recovery archive-terminal-lock --root . --worker {lock_worker} --allow-recovery",
+                "reason": (
+                    f"lock of worker {lock_worker} may be archived only when its own "
+                    "referenced task is already terminal"
+                ),
+            })
+    if (
+        flags.get("invalid_terminal_no_report")
+        or flags.get("invalid_conflicting_terminal_markers")
+        or flags.get("invalid_terminal_acceptance_fence")
+    ):
+        notes.append(
+            "invalid terminal truth, including acceptance-fence mismatch, is not "
+            "terminal success; do not archive locks until task truth becomes valid."
+        )
+    latest_run = payload.get("latest_run_summary", {}) if isinstance(payload.get("latest_run_summary"), dict) else {}
+    latest_meta = payload.get("latest_run", {}) if isinstance(payload.get("latest_run"), dict) else {}
+    latest_run_id = str(latest_meta.get("run") or latest_meta.get("run_id") or "")
+    latest_tasks = latest_meta.get("tasks", []) if isinstance(latest_meta.get("tasks"), list) else []
+    latest_task_id = str(latest_tasks[0].get("task") or "") if latest_tasks else ""
+    if (
+        flags.get("summary_stale_running_but_task_terminal")
+        or flags.get("terminal_marker_without_summary_update")
+        or flags.get("late_terminal_after_wait")
+    ) and latest_run_id and latest_task_id:
+        actions.append({
+            "priority": "medium",
+            "condition": "summary_stale_running_but_task_terminal",
+            "command": "./bin/omx_visible_dispatch settle-latest --root . --allow-terminal-archive",
+            "reason": "summary.json still reflects an older nonterminal state while the task directory is already terminal",
+        })
+    if flags.get("post_terminal_busy"):
+        notes.append("post_terminal_tui_busy is nonfatal session-layer telemetry; do not Esc, C-c, kill, or resubmit from the agent side")
+    notes.append("If health/policy/rebind shows a one-off ERROR that clears on a second check, treat it as transient and re-check before escalating.")
+    if not actions and flags.get("binding_ok"):
+        actions.append({
+            "priority": "info",
+            "condition": "none",
+            "command": "no recovery action needed",
+            "reason": "binding, watcher, locks, and alerts are currently consistent",
+        })
+    return {
+        "schema_version": 1,
+        "generated_at": utc_now(),
+        "source": payload.get("source", ""),
+        "fixture_path": payload.get("fixture_path", ""),
+        "default_worker": worker,
+        "actions": actions,
+        "notes": notes,
+        "status_flags": flags,
+    }
+
+
+def render_plan_md(plan: dict[str, Any]) -> str:
+    lines = [
+        "# Visible Recovery Plan",
+        "",
+        f"- generated_at: {plan.get('generated_at')}",
+        f"- source: {plan.get('source')}",
+        f"- worker: {plan.get('default_worker', {}).get('worker_id') or '-'}",
+        "",
+        "## Recommended Actions",
+    ]
+    for item in plan.get("actions", []):
+        lines.extend([
+            f"- [{item.get('priority', 'info')}] `{item.get('condition', '-')}`",
+            f"  - command: `{item.get('command', '-')}`",
+            f"  - reason: {item.get('reason', '-')}",
+        ])
+    lines.extend(["", "## Notes"])
+    for note in plan.get("notes", []):
+        lines.append(f"- {note}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def write_plan_outputs(root: Path, plan: dict[str, Any]) -> None:
+    out = recovery_root(root)
+    write_json(out / "recovery_plan.json", plan)
+    write_text(out / "recovery_plan.md", render_plan_md(plan))
+
+
+def read_recovery_artifact(script: Path) -> dict[str, Any]:
+    script_path = script.resolve()
+    if not script_path.is_file():
+        raise RecoveryError(f"recovery script missing: {script_path}")
+    metadata_path = script_path.with_suffix(script_path.suffix + ".json")
+    metadata = read_json(metadata_path)
+    commands: list[str] = []
+    for line in script_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        commands.append(stripped)
+    return {
+        "script_path": str(script_path),
+        "metadata_path": str(metadata_path),
+        "metadata": metadata,
+        "commands": commands,
+    }
+
+
+def build_recovery_artifact_plan(root: Path, script: Path) -> dict[str, Any]:
+    artifact = read_recovery_artifact(script)
+    validate = run_command(
+        [
+            str(root / "bin" / "omx_visible_policy_check"),
+            "backend-reconcile-validate",
+            "--root",
+            str(root),
+            "--backend",
+            "tmux-reference",
+            "--script",
+            artifact["script_path"],
+            "--json",
+        ],
+        root,
+        timeout=60,
+    )
+    validate_json = parse_json_output(validate)
+    return {
+        "schema_version": 1,
+        "generated_at": utc_now(),
+        "root": str(root),
+        "script_path": artifact["script_path"],
+        "metadata_path": artifact["metadata_path"],
+        "commands": artifact["commands"],
+        "command_count": len(artifact["commands"]),
+        "validate": validate_json,
+        "validate_command": short_result(validate),
+        "ready_to_execute": bool(validate_json.get("ready_to_execute")),
+        "fresh": bool(validate_json.get("fresh")),
+        "artifact_run_command": f"./bin/omx_visible_recovery artifact-run --root . --script {artifact['script_path']} --allow-recovery-execute",
+        "live_side_effects": [
+            "start the approved worker on the listener port recorded in the recovery artifact",
+            "update the approved worker binding via omx_visible_rebind",
+            "leave recovery event artifacts under .omx/framework/team/recovery when executed through the control surface",
+        ],
+        "recovery_event_artifacts": [
+            ".omx/framework/team/recovery/artifact_run_<script-stem>_<timestamp>.json",
+        ],
+        "acceptance_checks": [
+            "omx_visible_rebind check returns current_binding_ok for the approved worker",
+            "omx_visible_policy_check backend-audit reports tmux-reference switch_ready=true",
+            "omx_visible_policy_check check no longer reports default visible worker live binding failure",
+        ],
+    }
+
+
+def render_recovery_artifact_plan_md(plan: dict[str, Any]) -> str:
+    lines = [
+        "# Visible Recovery Artifact Plan",
+        "",
+        f"- generated_at: {plan.get('generated_at')}",
+        f"- script_path: `{plan.get('script_path')}`",
+        f"- metadata_path: `{plan.get('metadata_path')}`",
+        f"- fresh: `{str(bool(plan.get('fresh'))).lower()}`",
+        f"- ready_to_execute: `{str(bool(plan.get('ready_to_execute'))).lower()}`",
+        f"- artifact_run_command: `{plan.get('artifact_run_command')}`",
+        "",
+        "## Expected Side Effects",
+    ]
+    for item in plan.get("live_side_effects", []):
+        lines.append(f"- {item}")
+    lines.extend([
+        "",
+        "## Recovery Event Artifacts",
+    ])
+    for item in plan.get("recovery_event_artifacts", []):
+        lines.append(f"- {item}")
+    lines.extend([
+        "",
+        "## Acceptance Checks",
+    ])
+    for item in plan.get("acceptance_checks", []):
+        lines.append(f"- {item}")
+    lines.extend([
+        "",
+        "## Commands",
+    ])
+    for command in plan.get("commands", []):
+        lines.append(f"- `{command}`")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def command_diagnose(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    payload = diagnose_payload(root, args.fixture)
+    if payload.get("source") == "live":
+        write_diagnose_outputs(root, payload)
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
+    else:
+        print(render_diagnose_text(payload), end="")
+    return 0
+
+
+def command_plan(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    payload = diagnose_payload(root, args.fixture)
+    if payload.get("source") == "live":
+        write_diagnose_outputs(root, payload)
+    plan = build_plan(payload)
+    if payload.get("source") == "live":
+        write_plan_outputs(root, plan)
+    if args.json:
+        print(json.dumps(plan, indent=2, sort_keys=True, ensure_ascii=False))
+    else:
+        print(render_plan_md(plan), end="")
+    return 0
+
+
+def command_artifact_plan(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    plan = build_recovery_artifact_plan(root, Path(args.script))
+    if args.json:
+        print(json.dumps(plan, indent=2, sort_keys=True, ensure_ascii=False))
+    else:
+        print(render_recovery_artifact_plan_md(plan), end="")
+    return 0 if plan.get("ready_to_execute") else 1
+
+
+def execute_recovery_artifact(root: Path, script: Path, plan: dict[str, Any]) -> dict[str, Any]:
+    script_path = script.resolve()
+    result = run_command(["bash", str(script_path)], root, timeout=180)
+    event = {
+        "schema_version": 1,
+        "executed_at": utc_now(),
+        "root": str(root),
+        "script_path": str(script_path),
+        "metadata_path": str(Path(plan.get("metadata_path") or "")),
+        "plan": plan,
+        "result": short_result(result, stdout_limit=2000, stderr_limit=1200),
+        "ok": result.get("returncode") == 0,
+    }
+    out = recovery_root(root) / f"artifact_run_{script_path.stem}_{stamp()}.json"
+    write_json(out, event)
+    event["event_path"] = rel(out, root)
+    return event
+
+
+def command_artifact_run(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    plan = build_recovery_artifact_plan(root, Path(args.script))
+    if not args.allow_recovery_execute:
+        if args.json:
+            print(json.dumps(plan, indent=2, sort_keys=True, ensure_ascii=False))
+        else:
+            print(render_recovery_artifact_plan_md(plan), end="")
+        return 0 if plan.get("ready_to_execute") else 1
+    if not plan.get("ready_to_execute"):
+        raise RecoveryError("artifact is not ready_to_execute; refusing live recovery execution")
+    event = execute_recovery_artifact(root, Path(args.script), plan)
+    if args.json:
+        print(json.dumps(event, indent=2, sort_keys=True, ensure_ascii=False))
+    else:
+        print(f"artifact_run: {'OK' if event.get('ok') else 'ERROR'}")
+        print(f"script_path: {event.get('script_path')}")
+        print(f"event_path: {event.get('event_path')}")
+        result = event.get("result", {}) if isinstance(event.get("result"), dict) else {}
+        print(f"returncode: {result.get('returncode')}")
+    return 0 if event.get("ok") else 1
+
+
+def write_recovery_report_if_needed(
+    tdir: Path,
+    reason: str,
+    state: str,
+) -> str | None:
+    report = tdir / "report.md"
+    if file_nonempty(report):
+        return None
+    content = (
+        "# Recovery Closeout\n\n"
+        f"- recovery_timestamp: {utc_now()}\n"
+        f"- requested_state: {state}\n"
+        f"- reason: {reason}\n"
+        "- why_interrupted: task was left non-terminal and required explicit recovery closeout\n"
+        "- not_verified: no worker-side proof beyond current framework state was available to this recovery command\n"
+        "- business_file_changes: none\n"
+        "- recovery_scope: current task directory only\n"
+    )
+    report.parent.mkdir(parents=True, exist_ok=True)
+    encoded = content.encode("utf-8")
+    try:
+        fd = os.open(
+            report,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o644,
+        )
+    except FileExistsError as exc:
+        if file_nonempty(report):
+            return None
+        raise RecoveryError(
+            "report.md appeared during recovery but is empty; "
+            "refusing to overwrite possible worker output"
+        ) from exc
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except Exception:
+        try:
+            report.unlink()
+        except OSError:
+            pass
+        raise
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def write_recovery_closeout_authorization(
+    tdir: Path,
+    *,
+    run: str,
+    task: str,
+    worker: str,
+    state: str,
+    reason: str,
+    activity: dict[str, Any],
+    expected_report_sha256: str,
+    delivery_uncertain_closeout_authorized: bool,
+    interrupt_id: str = "",
+    writer_evidence_file: str = "",
+) -> Path | None:
+    report = tdir / "report.md"
+    try:
+        report_sha256 = hashlib.sha256(report.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise RecoveryError(
+            "report.md became unreadable during recovery closeout"
+        ) from exc
+    if report_sha256 != expected_report_sha256:
+        raise RecoveryError(
+            "report.md changed during recovery closeout; "
+            "refusing terminal signal"
+        )
+    fence = read_json(tdir / "acceptance_fence.json")
+    if not fence:
+        return None
+    authorization = {
+        "schema_version": 1,
+        "authorization_kind": (
+            "visible_operator_recovery_closeout"
+        ),
+        "authorization_id": str(uuid.uuid4()),
+        "authorized": True,
+        "authorized_at": utc_now(),
+        "run_id": run,
+        "task_id": task,
+        "worker_id": worker,
+        "state": state,
+        "reason": reason,
+        "interrupt_id": interrupt_id,
+        "writer_evidence_file": writer_evidence_file,
+        "acceptance_fence_hash": acceptance_fence_hash(fence),
+        "report_sha256": report_sha256,
+        "activity_guard": activity,
+        "delivery_uncertain_closeout_authorized": (
+            delivery_uncertain_closeout_authorized
+        ),
+    }
+    path = tdir / "recovery_closeout_authorization.json"
+    write_json_atomic(path, authorization)
+    return path
+
+
+def runtime_fixture_dir():
+    value = os.environ.get("OMX_RUNTIME_FIXTURE_DIR", "").strip()
+    return Path(value).resolve() if value else None
+
+
+def command_close_interrupted_task(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    if not args.allow_recovery:
+        raise RecoveryError("close-interrupted-task requires --allow-recovery")
+    if args.state not in {"blocked", "fail"}:
+        raise RecoveryError("close-interrupted-task only allows --state blocked or fail")
+    run = safe_id(args.run, "run")
+    task = safe_id(args.task, "task")
+    tdir = task_dir(root, run, task)
+    if not tdir.is_dir():
+        raise RecoveryError(f"task directory missing: {rel(tdir, root)}")
+    before = task_state(tdir)
+    if before.get("status") in TERMINAL_STATUSES or before.get("terminal_markers"):
+        raise RecoveryError("task already has a terminal marker; refusing duplicate recovery closeout")
+    delivery_uncertain_closeout_authorized = bool(
+        getattr(args, "allow_delivery_uncertain_closeout", False)
+    )
+    if (
+        before.get("status") == "delivery_uncertain"
+        and not delivery_uncertain_closeout_authorized
+    ):
+        raise RecoveryError(
+            "refusing close-interrupted-task for delivery_uncertain task; "
+            "reconcile delivery first or pass "
+            "--allow-delivery-uncertain-closeout after explicit authorization"
+        )
+    owner = before.get("owner") or read_text(tdir / "owner").strip()
+    if not owner:
+        raise RecoveryError("task owner is missing")
+    fence = read_json(tdir / "acceptance_fence.json")
+    if fence:
+        fence_session = str(fence.get("session_id") or "")
+        fence_state = str(fence.get("session_fence_state") or "")
+        try:
+            closeout_worker = resolve_worker_record(
+                root, owner, runtime_fixture_dir())
+        except Exception:
+            closeout_worker = {}
+        if str(closeout_worker.get("backend") or "") == "codex_tui":
+            if (not fence_session
+                    or fence_session != str(
+                        closeout_worker.get("codex_thread") or "")
+                    or fence_state != "live_observed"):
+                raise RecoveryError(
+                    "refusing close-interrupted-task for a pending codex "
+                    "acceptance fence without a live-observed bound thread; "
+                    "use the reviewed quarantine path instead of writing "
+                    "recovery terminal markers"
+                )
+        elif not fence_session.startswith("ses_"):
+            raise RecoveryError(
+                "refusing close-interrupted-task for a pending acceptance fence "
+                "without an observed session; use the reviewed quarantine path "
+                "instead of writing recovery terminal markers"
+            )
+    if fence:
+        classification = classify_terminal_protocol(tdir)
+        if (
+            str(classification.get("classification") or "")
+            == TERMINAL_PROTOCOL_CLASSIFICATION_INVALID
+        ):
+            invalid_fields = sorted(
+                set(classification.get("mismatched_fields") or [])
+            )
+            raise RecoveryError(
+                "close-interrupted-task refused: terminal protocol identity "
+                "is invalid"
+                + (
+                    ": " + ",".join(invalid_fields)
+                    if invalid_fields
+                    else ""
+                )
+                + "; preserve evidence and quarantine explicitly"
+            )
+    staleness_activity = ensure_safe_closeout_age(
+        tdir,
+        before,
+        args.min_active_age_seconds,
+    )
+    recovery_report_sha256 = write_recovery_report_if_needed(
+        tdir,
+        args.reason,
+        args.state,
+    )
+    if recovery_report_sha256 is None:
+        staleness_activity = ensure_safe_closeout_age(
+            tdir,
+            before,
+            args.min_active_age_seconds,
+        )
+        try:
+            recovery_report_sha256 = hashlib.sha256(
+                (tdir / "report.md").read_bytes()
+            ).hexdigest()
+        except OSError as exc:
+            raise RecoveryError(
+                "report.md became unreadable during recovery closeout"
+            ) from exc
+    activity = task_activity_snapshot(tdir, include_report=False)
+    activity["min_active_age_seconds"] = args.min_active_age_seconds
+    authorization_path = write_recovery_closeout_authorization(
+        tdir,
+        run=run,
+        task=task,
+        worker=owner,
+        state=args.state,
+        reason=args.reason,
+        activity=activity,
+        expected_report_sha256=recovery_report_sha256,
+        delivery_uncertain_closeout_authorized=(
+            delivery_uncertain_closeout_authorized
+        ),
+        interrupt_id=str(getattr(args, "interrupt_id", "") or ""),
+        writer_evidence_file=str(getattr(args, "writer_evidence_file", "") or ""),
+    )
+    signal_cmd = [
+        str(_THIS_FILE.parent / "omx_task_signal"),
+        "finish",
+        "--root",
+        str(root),
+        "--task-dir",
+        str(tdir),
+        "--worker",
+        owner,
+        "--state",
+        args.state,
+    ]
+    if authorization_path is not None:
+        signal_cmd.append("--operator-recovery-closeout")
+    result = run_command(signal_cmd, root, timeout=45)
+    if result.get("returncode") != 0:
+        raise RecoveryError(result.get("stderr") or result.get("stdout") or "omx_task_signal finish failed")
+    after = task_state(tdir)
+    if after.get("status") not in TERMINAL_STATUSES:
+        raise RecoveryError(f"recovery closeout did not reach terminal state: {after.get('status')}")
+    archived_lock = ""
+    worker_lock = lock_path(root, owner)
+    if worker_lock.is_file():
+        lock_data = read_json(worker_lock)
+        if lock_data.get("run") == run and lock_data.get("task") == task:
+            archived_lock = rel(archive_lock(root, worker_lock, f"recovery_terminal_{args.state}"), root)
+    event = {
+        "schema_version": 1,
+        "recovered_at": utc_now(),
+        "action": "close-interrupted-task",
+        "run": run,
+        "task": task,
+        "worker": owner,
+        "state": args.state,
+        "reason": args.reason,
+        "before": before,
+        "after": after,
+        "staleness_activity": staleness_activity,
+        "activity_guard": activity,
+        "delivery_uncertain_closeout_authorized": (
+            delivery_uncertain_closeout_authorized
+        ),
+        "recovery_authorization": (
+            rel(authorization_path, root)
+            if authorization_path is not None
+            else ""
+        ),
+        "signal_command": signal_cmd,
+        "signal_result": short_result(result),
+        "archived_lock": archived_lock,
+        "no_business_files_modified": True,
+    }
+    write_json(tdir / "recovery_event.json", event)
+    write_json(recovery_root(root) / f"close_{run}_{task}_{stamp()}.json", event)
+    print(f"recovery_closeout: {after.get('status')}")
+    print(f"task_dir: {rel(tdir, root)}")
+    print(f"recovery_event: {rel(tdir / 'recovery_event.json', root)}")
+    print(f"archived_lock: {archived_lock or '-'}")
+    return 0
+
+
+def command_archive_terminal_lock(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    if not args.allow_recovery:
+        raise RecoveryError("archive-terminal-lock requires --allow-recovery")
+    worker_id = safe_id(args.worker, "worker")
+    path = lock_path(root, worker_id)
+    if not path.is_file():
+        raise RecoveryError(f"lock not found: {rel(path, root)}")
+    data = read_json(path)
+    run = str(data.get("run") or "")
+    task = str(data.get("task") or "")
+    if not run or not task:
+        raise RecoveryError("lock does not reference a run/task")
+    tdir = task_dir(root, run, task)
+    if not tdir.is_dir():
+        raise RecoveryError(f"task directory missing for lock: {rel(tdir, root)}")
+    state = task_state(tdir)
+    if state.get("status") not in TERMINAL_STATUSES:
+        raise RecoveryError(f"refusing to archive non-terminal lock: {state.get('status')}")
+    archived = archive_lock(root, path, "terminal_only_recovery_archive")
+    event = {
+        "schema_version": 1,
+        "recovered_at": utc_now(),
+        "action": "archive-terminal-lock",
+        "worker": worker_id,
+        "run": run,
+        "task": task,
+        "task_state": state,
+        "archived_lock": rel(archived, root),
+        "no_business_files_modified": True,
+    }
+    write_json(tdir / "recovery_event.json", event)
+    write_json(recovery_root(root) / f"archive_{worker_id}_{stamp()}.json", event)
+    print(f"archived_lock: {rel(archived, root)}")
+    print(f"recovery_event: {rel(tdir / 'recovery_event.json', root)}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="omx_visible_recovery",
+        description=(
+            "Read-only recovery diagnosis and explicit close/archive helpers for the visible OpenCode workflow. "
+            "Default commands diagnose and plan only."
+        ),
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    diagnose = sub.add_parser("diagnose", help="read-only recovery diagnosis; writes latest_diagnose.* for live mode")
+    diagnose.add_argument("--root", default=".")
+    diagnose.add_argument("--fixture", help="optional fixture directory under the repo for simulated diagnosis")
+    diagnose.add_argument("--json", action="store_true")
+    diagnose.set_defaults(func=command_diagnose)
+
+    plan = sub.add_parser("plan", help="read-only recovery plan; writes recovery_plan.* for live mode")
+    plan.add_argument("--root", default=".")
+    plan.add_argument("--fixture", help="optional fixture directory under the repo for simulated planning")
+    plan.add_argument("--json", action="store_true")
+    plan.set_defaults(func=command_plan)
+
+    artifact_plan = sub.add_parser("artifact-plan", help="read-only plan for an exported default-worker recovery artifact")
+    artifact_plan.add_argument("--root", default=".")
+    artifact_plan.add_argument("--script", required=True)
+    artifact_plan.add_argument("--json", action="store_true")
+    artifact_plan.set_defaults(func=command_artifact_plan)
+
+    artifact_run = sub.add_parser("artifact-run", help="default dry-run for an exported recovery artifact; explicit allow required for future execution")
+    artifact_run.add_argument("--root", default=".")
+    artifact_run.add_argument("--script", required=True)
+    artifact_run.add_argument("--allow-recovery-execute", action="store_true")
+    artifact_run.add_argument("--json", action="store_true")
+    artifact_run.set_defaults(func=command_artifact_run)
+
+    close_cmd = sub.add_parser("close-interrupted-task", help="explicitly close a non-terminal interrupted task as blocked/fail")
+    close_cmd.add_argument("--root", default=".")
+    close_cmd.add_argument("--run", required=True)
+    close_cmd.add_argument("--task", required=True)
+    close_cmd.add_argument("--state", required=True, choices=["blocked", "fail"])
+    close_cmd.add_argument("--reason", required=True)
+    close_cmd.add_argument(
+        "--min-active-age-seconds",
+        type=int,
+        default=DEFAULT_MIN_ACTIVE_AGE_SECONDS,
+        help=(
+            "refuse closeout when the task has activity newer than this threshold "
+            f"(default: {DEFAULT_MIN_ACTIVE_AGE_SECONDS}); a value below the default "
+            "requires current recovery authority, identified residual child/tool/"
+            "remote-writer exit evidence, and either an accepted cancel of the "
+            "exact fenced session or a separately proven stopped task - session "
+            "idle alone is insufficient, unknown writers block, and zero is "
+            "exceptional direct writer-exit proof only"
+        ),
+    )
+    close_cmd.add_argument("--allow-recovery", action="store_true")
+    close_cmd.add_argument("--interrupt-id", default="", help="existing exact-task accepted interrupt receipt; omit only for separately observed current terminal turn")
+    close_cmd.add_argument("--writer-evidence-file", default="", help="task-contained existing writer verification JSON; required for live-session closeout")
+    close_cmd.add_argument(
+        "--allow-delivery-uncertain-closeout",
+        action="store_true",
+        help=(
+            "allow a terminal closeout of a submitted task with no worker "
+            "receipt after explicit delivery reconciliation"
+        ),
+    )
+    close_cmd.set_defaults(func=command_close_interrupted_task)
+
+    archive_cmd = sub.add_parser("archive-terminal-lock", help="archive a lock only when its task is already terminal")
+    archive_cmd.add_argument("--root", default=".")
+    archive_cmd.add_argument("--worker", required=True)
+    archive_cmd.add_argument("--allow-recovery", action="store_true")
+    archive_cmd.set_defaults(func=command_archive_terminal_lock)
+
+    for command_parser in sub.choices.values():
+        command_parser.set_defaults(root=None)
+    return parser
+
+
+def main(argv: list[str] | None = None, *, _admission_root: Path | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return invoke_cli_handler("omx_visible_recovery", args, args.func, admission_root=_admission_root)
+    except RecoveryError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    except AdmissionError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 130
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

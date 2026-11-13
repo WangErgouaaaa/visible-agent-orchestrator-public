@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Registered worker registry",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "registry_id",
+    "created_at",
+    "updated_at",
+    "registry_kind",
+    "workers",
+    "defaults",
+    "metadata"
+  ],
+  "properties": {
+    "schema_version": { "type": "integer", "const": 1 },
+    "registry_id": { "type": "string", "minLength": 1 },
+    "created_at": { "type": "string", "minLength": 1 },
+    "updated_at": { "type": "string", "minLength": 1 },
+    "registry_kind": { "type": "string", "const": "registered_worker_registry" },
+    "defaults": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "allow_business_repo_writes": { "type": "boolean", "default": false },
+        "allow_mixed_worker": { "type": "boolean", "default": false },
+        "business_ready": { "type": "boolean", "default": false },
+        "mixed_ready": { "type": "boolean", "default": false }
+      }
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "workers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": [
+          "backend_kind",
+          "worker_id",
+          "worker_label",
+          "workspace_root",
+          "runtime_backend",
+          "runtime_binding_kind",
+          "pane_id",
+          "pane_pid",
+          "process_id",
+          "command",
+          "user_owned_pane",
+          "authorization_record",
+          "live_enable_config",
+          "last_smoke_artifact",
+          "evidence_package",
+          "allowed_write_roots",
+          "forbidden_paths",
+          "allow_business_repo_writes",
+          "allow_single_worker_smoke",
+          "allow_mixed_worker",
+          "registration_status",
+          "live_enabled",
+          "business_ready",
+          "mixed_ready",
+          "registered_at",
+          "registered_by",
+          "notes"
+        ],
+        "properties": {
+          "backend_kind": { "type": "string" },
+          "worker_id": { "type": "string", "minLength": 1 },
+          "worker_label": { "type": "string" },
+          "workspace_root": { "type": "string" },
+          "runtime_backend": { "type": "string" },
+          "runtime_binding_kind": { "type": "string" },
+          "pane_id": { "type": "string" },
+          "pane_pid": { "type": "string" },
+          "process_id": { "type": "string" },
+          "command": { "type": "string" },
+          "user_owned_pane": { "type": "boolean" },
+          "authorization_record": { "type": "string" },
+          "live_enable_config": { "type": "string" },
+          "last_smoke_artifact": { "type": "string" },
+          "evidence_package": { "type": "string" },
+          "allowed_write_roots": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "forbidden_paths": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "allow_business_repo_writes": { "type": "boolean", "default": false },
+          "allow_single_worker_smoke": { "type": "boolean", "default": false },
+          "allow_mixed_worker": { "type": "boolean", "default": false },
+          "registration_status": { "type": "string" },
+          "live_enabled": { "type": "boolean", "default": false },
+          "business_ready": { "type": "boolean", "default": false },
+          "mixed_ready": { "type": "boolean", "default": false },
+          "registered_at": { "type": "string" },
+          "registered_by": { "type": "string" },
+          "notes": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        }
+      }
+    }
+  }
+}

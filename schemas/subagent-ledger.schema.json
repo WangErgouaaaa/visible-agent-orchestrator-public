@@ -1,0 +1,425 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/omx/subagent-ledger.schema.json",
+  "title": "OpenCode Subagent Ledger Sidecar",
+  "description": "Task-local advisory ledger for OpenCode native subagent or lane observations. This sidecar is read-only board evidence and does not control visible worker dispatch or completion truth.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "subagents"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "subagents": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "parent_worker_id",
+          "parent_run_id",
+          "parent_task_id",
+          "subagent_id",
+          "agent",
+          "lane",
+          "purpose",
+          "status"
+        ],
+        "properties": {
+          "parent_worker_id": {
+            "type": "string"
+          },
+          "parent_run_id": {
+            "type": "string"
+          },
+          "parent_task_id": {
+            "type": "string"
+          },
+          "subagent_id": {
+            "type": "string"
+          },
+          "agent": {
+            "type": "string"
+          },
+          "lane": {
+            "type": "string"
+          },
+          "purpose": {
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "created",
+              "launched",
+              "running",
+              "waiting_input",
+              "blocked",
+              "failed",
+              "completed",
+              "unknown"
+            ]
+          },
+          "started_at": {
+            "type": "string"
+          },
+          "completed_at": {
+            "type": "string"
+          },
+          "artifact": {
+            "type": "string"
+          },
+          "artifact_path": {
+            "type": "string"
+          },
+          "artifact_summary": {
+            "oneOf": [
+              {
+                "type": "object"
+              },
+              {
+                "type": "string"
+              }
+            ]
+          },
+          "error": {
+            "type": "string"
+          },
+          "semantic_status": {
+            "enum": [
+              "",
+              "passed",
+              "failed",
+              "blocked"
+            ]
+          },
+          "retry_scope": {
+            "enum": [
+              "",
+              "none",
+              "lane_only",
+              "full_run"
+            ]
+          },
+          "required_or_optional": {
+            "enum": [
+              "",
+              "required",
+              "optional"
+            ]
+          },
+          "latest_useful_moment": {
+            "enum": [
+              "",
+              "before_parent_report",
+              "before_report_freeze",
+              "before_summarizer",
+              "advisory_only"
+            ]
+          },
+          "retrieval_state": {
+            "enum": [
+              "",
+              "not_requested",
+              "retrieval_ready",
+              "completed_but_indexing",
+              "retrieval_failed",
+              "unretrieved_before_freeze",
+              "expired_with_session_fallback",
+              "unknown_task_id",
+              "retrieval_not_ready_or_unknown",
+              "retrieval_not_ready_or_unknown_then_ready"
+            ]
+          },
+          "merge_readiness": {
+            "description": "Readiness/state of the retrieved artifact for merging. Use not_merged when an output was retrieved but left unconsumed; use merge_status=retrieved_but_not_merged for the final outcome.",
+            "enum": [
+              "",
+              "merge_ready_exact_contract",
+              "summary_only",
+              "requires_parent_rewrite",
+              "requires_direct_verification",
+              "contract_risky",
+              "merged",
+              "not_merged"
+            ]
+          },
+          "subdomain_id": {
+            "type": "string"
+          },
+          "spawned_by_worker": {
+            "type": "string"
+          },
+          "expected_unique_value": {
+            "type": "string"
+          },
+          "unique_value_realized": {
+            "type": "string"
+          },
+          "value_classification": {
+            "enum": [
+              "",
+              "unique_value_realized",
+              "useful_payload_returned",
+              "confidence_only",
+              "duplicate_or_overlap",
+              "not_retrieved",
+              "retrieved_but_not_merged",
+              "cancelled_before_merge",
+              "direct_path_converged_first"
+            ]
+          },
+          "merge_status": {
+            "description": "Final consumption outcome for the lane. Use retrieved_but_not_merged here, not in merge_readiness.",
+            "enum": [
+              "",
+              "merged",
+              "merged_into_report",
+              "retrieved_but_not_merged",
+              "not_retrieved",
+              "cancelled"
+            ]
+          },
+          "downstream_consumer": {
+            "type": "string"
+          },
+          "canonical_retrieval_handle": {
+            "type": "string"
+          },
+          "fallback_session_id": {
+            "type": "string"
+          },
+          "review_round": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "attempt": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "event_index": {
+            "type": "integer",
+            "enum": [
+              1,
+              2
+            ]
+          },
+          "audit_receipt_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "context_manifest_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "on_critical_path": {
+            "type": "boolean"
+          },
+          "direct_path_converged_first": {
+            "type": "boolean"
+          },
+          "cancel_reason": {
+            "type": "string"
+          },
+          "visible_role": {
+            "type": "string"
+          },
+          "evidence_domain": {
+            "type": "string"
+          },
+          "allowed_sources": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "forbidden_sources": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "source_label": {
+            "enum": [
+              "",
+              "direct_tool_verified",
+              "subagent_reported",
+              "quoted_file_evidence",
+              "derived_from_multiple_files",
+              "inference",
+              "generic_guidance",
+              "not_verified_in_current_run"
+            ]
+          },
+          "adopted_findings": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "rejected_findings": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "critical_rejected_findings": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "rejected_finding_reason": {
+            "type": "string"
+          },
+          "rejected_finding_direct_evidence_status": {
+            "type": "string"
+          },
+          "rejected_finding_downstream_action": {
+            "type": "string"
+          },
+          "subagent_degraded": {
+            "type": "boolean"
+          },
+          "degradation_reason": {
+            "type": "string"
+          },
+          "confidence_effect": {
+            "type": "string"
+          },
+          "parent_action_on_degradation": {
+            "enum": [
+              "",
+              "blocked",
+              "human_review_required",
+              "direct_evidence_substituted",
+              "confidence_downgraded_noncritical"
+            ]
+          },
+          "librarian_freshness_source": {
+            "type": "string"
+          },
+          "librarian_freshness_checked_at": {
+            "type": "string"
+          },
+          "librarian_freshness_basis": {
+            "type": "string"
+          },
+          "hephaestus_draft_adoption": {
+            "enum": [
+              "",
+              "adopted",
+              "partially_adopted",
+              "rejected",
+              "not_applicable"
+            ]
+          },
+          "hephaestus_adoption_diff_or_summary": {
+            "type": "string"
+          },
+          "momus_context_isolation_status": {
+            "enum": [
+              "",
+              "fresh_session",
+              "explicit_no_prior_context",
+              "not_used",
+              "unknown",
+              "shared_context_risk"
+            ]
+          },
+          "background_expiry_status": {
+            "enum": [
+              "",
+              "not_background",
+              "usable_before_freeze",
+              "late_after_freeze",
+              "expired",
+              "unknown"
+            ]
+          },
+          "late_result_handling": {
+            "type": "string"
+          },
+          "source_identity": {
+            "type": "object",
+            "properties": {
+              "root_kind": {
+                "enum": [
+                  "",
+                  "source_repo",
+                  "installed_live",
+                  "fixture",
+                  "unknown"
+                ]
+              },
+              "observed_at": {
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              },
+              "mtime": {
+                "type": "string"
+              },
+              "sha256": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          },
+          "requested_launcher_contract": {
+            "type": "string"
+          },
+          "actual_launcher_used": {
+            "type": "string"
+          },
+          "missing_or_unexpressed_fields": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "mitigation_steps_taken": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "audit_status": {
+            "type": "string"
+          },
+          "prompt_tokens": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "completion_tokens": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "total_tokens": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "token_cost_source": {
+            "type": "string"
+          },
+          "duration_ms": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "duration_ms_source": {
+            "type": "string"
+          },
+          "trace_task_id": {
+            "type": "string"
+          },
+          "trace_session_id": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "additionalProperties": true
+}

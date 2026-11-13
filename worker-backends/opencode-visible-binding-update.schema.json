@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "properties": {
+    "blocked_reasons": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "changed_fields": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "forbidden_fields_unchanged": {
+      "type": "boolean"
+    },
+    "no_live_actions_performed": {
+      "const": true
+    },
+    "no_registered_registry_writes": {
+      "const": true
+    },
+    "ok": {
+      "type": "boolean"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "update_kind": {
+      "const": "opencode-visible-binding-update"
+    },
+    "would_execute_live": {
+      "const": false
+    },
+    "would_write_registry": {
+      "const": false
+    }
+  },
+  "required": [
+    "schema_version",
+    "update_kind",
+    "ok",
+    "worker_id",
+    "registry_path",
+    "changed_fields",
+    "forbidden_fields_unchanged",
+    "would_execute_live",
+    "no_live_actions_performed"
+  ],
+  "title": "OpenCode visible binding update plan",
+  "type": "object"
+}

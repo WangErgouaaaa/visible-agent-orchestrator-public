@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+"""Phase-2 Jev shadow advisory CLI for one bounded decision point.
+
+Default is dry-run: prints the request that would be sent, performs no
+network call, and needs no API key. --live sends exactly one choice request
+to the fixed official endpoint; any failure returns status "unavailable"
+and exit code 0 so an optional shadow observation never fails an outer
+task. Local input errors exit 1 with a stderr message.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+if SRC.is_dir() and str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+from visible_agent_orchestrator.jev_shadow import (  # noqa: E402
+    DEFAULT_TIMEOUT_SECONDS,
+    MAX_TIMEOUT_SECONDS,
+)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="omx_jev_shadow",
+        description=(
+            "Ask one Jev choice question: is an additional read-only Astra "
+            "deep review worth it given existing coder/reviewer materials? "
+            "Observation-only; never dispatches, locks, or closes tasks."
+        ),
+    )
+    parser.add_argument("--input", required=True, help="sanitized case JSON path")
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        help="send one real request (default: dry-run with no network)",
+    )
+    parser.add_argument(
+        "--reverse-options",
+        action="store_true",
+        help="reverse the choice order for order-sensitivity checks",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_TIMEOUT_SECONDS,
+        help=f"request timeout in seconds, at most {MAX_TIMEOUT_SECONDS}",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    from visible_agent_orchestrator.jev_shadow import (
+        JevShadowError,
+        execute_shadow_case,
+        load_shadow_case,
+    )
+
+    args = build_parser().parse_args(argv)
+    try:
+        case = load_shadow_case(args.input)
+        result = execute_shadow_case(
+            case,
+            live=args.live,
+            reverse_options=args.reverse_options,
+            timeout_seconds=args.timeout,
+        )
+    except JevShadowError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    rendered = json.dumps(result, ensure_ascii=False, indent=2)
+    print(rendered)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

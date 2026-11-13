@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "purpose": "Fixed Companion Skill identities, canonical sources, derived discovery surfaces, install targets, and conservative impact lower bounds.",
+  "impact_protocol": {
+    "is_complete_inventory": false,
+    "non_match_result": "unverified",
+    "reason_required_for": [
+      "reviewed-no-change",
+      "not-applicable"
+    ],
+    "review_dispositions": [
+      "affected",
+      "reviewed-no-change",
+      "not-applicable"
+    ]
+  },
+  "release_protocol": {
+    "schema_version": 1,
+    "digest_protocol": "sha256-canonical-json-v1",
+    "contract_generation": 1,
+    "runtime_identity": "visible-agent-orchestrator-runtime-v1"
+  },
+  "skills": [
+    {
+      "id": "visible-agent-orchestrator",
+      "canonical_package": "companion-skill-sources/visible-agent-orchestrator",
+      "canonical_source": "companion-skill-sources/visible-agent-orchestrator/SKILL.md",
+      "discovery_paths": [
+        "plugins/visible-agent-orchestrator-skill-v0/SKILL.md"
+      ],
+      "install_target": {
+        "scope": "codex-user",
+        "active_name": "visible-agent-orchestrator"
+      },
+      "contract_version": "0.3.0",
+      "runtime_compatibility": {"required_identity": "visible-agent-orchestrator-runtime-v1"},
+      "impact_triggers": {
+        "path_prefixes": [
+          "bin/omx_install_sync",
+          "bin/omx_opencode_tui_adapter",
+          "bin/omx_visible_dispatch",
+          "src/visible_agent_orchestrator/operation_authorization.py",
+          "src/visible_agent_orchestrator/terminal_acceptance.py"
+        ],
+        "contracts": [
+          "companion-skill-lifecycle",
+          "operation-capability",
+          "session-action",
+          "skill-generation",
+          "terminal-protocol",
+          "visible-worker-dispatch"
+        ]
+      }
+    },
+    {
+      "id": "ag2-meeting",
+      "canonical_package": "companion-skill-sources/ag2-meeting",
+      "canonical_source": "companion-skill-sources/ag2-meeting/SKILL.md",
+      "discovery_paths": [
+        ".agents/skills/ag2-meeting/SKILL.md",
+        "plugins/ag2-meeting-runtime/skills/ag2-meeting/SKILL.md"
+      ],
+      "install_target": {
+        "scope": "agents-user",
+        "active_name": "ag2-meeting"
+      },
+      "contract_version": "1.0.0",
+      "runtime_compatibility": {"required_identity": "visible-agent-orchestrator-runtime-v1"},
+      "impact_triggers": {
+        "path_prefixes": [
+          "bin/omx_ag2_meeting",
+          "bin/omx_meeting_plan",
+          "plugins/ag2-meeting-runtime/profiles"
+        ],
+        "contracts": [
+          "ag2-meeting-artifact",
+          "ag2-meeting-profile",
+          "companion-skill-lifecycle",
+          "meeting-runtime"
+        ]
+      }
+    }
+  ]
+}

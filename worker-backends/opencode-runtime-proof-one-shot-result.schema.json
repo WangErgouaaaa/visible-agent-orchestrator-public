@@ -1,0 +1,166 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OpenCode Runtime-Proof One-Shot Result",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "execution_result_kind",
+    "execution_id",
+    "ok",
+    "backend_kind",
+    "target_worker_id",
+    "wrapper_id",
+    "command_returncode",
+    "command_timed_out",
+    "command_output",
+    "approved_command_attempted",
+    "did_execute_opencode",
+    "single_attempt_only",
+    "no_retry",
+    "execution_receipt",
+    "cleanup_receipt",
+    "operator_report",
+    "raw_event_evidence",
+    "postcheck_contract",
+    "evidence_postcheck",
+    "errors",
+    "warnings"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "execution_result_kind": { "const": "opencode-runtime-proof-one-shot-result" },
+    "execution_id": { "type": "string", "minLength": 1 },
+    "ok": { "type": "boolean" },
+    "backend_kind": { "const": "opencode_tui" },
+    "target_worker_id": { "type": "string", "minLength": 1 },
+    "wrapper_id": { "type": "string", "minLength": 1 },
+    "command_returncode": { "type": "integer" },
+    "command_timed_out": { "type": "boolean" },
+    "command_output": {
+      "type": "object",
+      "required": [
+        "stdout_bytes",
+        "stderr_bytes",
+        "stdout_sha256",
+        "stderr_sha256",
+        "stdout_preview",
+        "stderr_preview",
+        "preview_redacted"
+      ],
+      "properties": {
+        "stdout_bytes": { "type": "integer", "minimum": 0 },
+        "stderr_bytes": { "type": "integer", "minimum": 0 },
+        "stdout_sha256": { "type": "string" },
+        "stderr_sha256": { "type": "string" },
+        "stdout_preview": { "type": "string" },
+        "stderr_preview": { "type": "string" },
+        "preview_redacted": { "type": "boolean" }
+      },
+      "additionalProperties": true
+    },
+    "approved_command_attempted": { "type": "boolean" },
+    "did_execute_opencode": { "type": "boolean" },
+    "single_attempt_only": { "const": true },
+    "no_retry": { "const": true },
+    "execution_receipt": {
+      "type": "object",
+      "required": [
+        "receipt_kind",
+        "source",
+        "worker_id",
+        "wrapper_id",
+        "approved_argv",
+        "attempt_count",
+        "attempt_index",
+        "single_attempt_only",
+        "no_retry",
+        "cleanup_receipt_path",
+        "postcheck_marker_path"
+      ],
+      "properties": {
+        "receipt_kind": { "const": "opencode-runtime-proof-execution-receipt" },
+        "source": { "const": "opencode-runtime-proof-one-shot-executor" },
+        "attempt_count": { "const": 1 },
+        "attempt_index": { "const": 1 },
+        "single_attempt_only": { "const": true },
+        "no_retry": { "const": true },
+        "approved_argv": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": true
+    },
+    "cleanup_receipt": {
+      "type": "object",
+      "required": [
+        "receipt_kind",
+        "cleanup_required",
+        "cleanup_scope",
+        "leak_allowed",
+        "cleanup_completed",
+        "cleanup_leftover_paths",
+        "temp_root_only_writes",
+        "forbidden_path_writes_detected"
+      ],
+      "properties": {
+        "receipt_kind": { "const": "opencode-runtime-proof-cleanup-receipt" },
+        "cleanup_required": { "const": true },
+        "cleanup_scope": { "const": "temp_root_only" },
+        "leak_allowed": { "const": false },
+        "cleanup_leftover_paths": { "type": "array", "maxItems": 0 },
+        "temp_root_only_writes": { "const": true },
+        "forbidden_path_writes_detected": { "const": false }
+      },
+      "additionalProperties": true
+    },
+    "operator_report": {
+      "type": "object",
+      "required": [
+        "report_md_nonempty",
+        "terminal_marker",
+        "terminal_markers",
+        "terminal_marker_count",
+        "terminal_marker_without_report",
+        "cleanup_completed"
+      ],
+      "properties": {
+        "report_md_nonempty": { "const": true },
+        "terminal_marker": { "enum": [".done", ".fail", ".blocked"] },
+        "terminal_marker_count": { "const": 1 },
+        "terminal_marker_without_report": { "const": false },
+        "cleanup_completed": { "const": true }
+      },
+      "additionalProperties": true
+    },
+    "raw_event_evidence": {
+      "type": "object",
+      "required": [
+        "evidence_kind",
+        "raw_events_jsonl_path",
+        "raw_event_count",
+        "observed_event_kinds",
+        "plugin_import_observed",
+        "hook_invocation_observed",
+        "plugin_runtime_load_proven",
+        "native_subagent_lifecycle_proven",
+        "read_from_disposable_root_only",
+        "forbidden_path_writes_detected"
+      ],
+      "properties": {
+        "evidence_kind": { "const": "opencode-runtime-proof-raw-event-evidence" },
+        "raw_event_count": { "type": "integer", "minimum": 0 },
+        "observed_event_kinds": { "type": "array", "items": { "type": "string" } },
+        "plugin_import_observed": { "type": "boolean" },
+        "hook_invocation_observed": { "type": "boolean" },
+        "plugin_runtime_load_proven": { "type": "boolean" },
+        "native_subagent_lifecycle_proven": { "const": false },
+        "read_from_disposable_root_only": { "const": true },
+        "forbidden_path_writes_detected": { "const": false }
+      },
+      "additionalProperties": true
+    },
+    "postcheck_contract": { "type": "object" },
+    "evidence_postcheck": { "type": "object" },
+    "errors": { "type": "array", "items": { "type": "string" } },
+    "warnings": { "type": "array", "items": { "type": "string" } }
+  },
+  "additionalProperties": true
+}

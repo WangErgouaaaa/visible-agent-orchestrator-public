@@ -1,0 +1,221 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "ClaudeMixedReadinessGate",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version",
+    "gate_id",
+    "created_at",
+    "backend_kind",
+    "worker_id",
+    "registered_worker_registry",
+    "registered_worker_record",
+    "required_terminal_evidence",
+    "required_registered_smokes",
+    "required_health_evidence",
+    "required_write_scope_evidence",
+    "required_lock_evidence",
+    "required_business_policy",
+    "required_mixed_policy",
+    "current_readiness",
+    "mixed_ready_candidate",
+    "business_ready_candidate",
+    "would_update_registry",
+    "would_execute_live",
+    "blocked_reasons",
+    "warnings",
+    "safe_next_actions",
+    "forbidden_next_actions",
+    "evidence"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "gate_id": {
+      "const": "claude-mixed-readiness-gate"
+    },
+    "created_at": {
+      "type": "string"
+    },
+    "backend_kind": {
+      "const": "claude_code"
+    },
+    "worker_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "registered_worker_registry": {
+      "type": "string"
+    },
+    "registered_worker_record": {
+      "type": "object"
+    },
+    "required_terminal_evidence": {
+      "type": "object",
+      "required": [
+        "done_smoke_required",
+        "blocked_smoke_required",
+        "fail_smoke_required",
+        "report_md_nonempty_required",
+        "exactly_one_terminal_marker_required"
+      ],
+      "properties": {
+        "done_smoke_required": {
+          "const": true
+        },
+        "blocked_smoke_required": {
+          "const": true
+        },
+        "fail_smoke_required": {
+          "const": true
+        },
+        "report_md_nonempty_required": {
+          "const": true
+        },
+        "exactly_one_terminal_marker_required": {
+          "const": true
+        }
+      }
+    },
+    "required_registered_smokes": {
+      "type": "object"
+    },
+    "required_health_evidence": {
+      "type": "object"
+    },
+    "required_write_scope_evidence": {
+      "type": "object",
+      "required": [
+        "claude_allowed_write_roots",
+        "opencode_allowed_write_roots",
+        "disjoint_write_roots_required",
+        "business_repo_forbidden",
+        "state_team_forbidden",
+        "obsidian_forbidden"
+      ],
+      "properties": {
+        "claude_allowed_write_roots": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "opencode_allowed_write_roots": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "disjoint_write_roots_required": {
+          "const": true
+        },
+        "business_repo_forbidden": {
+          "const": true
+        },
+        "state_team_forbidden": {
+          "const": true
+        },
+        "obsidian_forbidden": {
+          "const": true
+        }
+      }
+    },
+    "required_lock_evidence": {
+      "type": "object"
+    },
+    "required_business_policy": {
+      "type": "object",
+      "properties": {
+        "allow_business_tasks": {
+          "const": false
+        },
+        "business_ready_candidate_must_remain_false": {
+          "const": true
+        }
+      }
+    },
+    "required_mixed_policy": {
+      "type": "object",
+      "required": [
+        "allow_business_tasks",
+        "allow_mixed_live",
+        "allow_mixed_noop_sandbox_candidate",
+        "require_opencode_registry",
+        "require_claude_registered_worker",
+        "require_no_active_locks",
+        "require_no_watcher_alerts",
+        "require_board_validate_ok"
+      ],
+      "properties": {
+        "allow_business_tasks": {
+          "const": false
+        },
+        "allow_mixed_live": {
+          "const": false
+        },
+        "allow_mixed_noop_sandbox_candidate": {
+          "type": "boolean"
+        },
+        "require_opencode_registry": {
+          "const": true
+        },
+        "require_claude_registered_worker": {
+          "const": true
+        },
+        "require_no_active_locks": {
+          "const": true
+        },
+        "require_no_watcher_alerts": {
+          "const": true
+        },
+        "require_board_validate_ok": {
+          "const": true
+        }
+      }
+    },
+    "current_readiness": {
+      "type": "object"
+    },
+    "mixed_ready_candidate": {
+      "type": "boolean"
+    },
+    "business_ready_candidate": {
+      "const": false
+    },
+    "would_update_registry": {
+      "const": false
+    },
+    "would_execute_live": {
+      "const": false
+    },
+    "blocked_reasons": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "safe_next_actions": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "forbidden_next_actions": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "evidence": {
+      "type": "array"
+    }
+  }
+}

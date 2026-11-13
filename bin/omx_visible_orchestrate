@@ -1,0 +1,4144 @@
+#!/usr/bin/env python3
+"""Single leader entrypoint for visible OpenCode worker orchestration."""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import hashlib
+import json
+import os
+import re
+import shlex
+import subprocess
+import stat
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+_THIS_FILE = Path(__file__).resolve()
+for _p in ((_THIS_FILE.parent.parent / "src").resolve(), (_THIS_FILE.parent.parent / "lib").resolve()):
+    if _p.exists() and str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
+
+from visible_agent_orchestrator.lane_contracts import LaneContractError
+from visible_agent_orchestrator.leader_orchestrate import (
+    LeaderOrchestrateError,
+    SessionActionError,
+    build_run_plan,
+    parse_workers,
+    prompt_delivery_scope_notice_lines,
+    selected_prompt_delivery_mode,
+    recommended_auto_recover_workers,
+    resolve_session_actions,
+    resolve_topology_metadata,
+)
+from visible_agent_orchestrator import leader_orchestrate as leader_runtime
+from visible_agent_orchestrator.operation_authorization import (
+    OperationAuthorizationError,
+    _canonical_json_hash,
+    _external_harness_derived_contract_hash,
+    derive_operation_contract,
+    extract_opencode_server_prompt_async_canary,
+    external_harness_authorization_ledger,
+    prepare_external_harness_grant,
+    reconcile_external_harness_grant,
+    validate_mutation_gate_union,
+    validate_operation_capability,
+)
+from visible_agent_orchestrator.runtime.errors import RegistryError
+from visible_agent_orchestrator.runtime.pane_drift import evaluate_auto_rebind_decision
+from visible_agent_orchestrator.runtime.registry import load_visible_workers
+from visible_agent_orchestrator.visible_registry_lock import write_json_atomic
+from visible_agent_orchestrator.terminal_durability import durable_atomic_write
+from visible_agent_orchestrator.progress_checkpoints import read_checkpoint_access
+from visible_agent_orchestrator.worker_pool_lease import active_worker_pool_leases_summary
+from visible_agent_orchestrator.runtime_paths import runtime_root
+from visible_agent_orchestrator.companion_skill_admission import AdmissionError, invoke_cli_handler, readonly_wait_window
+
+# Structured lock-rejection surfaces only (issue #895): explicit JSON fields
+# and exact machine lines the downstream dispatch/langgraph control-plane
+# CLIs emit, plus the typed DispatchError renderings dispatch prints for
+# owner-lock refusals. Prose that merely mentions these codes never selects
+# lock diagnostics.
+LOCK_REJECTION_FINAL_STATES = ("worker_pool_busy",)
+LOCK_REJECTION_MACHINE_LINES = (
+    "final_state: worker_pool_busy",
+    "wait_result: running_or_incomplete",
+)
+# The langgraph text mode prints the summary machine field as
+# `summary: {json object}` (bin/omx_langgraph_control_plane:659).
+LOCK_REJECTION_SUMMARY_LINE_PREFIX = "summary: "
+LOCK_REJECTION_ERROR_LINE_PATTERNS = (
+    re.compile(r"ERROR: submit failed: active_task_exists for \S.*"),
+    re.compile(r"ERROR: submit failed: worker \S+ binding changed before owner lock acquisition"),
+)
+# Structured `refusal_reason` values carried by the omx_visible_rebind --json
+# known-failure envelope (RebindError facts) that are confirmed target
+# owner-lock refusals; every other nonzero rebind result keeps its own
+# failure reason without lock diagnosis. `status` stays the trusted binding
+# observation or null per the runbook contract.
+REBIND_LOCK_REFUSAL_REASONS = ("target_owner_lock",)
+TERMINAL_PROTOCOL_STATES = {"completed", "blocked", "failed", "submit_failed"}
+CROSS_SESSION_REBIND_STATUS = "registry_session_mismatch_rebind_available"
+
+
+class RecoveryGuidanceError(LeaderOrchestrateError):
+    def __init__(self, message: str, guidance: dict[str, object] | None):
+        super().__init__(message)
+        self.guidance = guidance
+
+
+def root_path(value: str | None) -> Path:
+    return runtime_root(value)
+
+
+def add_common_run_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--root", default=".")
+    parser.add_argument("--backend", default="tmux-reference")
+    parser.add_argument("--worker", action="append", default=[], help="repeatable worker id or comma-separated worker ids")
+    parser.add_argument("--all-production-workers", action="store_true", help="use every dispatchable default/production worker from registry")
+    parser.add_argument("--fanout", type=int, help="choose the first N dispatchable workers from registry (default worker first)")
+    parser.add_argument("--title", required=True)
+    parser.add_argument("--inner-mode", choices=["4x3", "4x7"], default="")
+    parser.add_argument("--artifact-root", default="")
+    parser.add_argument("--topology-metadata", default="", help="optional chapter brief / topology metadata JSON that can derive inner topology")
+    parser.add_argument(
+        "--task-profile",
+        default="",
+        help="optional validated task-feature JSON used for advisory fanout selection",
+    )
+    parser.add_argument(
+        "--lane-contracts",
+        default="",
+        help="optional JSON file with explicit per-worker lane assignments and prepared task contracts",
+    )
+    parser.add_argument(
+        "--emit-lane-contracts",
+        default="",
+        help="optional path where plan/run should write an auto-generated lane-contract JSON for a multiworker read-only run",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=300,
+        help=(
+            "caller wait budget in seconds forwarded to the dispatch child; it is "
+            "not a worker task deadline: expiry returns pending/running while "
+            "task/attempt/owner stay retained, so keep reading the task's own "
+            "report/marker/evidence and settle only after the formal terminal state"
+        ),
+    )
+    parser.add_argument("--model", default="", help="optional model name for effective context budget hints")
+    parser.add_argument("--nominal-context-tokens", type=int, default=0, help="model advertised context window in tokens")
+    parser.add_argument("--effective-context-tokens", type=int, default=0, help="provider/runtime effective context window in tokens")
+    parser.add_argument("--wait-for-workers", action="store_true")
+    parser.add_argument("--worker-wait-timeout", type=int, default=600)
+    parser.add_argument("--worker-wait-interval", type=int, default=5)
+    parser.add_argument("--post-failure-settle-timeout", type=int, default=180)
+    parser.add_argument("--post-failure-settle-interval", type=int, default=5)
+    parser.add_argument("--allow-real", action="store_true")
+    parser.add_argument(
+        "--allow-visible-full-prompt",
+        action="store_true",
+        help=(
+            "explicitly post the complete prompt.txt body into the visible "
+            "TUI; full-prompt delivery modes are the only delivery modes "
+            "whose task-body grants can authorize writes outside the task "
+            "directory, and this flag selects the visible full-prompt mode "
+            "- the flag itself grants no additional write scope"
+        ),
+    )
+    parser.add_argument(
+        "--task-contract-json",
+        default="",
+        help=(
+            "host-prepared task contract JSON for real operator dispatch; "
+            "the trusted host prepares the grant through the "
+            "operation_authorization library, this entrypoint only consumes it"
+        ),
+    )
+    parser.add_argument(
+        "--draft-check",
+        dest="draft_check",
+        action="store_true",
+        help=(
+            "opt this task into the closed draft-check delivery contract "
+            "(draft_check.enabled=true) before the grant/contract hash is "
+            "prepared: --authorize-leader mints the grant with the "
+            "selection bound into the task contract, and a consumed "
+            "--task-contract-json must carry the exact same selection or "
+            "the dispatch is rejected as a contract conflict"
+        ),
+    )
+    parser.add_argument(
+        "--draft-check-jev-live",
+        dest="draft_check_jev_live",
+        action="store_true",
+        help=(
+            "leader-only task-level live Jev selection for the automatic "
+            "draft-check hook: implies --draft-check and requires "
+            "--draft-check-evidence-root; within that hook path it is "
+            "the only live-sending authorization (other tools keep their "
+            "own independent surfaces), it is bound into the task "
+            "contract before the grant/contract hash like --draft-check, "
+            "and ordinary --draft-check stays offline"
+        ),
+    )
+    parser.add_argument(
+        "--draft-check-evidence-root",
+        dest="draft_check_evidence_root",
+        default="",
+        help=(
+            "authorized absolute evidence root recorded with "
+            "--draft-check-jev-live; the check refuses to send unless "
+            "the draft declares exactly this root, so a worker draft "
+            "cannot point the check at a different host directory"
+        ),
+    )
+    parser.add_argument("--require-confirmation", action="store_true")
+    parser.add_argument("--force-langgraph", action="store_true")
+    parser.add_argument("--thread-id")
+    parser.add_argument("--approved", action="store_true")
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help=(
+            "run: structured result receipt after an accepted single-worker "
+            "dispatch, including run_preflight from the same call's binding/"
+            "doctor/lock gates; usage and admission rejections stay "
+            "stderr+nonzero with no JSON. plan: emit the selected plan JSON"
+        ),
+    )
+    parser.add_argument(
+        "--session-action",
+        action="append",
+        default=[],
+        help="single action or repeatable worker=action mapping",
+    )
+    parser.add_argument(
+        "--session-action-reason",
+        default="",
+        help=(
+            "required for every session action; when any session_action=rotate "
+            "this reason must equal --rotation-reason exactly (e.g. "
+            "role_isolation), otherwise the run is rejected before any grant, "
+            "task, or lock is created"
+        ),
+    )
+    parser.add_argument(
+        "--rotation-reason",
+        default="",
+        help=(
+            "required when any session_action=rotate; sanctioned values: "
+            "manual_new, role_isolation, context_domain_changed, "
+            "contract_breaking_changed, context_contaminated, "
+            "context_rollover, recovery_restart, worker_reuse. "
+            "context_domain_changed is not configured on this entry; use "
+            "omx_visible_dispatch run-one with distinct --context-domain-id "
+            "and --previous-context-domain-id. Ordinary new work uses "
+            "worker_reuse with rehydration-packet-type new-task."
+        ),
+    )
+    parser.add_argument(
+        "--rehydration-packet-type",
+        default="",
+        help="required when rotating: continuation, clean-room-review, new-task, recovery",
+    )
+    parser.add_argument(
+        "--no-auto-rebind-pane-drift",
+        action="store_true",
+        help=(
+            "disable safe pre-run pane-drift repair only; required binding, "
+            "current-window, doctor, and target-lock gates still run"
+        ),
+    )
+
+
+def _lane_task_contract_workers(path_value: str) -> list[str]:
+    if not str(path_value or "").strip():
+        return []
+    path = Path(path_value).expanduser().resolve()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    assignments = payload.get("assignments") if isinstance(payload, dict) else None
+    if not isinstance(assignments, list):
+        return []
+    routed = [item for item in assignments if isinstance(item, dict) and "task_contract" in item]
+    if not routed:
+        return []
+    if len(routed) != len(assignments):
+        raise LeaderOrchestrateError(
+            "every selected worker assignment requires task_contract when prepared contract routing is used"
+        )
+    workers: list[str] = []
+    for item in routed:
+        worker_id = str(item.get("worker_id") or "").strip()
+        if not worker_id:
+            raise LeaderOrchestrateError("prepared task_contract is missing worker_id")
+        if worker_id in workers:
+            raise LeaderOrchestrateError(
+                f"duplicate task_contract input for worker {worker_id}"
+            )
+        task_contract = item.get("task_contract")
+        capability = (
+            task_contract.get("operation_capability")
+            if isinstance(task_contract, dict)
+            else None
+        )
+        scope = capability.get("scope") if isinstance(capability, dict) else None
+        if not isinstance(scope, dict) or scope.get("kind") != "worker" or scope.get("id") != worker_id:
+            raise LeaderOrchestrateError(
+                f"prepared task_contract capability scope does not match worker {worker_id}"
+            )
+        workers.append(worker_id)
+    return workers
+
+
+def _selected_prompt_delivery_mode_from_args(
+    args: argparse.Namespace,
+) -> str | None:
+    """Selected delivery mode for plan/pre-submit output, or None.
+
+    Reads the inline prepared ``--task-contract-json`` when present so a
+    prepared contract's own ``allow_visible_full_prompt``/
+    ``clean_room_startup`` selection is respected, not just the raw argparse
+    flag. A present-but-malformed prepared contract yields None: existing
+    bridge/validation surfaces own that failure, and no advisory mode is
+    guessed from the flag in its place.
+    """
+    raw = str(getattr(args, "task_contract_json", "") or "").strip()
+    if not raw:
+        return selected_prompt_delivery_mode(
+            None,
+            explicit_full_prompt=bool(
+                getattr(args, "allow_visible_full_prompt", False)
+            ),
+        )
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return selected_prompt_delivery_mode(
+        payload,
+        explicit_full_prompt=bool(
+            getattr(args, "allow_visible_full_prompt", False)
+        ),
+    )
+
+
+def _print_prompt_delivery_scope_notice(mode: str, *, json_output: bool) -> None:
+    """Print the shared pre-submit delivery-scope explanation (#904).
+
+    Text mode prints to stdout with the other pre-dispatch lines; JSON mode
+    prints to stderr so the final machine receipt stays the only stdout
+    JSON document.
+    """
+    stream = sys.stderr if json_output else sys.stdout
+    for line in prompt_delivery_scope_notice_lines(mode):
+        print(line, file=stream)
+
+
+def plan_payload(args: argparse.Namespace) -> dict[str, object]:
+    root = root_path(args.root)
+    task_contract_workers = _lane_task_contract_workers(
+        str(getattr(args, "lane_contracts", "") or "")
+    )
+    plan = build_run_plan(
+        root,
+        backend=args.backend,
+        requested_workers=parse_workers(args.worker),
+        all_production_workers=bool(args.all_production_workers),
+        fanout=args.fanout,
+        title=args.title,
+        body=args.body,
+        timeout=int(args.timeout),
+        allow_real=bool(args.allow_real),
+        require_confirmation=bool(args.require_confirmation),
+        force_langgraph=bool(args.force_langgraph) or bool(task_contract_workers),
+        thread_id=args.thread_id,
+        approved=bool(args.approved),
+        json_output=bool(args.json),
+        inner_mode=str(args.inner_mode or ""),
+        artifact_root=str(args.artifact_root or ""),
+        topology_metadata=str(args.topology_metadata or ""),
+        lane_contracts=str(getattr(args, "lane_contracts", "") or ""),
+        emit_lane_contracts=str(getattr(args, "emit_lane_contracts", "") or ""),
+        model=str(getattr(args, "model", "") or ""),
+        nominal_context_tokens=int(getattr(args, "nominal_context_tokens", 0) or 0),
+        effective_context_tokens=int(getattr(args, "effective_context_tokens", 0) or 0),
+        task_profile=str(getattr(args, "task_profile", "") or ""),
+        session_action_values=list(getattr(args, "session_action", []) or []),
+        session_action_reason=str(
+            getattr(args, "session_action_reason", "") or ""
+        ),
+        rotation_reason=str(getattr(args, "rotation_reason", "") or ""),
+        rehydration_packet_type=str(
+            getattr(args, "rehydration_packet_type", "") or ""
+        ),
+    )
+    if task_contract_workers and set(task_contract_workers) != set(plan.workers):
+        raise LeaderOrchestrateError(
+            "prepared task_contract workers must exactly match selected workers: "
+            f"expected={sorted(plan.workers)} actual={sorted(task_contract_workers)}"
+        )
+    return {
+        "root": str(plan.root),
+        "route": plan.route,
+        "backend": plan.backend,
+        "workers": plan.workers,
+        "reason": plan.reason,
+        "prompt_delivery_mode": _selected_prompt_delivery_mode_from_args(args),
+        "task_feature_profile": plan.task_feature_profile,
+        "topology_recommendation": plan.topology_recommendation,
+        "lane_assignments": plan.lane_assignments,
+        "lane_assignment_source": plan.lane_assignment_source,
+        "lane_contracts_path": plan.lane_contracts_path,
+        "lane_contracts_emitted": plan.lane_contracts_emitted,
+        "task_contract_workers": task_contract_workers,
+        "session_actions": plan.session_actions,
+        "session_action_reason": plan.session_action_reason,
+        "rotation_reason": plan.rotation_reason,
+        "rehydration_packet_type": plan.rehydration_packet_type,
+        "argv": plan.argv,
+    }
+
+
+def _workers_still_ready(root: Path, worker_ids: list[str]) -> bool:
+    for worker_id in worker_ids:
+        live = leader_runtime._live_worker_health(root, worker_id)
+        if not (
+            int(live.get("returncode", 1)) == 0
+            and str(live.get("overall") or "") == "OK"
+            and str(live.get("rebind") or "") == "current_binding_ok"
+            and int(live.get("active_locks", 0) or 0) == 0
+            and int(live.get("active_alerts", 0) or 0) == 0
+        ):
+            return False
+    return True
+
+
+def _print_lane_assignments(payload: dict[str, object]) -> None:
+    assignments = payload.get("lane_assignments", [])
+    if not isinstance(assignments, list) or not assignments:
+        return
+    source = str(payload.get("lane_assignment_source") or "").strip()
+    if source:
+        print(f"lane_assignment_source: {source}")
+    path = str(payload.get("lane_contracts_path") or "").strip()
+    emitted = bool(payload.get("lane_contracts_emitted"))
+    if path:
+        print(f"lane_contracts_path: {path}")
+        print(f"lane_contracts_emitted: {str(emitted).lower()}")
+    print("lane_assignments:")
+    for item in assignments:
+        if not isinstance(item, dict):
+            continue
+        worker_id = str(item.get("worker_id") or "-")
+        lane_id = str(item.get("lane_id") or "-")
+        lane_focus = str(item.get("lane_focus") or "").strip()
+        suffix = f" | focus={lane_focus}" if lane_focus else ""
+        print(f"  - {worker_id}: {lane_id}{suffix}")
+
+
+def _running_incomplete_lock_rejection(summary: object) -> bool:
+    if not isinstance(summary, dict):
+        return False
+    running = summary.get("running_or_incomplete")
+    return type(running) is int and running > 0
+
+
+def _summary_line_lock_rejection(line: str) -> bool:
+    value = line[len(LOCK_REJECTION_SUMMARY_LINE_PREFIX):].strip()
+    if not value.startswith("{"):
+        return False
+    try:
+        summary = json.loads(value)
+    except json.JSONDecodeError:
+        return False
+    return _running_incomplete_lock_rejection(summary)
+
+
+def _lock_rejection_detected(stdout: str, stderr: str) -> bool:
+    text = str(stdout or "").strip()
+    if text:
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, dict):
+            if str(payload.get("final_state") or "") in LOCK_REJECTION_FINAL_STATES:
+                return True
+            if _running_incomplete_lock_rejection(payload.get("summary")):
+                return True
+    lines = [line.strip() for line in f"{stdout or ''}\n{stderr or ''}".splitlines()]
+    if any(line in LOCK_REJECTION_MACHINE_LINES for line in lines):
+        return True
+    if any(
+        line.startswith(LOCK_REJECTION_SUMMARY_LINE_PREFIX)
+        and _summary_line_lock_rejection(line)
+        for line in lines
+    ):
+        return True
+    return any(
+        pattern.fullmatch(line)
+        for line in lines
+        for pattern in LOCK_REJECTION_ERROR_LINE_PATTERNS
+    )
+
+
+def _rebind_lock_refusal(stdout: str) -> bool:
+    try:
+        payload = json.loads(str(stdout or ""))
+    except json.JSONDecodeError:
+        return False
+    return (
+        isinstance(payload, dict)
+        and str(payload.get("refusal_reason") or "") in REBIND_LOCK_REFUSAL_REASONS
+    )
+
+
+def suppress_synthetic_timeout_after_recovered_completion(
+    stdout: str,
+    stderr: str,
+    returncode: int,
+) -> str:
+    recovered_completion_markers = (
+        "protocol_terminal_state: completed",
+        "final_protocol_terminal_state: completed",
+        "pending_after_timeout: false",
+        "needs_settle: false",
+        "lock_archived_by_finalizer: true",
+    )
+    if int(returncode) != 0 or not all(marker in stdout for marker in recovered_completion_markers):
+        return stderr
+    return "".join(line for line in stderr.splitlines(keepends=True) if line.strip() != "command timed out")
+
+
+def _print_lock_failure_hint(
+    root: Path,
+    *,
+    worker_id: str | None = None,
+    backend: str = "tmux-reference",
+    guidance: dict[str, object] | None = None,
+) -> dict[str, object] | None:
+    dispatch = root / "bin" / "omx_visible_dispatch"
+    print(
+        f"lock_diagnosis_next: {dispatch} locks --root {root} --json",
+        file=sys.stderr,
+    )
+    print(
+        "lock_diagnosis_rule: run the read-only lock doctor before retrying dispatch, pressing Enter, or settling locks",
+        file=sys.stderr,
+    )
+    target = str(worker_id or "").strip()
+    if guidance is None and target:
+        payload, error = _load_locks_payload(root, worker_id=target)
+        guidance = build_failure_recovery_guidance(
+            root=root,
+            backend=backend,
+            worker_id=target,
+            locks_payload=payload,
+            locks_error=error,
+        )
+    if guidance is not None and (
+        guidance.get("commands")
+        or guidance.get("lock_not_safe_to_settle")
+        or guidance.get("condition") == "current_binding_terminal_settlement"
+    ):
+        _print_recovery_guidance(guidance, file=sys.stderr)
+    return guidance
+
+
+def _load_locks_payload(
+    root: Path,
+    *,
+    worker_id: str | None = None,
+) -> tuple[dict[str, object] | None, dict[str, object] | None]:
+    argv = [str(root / "bin" / "omx_visible_dispatch"), "locks", "--root", str(root), "--json"]
+    if worker_id:
+        argv.extend(["--worker", worker_id])
+    try:
+        result = subprocess.run(
+            argv,
+            cwd=str(root),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except OSError as exc:
+        return None, {
+            "action": "locks",
+            "returncode": 127,
+            "stderr": f"locks diagnostic unavailable: {exc}",
+        }
+    if int(result.returncode) not in (0, 1):
+        return None, {"action": "locks", "returncode": int(result.returncode), "stderr": str(result.stderr or "")}
+    try:
+        payload = json.loads(result.stdout or "")
+    except json.JSONDecodeError:
+        return None, {"action": "locks", "returncode": int(result.returncode), "stderr": "locks json is not valid JSON"}
+    schema_version = payload.get("schema_version") if isinstance(payload, dict) else None
+    lock_doctor_verdict = payload.get("lock_doctor") if isinstance(payload, dict) else None
+    if (
+        not isinstance(payload, dict)
+        or type(schema_version) is not int
+        or schema_version != 1
+        or not isinstance(payload.get("locks"), list)
+        or not isinstance(lock_doctor_verdict, str)
+        or not lock_doctor_verdict
+        or not str(payload.get("lock_scope") or "")
+    ):
+        return None, {"action": "locks", "returncode": int(result.returncode), "stderr": "locks json is not a lock inventory object"}
+    expected_doctors = {0: {"OK"}, 1: {"ATTENTION", "RECOVERABLE"}}
+    if lock_doctor_verdict not in expected_doctors.get(int(result.returncode), set()):
+        return None, {"action": "locks", "returncode": int(result.returncode), "stderr": f"locks returncode {result.returncode} contradicts lock_doctor {lock_doctor_verdict!r}"}
+    if worker_id:
+        target_count = payload.get("target_worker_lock_count")
+        if (
+            str(payload.get("lock_scope") or "") != "worker"
+            or str(payload.get("worker_id") or "") != worker_id
+            or type(target_count) is not int
+            or target_count < 0
+            or target_count != len(payload.get("locks") or [])
+        ):
+            return None, {"action": "locks", "returncode": int(result.returncode), "stderr": "locks json is not the requested worker scope"}
+        for item in payload.get("locks", []):
+            if not isinstance(item, dict) or str(item.get("worker_id") or "") != worker_id:
+                return None, {"action": "locks", "returncode": int(result.returncode), "stderr": "worker scope locks contain an unrelated worker"}
+    return payload, None
+
+
+def _selected_locks(payload: dict[str, object], worker_ids: list[str]) -> list[dict[str, object]]:
+    wanted = {str(item) for item in worker_ids if str(item)}
+    if not wanted:
+        return []
+    locks = payload.get("locks", [])
+    if not isinstance(locks, list):
+        return []
+    return [item for item in locks if isinstance(item, dict) and str(item.get("worker_id") or "") in wanted]
+
+
+def _task_state_module():
+    if str(_THIS_FILE.parent) not in sys.path:
+        sys.path.insert(0, str(_THIS_FILE.parent))
+    import omx_visible_task_state as task_state
+
+    return task_state
+
+
+def _safe_run_task_ids(run_id: str, task_id: str) -> tuple[str, str] | None:
+    task_state = _task_state_module()
+    try:
+        run_id = task_state.canonical_run_id(run_id)
+        task_id = task_state.safe_id(task_id, "task")
+    except task_state.TaskStateError:
+        return None
+    if shlex.quote(run_id) != run_id or shlex.quote(task_id) != task_id:
+        return None
+    return run_id, task_id
+
+
+def _validated_settle_target(lock: object, worker_id: str) -> dict[str, str] | None:
+    if not isinstance(lock, dict):
+        return None
+    if str(lock.get("worker_id") or "") != worker_id:
+        return None
+    truth = lock.get("task_truth") if isinstance(lock.get("task_truth"), dict) else {}
+    diagnosis = str(lock.get("diagnosis") or "")
+    lock_state = str(truth.get("lock_state") or "")
+    protocol_state = str(
+        lock.get("protocol_terminal_state") or truth.get("protocol_terminal_state") or ""
+    )
+    if diagnosis != "terminal_stale_lock" and lock_state != "stale_terminal_lock":
+        return None
+    if protocol_state not in TERMINAL_PROTOCOL_STATES:
+        return None
+    run_id = str(lock.get("run") or truth.get("run_id") or "")
+    task_id = str(lock.get("task") or truth.get("task_id") or "")
+    if not run_id or not task_id:
+        return None
+    safe_ids = _safe_run_task_ids(run_id, task_id)
+    if safe_ids is None:
+        return None
+    run_id, task_id = safe_ids
+    return {"worker_id": worker_id, "run": run_id, "task": task_id}
+
+
+def _cross_session_facts(
+    check_payload: object,
+    *,
+    root: Path,
+    worker_id: str,
+    check_rc: object,
+) -> dict[str, object] | None:
+    if not isinstance(check_payload, dict):
+        return None
+    if type(check_rc) is not int or check_rc != 1:
+        return None
+    if str(check_payload.get("root") or "") != str(root):
+        return None
+    if str(check_payload.get("worker_id") or "") != worker_id:
+        return None
+    if str(check_payload.get("status") or "") != CROSS_SESSION_REBIND_STATUS:
+        return None
+    if check_payload.get("target_worker_rebind_available") is not True:
+        return None
+    registry = check_payload.get("registry")
+    live = check_payload.get("live")
+    if not isinstance(registry, dict) or not isinstance(live, dict):
+        return None
+    registry_session = str(registry.get("tmux_session") or "")
+    live_session = str(live.get("tmux_session") or "")
+    registry_window = str(registry.get("tmux_window") or "")
+    live_window = str(live.get("tmux_window") or "")
+    if not registry_session or not live_session or not registry_window or not live_window:
+        return None
+    if registry_session == live_session and registry_window == live_window:
+        return None
+    registry_port = registry.get("port")
+    live_port = live.get("port")
+    if type(registry_port) is not int or type(live_port) is not int:
+        return None
+    if registry_port <= 0 or live_port <= 0 or registry_port != live_port:
+        return None
+    return {
+        "port": registry_port,
+        "registry_session": registry_session,
+        "live_session": live_session,
+        "registry_window": registry_window,
+        "live_window": live_window,
+    }
+
+
+def _recovery_dispatch_instruction() -> str:
+    return (
+        "follow reported consumption_state and reconcile_decision: "
+        "continue only the exact original prepared contract when the grant "
+        "remains active and recovery is complete; use a new attempt/event "
+        "for a changed contract or an inactive grant; stop on unknown state. "
+        "Grant reconciliation is library-only "
+        "(visible_agent_orchestrator.operation_authorization."
+        "reconcile_external_harness_grant); there is no CLI and no auto-revoke"
+    )
+
+
+def build_failure_recovery_guidance(
+    *,
+    root: Path,
+    backend: str,
+    worker_id: str,
+    check_payload: object = None,
+    check_rc: object = None,
+    locks_payload: object = None,
+    locks_error: object = None,
+) -> dict[str, object]:
+    cross = _cross_session_facts(
+        check_payload, root=root, worker_id=worker_id, check_rc=check_rc
+    )
+    settle_target = None
+    lock_not_safe = False
+    observation_unusable = False
+    mutation_blocked = False
+    zero_locks_proven = False
+    if locks_error is not None:
+        observation_unusable = True
+        mutation_blocked = True
+    elif isinstance(locks_payload, dict) and isinstance(locks_payload.get("locks"), list):
+        scoped = [
+            item
+            for item in locks_payload.get("locks", [])
+            if isinstance(item, dict) and str(item.get("worker_id") or "") == worker_id
+        ]
+        validated: list[dict[str, str]] = []
+        for item in scoped:
+            target = _validated_settle_target(item, worker_id)
+            if target is None:
+                lock_not_safe = True
+            else:
+                validated.append(target)
+        if lock_not_safe or len(validated) > 1:
+            mutation_blocked = True
+        elif len(validated) == 1:
+            settle_target = validated[0]
+        else:
+            zero_locks_proven = True
+    elif locks_payload is not None:
+        observation_unusable = True
+        mutation_blocked = True
+    commands: list[dict[str, str]] = []
+    allow_rebind = bool(cross) and not mutation_blocked and (
+        zero_locks_proven or settle_target is not None
+    )
+    if settle_target is not None and not mutation_blocked:
+        commands.append(
+            {
+                "action": "settle",
+                "command": shlex.join(
+                    [
+                        str(root / "bin" / "omx_visible_dispatch"),
+                        "settle",
+                        "--root",
+                        str(root),
+                        "--backend",
+                        backend,
+                        "--run",
+                        settle_target["run"],
+                        "--task",
+                        settle_target["task"],
+                        "--allow-terminal-archive",
+                    ]
+                ),
+            }
+        )
+    if allow_rebind:
+        commands.append(
+            {
+                "action": "authorized_cross_session_rebind",
+                "command": shlex.join(
+                    [
+                        str(root / "bin" / "omx_visible_rebind"),
+                        "rebind",
+                        "--root",
+                        str(root),
+                        "--worker",
+                        worker_id,
+                        "--port",
+                        str(cross["port"]),
+                        "--runtime-backend",
+                        backend,
+                        "--allow-rebind",
+                        "--allow-cross-session-move",
+                        "--json",
+                    ]
+                ),
+            }
+        )
+    if commands:
+        commands.append(
+            {
+                "action": "dispatch",
+                "command": _recovery_dispatch_instruction(),
+            }
+        )
+    if allow_rebind and settle_target is not None:
+        condition = "settle_then_cross_session_rebind"
+    elif allow_rebind:
+        condition = "cross_session_registry_drift"
+    elif settle_target is not None and not mutation_blocked:
+        condition = "current_binding_terminal_settlement"
+    elif observation_unusable:
+        condition = "observation_unusable"
+    elif lock_not_safe or mutation_blocked:
+        condition = "lock_not_safe_to_settle"
+    else:
+        condition = "no_recovery_needed"
+    return {
+        "condition": condition,
+        "worker_id": worker_id,
+        "safe_to_settle": settle_target is not None and not mutation_blocked,
+        "auto_cross_session": False,
+        "cross_session": cross is not None,
+        "lock_not_safe_to_settle": lock_not_safe or mutation_blocked,
+        "observation_unusable": observation_unusable,
+        "commands": commands,
+        "registry_session": str((cross or {}).get("registry_session") or ""),
+        "live_session": str((cross or {}).get("live_session") or ""),
+    }
+
+
+def _print_recovery_guidance(guidance: dict[str, object], *, file=None) -> None:
+    target = sys.stderr if file is None else file
+    print(f"recovery_condition: {guidance.get('condition')}", file=target)
+    print(
+        f"recovery_safe_to_settle: {str(bool(guidance.get('safe_to_settle'))).lower()}",
+        file=target,
+    )
+    print("recovery_auto_cross_session: false", file=target)
+    if guidance.get("cross_session"):
+        print(
+            "recovery_cross_session: "
+            f"{guidance.get('registry_session')} -> {guidance.get('live_session')}",
+            file=target,
+        )
+    if guidance.get("lock_not_safe_to_settle"):
+        print(
+            "recovery_lock_rule: active/nonterminal/unknown target lock is not safe to settle",
+            file=target,
+        )
+    for index, item in enumerate(guidance.get("commands") or [], start=1):
+        if not isinstance(item, dict):
+            continue
+        print(
+            f"recovery_command_{index}_{item.get('action')}: {item.get('command')}",
+            file=target,
+        )
+
+
+def _post_run_settle_terminal_locks(
+    root: Path,
+    backend: str,
+    worker_ids: list[str],
+    locks_payload: dict[str, object] | None = None,
+) -> list[dict[str, object]]:
+    wanted = {str(item) for item in worker_ids if str(item)}
+    if not wanted:
+        return []
+    if locks_payload is not None:
+        payload = locks_payload
+    else:
+        payload, error = _load_locks_payload(root)
+        if error is not None:
+            return [error]
+    assert payload is not None
+    actions: list[dict[str, object]] = []
+    for item in _selected_locks(payload, worker_ids):
+        worker_id = str(item.get("worker_id") or "")
+        truth = item.get("task_truth", {}) if isinstance(item.get("task_truth"), dict) else {}
+        diagnosis = str(item.get("diagnosis") or "")
+        lock_state = str(truth.get("lock_state") or "")
+        protocol_state = str(item.get("protocol_terminal_state") or truth.get("protocol_terminal_state") or "")
+        if diagnosis != "terminal_stale_lock" and lock_state != "stale_terminal_lock":
+            continue
+        if protocol_state not in TERMINAL_PROTOCOL_STATES:
+            continue
+        run_id = str(item.get("run") or truth.get("run_id") or "")
+        task_id = str(item.get("task") or truth.get("task_id") or "")
+        if not run_id or not task_id:
+            actions.append({"action": "settle", "worker_id": worker_id, "returncode": 1, "stderr": "missing run/task"})
+            continue
+        cmd = [
+            str(root / "bin" / "omx_visible_dispatch"),
+            "settle",
+            "--root",
+            str(root),
+            "--backend",
+            backend,
+            "--run",
+            run_id,
+            "--task",
+            task_id,
+            "--allow-terminal-archive",
+        ]
+        result = subprocess.run(
+            cmd,
+            cwd=str(root),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        actions.append(
+            {
+                "action": "settle",
+                "worker_id": worker_id,
+                "run": run_id,
+                "task": task_id,
+                "returncode": int(result.returncode),
+                "stdout": str(result.stdout or ""),
+                "stderr": str(result.stderr or ""),
+            }
+        )
+    return actions
+
+
+def _post_failure_settle_terminal_locks(
+    root: Path,
+    backend: str,
+    worker_ids: list[str],
+    *,
+    timeout: int,
+    interval: int,
+) -> list[dict[str, object]]:
+    wanted = [str(item) for item in worker_ids if str(item)]
+    if not wanted:
+        return []
+    safe_interval = max(1, int(interval))
+    attempts = max(1, (max(0, int(timeout)) // safe_interval) + 1)
+    actions: list[dict[str, object]] = []
+    for attempt in range(attempts):
+        actions.extend(_post_run_settle_terminal_locks(root, backend, wanted))
+        payload, error = _load_locks_payload(root)
+        if error is not None:
+            actions.append(error)
+            break
+        assert payload is not None
+        remaining = _selected_locks(payload, wanted)
+        if not remaining:
+            break
+        if attempt < attempts - 1:
+            time.sleep(safe_interval)
+    return actions
+
+
+def _auto_rebind_candidate_workers(
+    root: Path,
+    requested_workers: list[str],
+    all_production_workers: bool,
+    fanout: int | None,
+) -> list[str]:
+    if requested_workers:
+        return requested_workers
+    try:
+        workers = leader_runtime._dispatchable_workers(root)
+    except Exception:
+        return []
+    worker_ids = [str(worker.get("worker_id") or "") for worker in workers if str(worker.get("worker_id") or "")]
+    if all_production_workers:
+        return worker_ids
+    if fanout is not None:
+        return worker_ids[: max(0, int(fanout))]
+    return worker_ids[:1]
+
+
+def _run_json_command(argv: list[str], root: Path, timeout: int = 120) -> dict[str, object]:
+    proc = subprocess.run(
+        argv,
+        cwd=str(root),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+        check=False,
+    )
+    payload: dict[str, object] = {
+        "argv": argv,
+        "returncode": int(proc.returncode),
+        "stdout": proc.stdout or "",
+        "stderr": proc.stderr or "",
+    }
+    try:
+        parsed = json.loads(proc.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        payload["json_error"] = str(exc)
+        payload["json"] = {}
+    else:
+        payload["json"] = parsed if isinstance(parsed, dict) else {}
+    return payload
+
+
+def _langgraph_runtime_preflight(
+    root: Path,
+    *,
+    entrypoint: str | Path | None = None,
+    runner=None,
+) -> dict[str, object]:
+    runner = runner or subprocess.run
+    runtime_path = Path(entrypoint) if entrypoint is not None else root / "bin" / "omx_langgraph_control_plane"
+    argv = [str(runtime_path), "--help"]
+    try:
+        proc = runner(
+            argv,
+            cwd=str(root),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {
+            "ok": False,
+            "status": "runtime_unavailable",
+            "dependency": "langgraph",
+            "runtime_path": str(runtime_path),
+            "diagnostic": str(exc),
+            "safe_fallback": "omx_visible_dispatch run-one",
+        }
+    if int(proc.returncode) == 0:
+        return {
+            "ok": True,
+            "status": "available",
+            "dependency": "langgraph",
+            "runtime_path": str(runtime_path),
+            "diagnostic": "",
+            "safe_fallback": "",
+        }
+    diagnostic = str(proc.stderr or proc.stdout or "").strip()
+    status = (
+        "runtime_dependency_unavailable"
+        if "No module named 'langgraph'" in diagnostic
+        else "runtime_unavailable"
+    )
+    return {
+        "ok": False,
+        "status": status,
+        "dependency": "langgraph",
+        "runtime_path": str(runtime_path),
+        "diagnostic": diagnostic,
+        "safe_fallback": "omx_visible_dispatch run-one",
+    }
+
+
+def _langgraph_runtime_blocker(runtime_preflight: dict[str, object], workers: list[object]) -> dict[str, object]:
+    return {
+        "type": "langgraph_runtime_preflight_failed",
+        "status": runtime_preflight.get("status"),
+        "dependency": runtime_preflight.get("dependency"),
+        "runtime_path": runtime_preflight.get("runtime_path"),
+        "diagnostic": runtime_preflight.get("diagnostic"),
+        "fallback": {
+            "route": "dispatch",
+            "command": runtime_preflight.get("safe_fallback"),
+            "workers": list(workers),
+        },
+    }
+
+
+def auto_rebind_pane_drift(
+    root: Path,
+    *,
+    backend: str,
+    requested_workers: list[str],
+    all_production_workers: bool,
+    fanout: int | None,
+) -> list[dict[str, object]]:
+    if backend != "tmux-reference":
+        return []
+    caller_pane = str(os.environ.get("TMUX_PANE") or "").strip()
+    if not re.fullmatch(r"%[0-9]+", caller_pane):
+        return [{"action": "skipped", "reason": "caller pane target unavailable"}]
+    workers = _auto_rebind_candidate_workers(root, requested_workers, all_production_workers, fanout)
+    if not workers:
+        return []
+    locks_payload, lock_error = _load_locks_payload(root)
+    if lock_error is not None:
+        return [{"action": "skipped", "reason": "lock state unavailable", "error": lock_error}]
+    assert locks_payload is not None
+    locks_payload = {"locks": _selected_locks(locks_payload, workers)}
+    actions: list[dict[str, object]] = []
+    for worker_id in workers:
+        check = _run_json_command(
+            [
+                str(root / "bin" / "omx_visible_rebind"),
+                "check",
+                "--root",
+                str(root),
+                "--worker",
+                worker_id,
+                "--runtime-backend",
+                backend,
+                "--json",
+            ],
+            root,
+        )
+        check_payload = check.get("json", {}) if isinstance(check.get("json"), dict) else {}
+        decision = evaluate_auto_rebind_decision(check_payload, locks_payload, backend=backend)
+        if not decision.get("allowed"):
+            continue
+        if str(check_payload.get("status") or "") in {
+            "binding_lease_rebind_available",
+            "registry_identity_mismatch_rebind_available",
+        }:
+            continue
+        port = int(decision.get("port") or 0)
+        result = subprocess.run(
+            [
+                str(root / "bin" / "omx_visible_rebind"),
+                "rebind",
+                "--root",
+                str(root),
+                "--worker",
+                worker_id,
+                "--port",
+                str(port),
+                "--runtime-backend",
+                backend,
+                "--allow-rebind",
+                "--json",
+            ],
+            cwd=str(root),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if int(result.returncode) != 0:
+            raise LeaderOrchestrateError(
+                f"auto rebind pane drift failed for {worker_id}: {result.stderr or result.stdout}"
+            )
+        actions.append(
+            {
+                "action": "rebound",
+                "worker_id": worker_id,
+                "port": port,
+                "registry_pane_id": decision.get("registry_pane_id", ""),
+                "live_pane_id": decision.get("live_pane_id", ""),
+            }
+        )
+    return actions
+
+
+def _repair_binding_under_fresh_grant(
+    root: Path,
+    bridge: dict[str, object],
+    *,
+    backend: str,
+    bridge_args: argparse.Namespace,
+) -> dict[str, object]:
+    """Repair the explicit bridge worker's binding under its fresh grant.
+
+    Runs after fresh classification and before plan_payload so an expired
+    lease or a drifted pane/identity no longer rejects dispatch. The repair
+    reuses the existing check/decision/rebind sequence inside the grant's
+    ledger mutation boundary and never consumes the grant; run-one alone
+    consumes it.
+    """
+    worker_id = str(bridge["worker_id"])
+    worker_record = next(
+        (record for record in load_visible_workers(root)
+         if str(record.get("worker_id") or "") == worker_id),
+        {},
+    )
+    codex_worker = worker_record.get("backend") == "codex_tui"
+    task_id = str(bridge["task_id"])
+    attempt_id = str(bridge["attempt_id"])
+    authorization_id = str(bridge["authorization_id"])
+    check = _run_json_command(
+        [
+            str(root / "bin" / "omx_visible_rebind"),
+            "check",
+            "--root",
+            str(root),
+            "--worker",
+            worker_id,
+            "--runtime-backend",
+            backend,
+            "--json",
+        ],
+        root,
+    )
+    if type(check.get("returncode")) is not int:
+        raise LeaderOrchestrateError(
+            f"rebind check for {worker_id} has a non-integer returncode"
+        )
+    check_rc = check["returncode"]
+    if not isinstance(check.get("json"), dict) or not check["json"]:
+        raise LeaderOrchestrateError(
+            f"rebind check for {worker_id} returned no schema; refusing to "
+            "treat it as healthy or repairable"
+        )
+    check_payload = check["json"]
+    if check_rc != 0:
+        failure_error = _rebind_subcommand_failure_error(
+            f"rebind check for {worker_id}",
+            check_payload,
+            stderr=str(check.get("stderr") or ""),
+        )
+        if failure_error is not None:
+            raise failure_error
+    if str(check_payload.get("root") or "") != str(root):
+        raise LeaderOrchestrateError(
+            f"rebind check for {worker_id} observed a different root"
+        )
+    if str(check_payload.get("worker_id") or "") != worker_id:
+        raise LeaderOrchestrateError(
+            f"rebind check for {worker_id} observed the wrong worker"
+        )
+    if type(check_payload.get("schema_version")) is not int or check_payload["schema_version"] != 1:
+        raise LeaderOrchestrateError(
+            f"rebind check for {worker_id} has an unsupported schema_version"
+        )
+    check_registry = check_payload.get("registry")
+    check_live = check_payload.get("live")
+    if not isinstance(check_registry, dict) or not isinstance(check_live, dict):
+        raise LeaderOrchestrateError(
+            f"rebind check for {worker_id} is missing registry/live objects"
+        )
+    if not isinstance(check_payload.get("ok"), bool) or not isinstance(
+        check_payload.get("ready_for_dispatch"), bool
+    ):
+        raise LeaderOrchestrateError(
+            f"rebind check for {worker_id} has non-boolean ok/ready_for_dispatch"
+        )
+    live_checks = check_live.get("checks")
+    if not isinstance(live_checks, dict):
+        raise LeaderOrchestrateError(
+            f"rebind check for {worker_id} is missing the live checks object"
+        )
+    if (
+        str(check_payload.get("status") or "") == "port_not_live"
+        and live_checks.get("port_live") is False
+    ):
+        # #782: the emitter classifies port_not_live before identity, so an
+        # offline target's empty pane observations must not mask it. Rebind
+        # cannot repair an instance that is not running; the gate stays and
+        # only the diagnostic priority changes. The typed port_live=False
+        # confirmation is required so a contradictory or malformed check
+        # stays unusable instead of being described as confirmed offline.
+        raise LeaderOrchestrateError(
+            f"rebind check for {worker_id} reports port_not_live: the target "
+            f"instance on port {check_registry.get('port')} is offline, so "
+            "dispatch is refused. Recovery: restore the target instance so "
+            "its port answers again, then retry the same dispatch; do not "
+            "rebind an instance that is not live."
+        )
+    check_live_session = check_live.get("tmux_session")
+    check_live_window = check_live.get("tmux_window")
+    check_registry_session = check_registry.get("tmux_session")
+    check_registry_window = check_registry.get("tmux_window")
+    if (
+        not isinstance(check_live_session, str)
+        or not check_live_session
+        or not isinstance(check_live_window, str)
+        or not check_live_window
+        or not isinstance(check_registry_session, str)
+        or not check_registry_session
+        or not isinstance(check_registry_window, str)
+        or not check_registry_window
+    ):
+        raise LeaderOrchestrateError(
+            f"rebind check for {worker_id} has missing session/window identity"
+        )
+    if check_payload.get("binding_confidence") != "strong":
+        raise LeaderOrchestrateError(
+            f"rebind check for {worker_id} is not a strong binding"
+        )
+    if check_live.get("binding_confidence") != "strong":
+        raise LeaderOrchestrateError(
+            f"rebind check for {worker_id} has non-strong live binding confidence"
+        )
+    registry_port = check_registry.get("port")
+    live_port = check_live.get("port")
+    if not codex_worker and (
+        type(registry_port) is not int or type(live_port) is not int
+    ):
+        raise LeaderOrchestrateError(
+            f"rebind check for {worker_id} has non-integer ports"
+        )
+    if not codex_worker and (
+        registry_port <= 0 or live_port <= 0 or registry_port != live_port
+    ):
+        raise LeaderOrchestrateError(
+            f"rebind check for {worker_id} has missing or mismatched ports"
+        )
+    pane_pattern = re.compile(r"%[0-9]+")
+    check_registry_pane = str(check_registry.get("pane_id") or "")
+    check_live_pane = str(check_live.get("pane_id") or "")
+    if not pane_pattern.fullmatch(check_registry_pane) or not pane_pattern.fullmatch(
+        check_live_pane
+    ):
+        raise LeaderOrchestrateError(
+            f"rebind check for {worker_id} has missing or malformed pane ids"
+        )
+    if codex_worker:
+        if (
+            check_registry_pane != check_live_pane
+            or check_live_pane != str(worker_record.get("pane_id") or "")
+            or check_live.get("discovery_path") != "codex_appserver_binding"
+            or any(live_checks.get(key) is not True for key in (
+                "pane_pid_matches_registry", "codex_process_in_pane_tree",
+                "codex_thread_read_ok", "codex_binding_verified",
+            ))
+        ):
+            raise LeaderOrchestrateError(
+                f"rebind check for {worker_id} fails native current-window checks"
+            )
+    elif (
+        live_checks.get("opencode_pid_in_current_window_pane_tree") is not True
+        or live_checks.get("port_live") is not True
+        or live_checks.get("required_tui_present") is not True
+    ):
+        raise LeaderOrchestrateError(
+            f"rebind check for {worker_id} fails live current-window checks"
+        )
+    check_status = str(check_payload.get("status") or "")
+    session_mismatch = bool(
+        check_registry_session
+        and check_live_session
+        and check_registry_session != check_live_session
+    )
+    window_mismatch = bool(
+        check_registry_window
+        and check_live_window
+        and check_registry_window != check_live_window
+    )
+    cross = _cross_session_facts(
+        check_payload, root=root, worker_id=worker_id, check_rc=check_rc
+    )
+    if cross is not None or check_status == CROSS_SESSION_REBIND_STATUS:
+        payload, error = _load_locks_payload(root, worker_id=worker_id)
+        guidance = build_failure_recovery_guidance(
+            root=root,
+            backend=backend,
+            worker_id=worker_id,
+            check_payload=check_payload,
+            check_rc=check_rc,
+            locks_payload=payload,
+            locks_error=error,
+        )
+        raise RecoveryGuidanceError(
+            f"rebind check for {worker_id} reports cross-session registry drift; "
+            "explicit authorized rebind required"
+            if cross is not None
+            else (
+                f"rebind check for {worker_id} has unusable cross-session "
+                "observations"
+            ),
+            guidance,
+        )
+    if session_mismatch or window_mismatch:
+        raise LeaderOrchestrateError(
+            f"rebind check for {worker_id} has unusable session/window observations"
+        )
+    if check_rc == 0 and check_status == "current_binding_ok":
+        if check_payload.get("ok") is not True:
+            raise RecoveryGuidanceError(
+                f"rebind check for {worker_id} has unusable current-binding "
+                "observations",
+                build_failure_recovery_guidance(
+                    root=root,
+                    backend=backend,
+                    worker_id=worker_id,
+                    locks_error={"stderr": "contradictory current_binding_ok"},
+                ),
+            )
+        if check_payload.get("ready_for_dispatch") is True:
+            return {"action": "skipped", "worker_id": worker_id, "reason": "binding already current"}
+        payload, error = _load_locks_payload(root, worker_id=worker_id)
+        guidance = build_failure_recovery_guidance(
+            root=root,
+            backend=backend,
+            worker_id=worker_id,
+            locks_payload=payload,
+            locks_error=error,
+        )
+        raise RecoveryGuidanceError(
+            f"rebind check for {worker_id} is a current binding that is not "
+            "ready for dispatch; diagnose the target lock",
+            guidance,
+        )
+    if check_rc != 1 or check_status not in {
+        "rebind_available",
+        "stale_pane_rebind_available",
+        "binding_lease_rebind_available",
+        "registry_identity_mismatch_rebind_available",
+    }:
+        raise LeaderOrchestrateError(
+            f"rebind check for {worker_id} is not a documented repairable "
+            f"result (rc={check_rc}, status={check_payload.get('status')!r})"
+        )
+    if codex_worker:
+        raise LeaderOrchestrateError(
+            f"codex binding for {worker_id} requires explicit registration; "
+            "automatic port-based rebind is unavailable"
+        )
+    if check_payload.get("target_worker_rebind_available") is not True:
+        raise LeaderOrchestrateError(
+            f"rebind check for {worker_id} does not mark the target worker "
+            "rebind as available"
+        )
+    payload, error = _load_locks_payload(root, worker_id=worker_id)
+    if error is not None or not isinstance(payload, dict):
+        return {"action": "skipped", "worker_id": worker_id, "reason": "lock state unavailable"}
+    scoped_locks = {"locks": _selected_locks(payload, [worker_id])}
+    decision = evaluate_auto_rebind_decision(check_payload, scoped_locks, backend=backend)
+    if not decision.get("allowed"):
+        return {"action": "skipped", "worker_id": worker_id, "reason": str(decision.get("reason"))}
+    port = int(decision.get("port") or 0)
+    try:
+        task_contract = json.loads(str(bridge["task_contract_json"]))
+        capability = dict(task_contract.get("operation_capability") or {})
+        operation_contract = derive_operation_contract(
+            "worker_dispatch", task_contract
+        )
+        try:
+            resolve_session_actions(
+                list(getattr(bridge_args, "session_action", []) or []),
+                [worker_id],
+                reason=str(getattr(bridge_args, "session_action_reason", "") or ""),
+                rotation_reason=str(getattr(bridge_args, "rotation_reason", "") or ""),
+                rehydration_packet_type=str(
+                    getattr(bridge_args, "rehydration_packet_type", "") or ""
+                ),
+                required=True,
+            )
+        except SessionActionError as exc:
+            raise LeaderOrchestrateError(str(exc)) from exc
+        ledger = external_harness_authorization_ledger(root, task_id, attempt_id)
+        with ledger.mutation_boundary(
+            authorization_id,
+            expected_boundary=int(bridge["ledger_sequence"]),
+        ) as durable_capability:
+            if _canonical_json_hash(dict(durable_capability)) != _canonical_json_hash(capability):
+                raise OperationAuthorizationError("capability does not match ledger")
+            if str(durable_capability.get("contract_hash") or "") != str(capability.get("contract_hash") or ""):
+                raise OperationAuthorizationError("dispatch contract hash mismatch")
+            validate_operation_capability(
+                durable_capability,
+                operation_kind="worker_dispatch",
+                target_scope={"kind": "worker", "id": worker_id},
+                required_mutation_gates=list(operation_contract["required_mutation_gates"]),
+                task_id=task_id,
+                attempt_id=attempt_id,
+            )
+            validate_mutation_gate_union(
+                list(operation_contract["required_mutation_gates"]),
+                [
+                    "dispatch_authorization",
+                    "target_worker_lock",
+                    "task_directory_write",
+                    "worker_binding",
+                    "worker_transport",
+                    "session_rotation_authorization",
+                ],
+            )
+            settle_actions = _post_run_settle_terminal_locks(
+                root, backend, [worker_id], locks_payload=scoped_locks
+            )
+            if any(
+                int(item.get("returncode", 1)) != 0
+                for item in settle_actions
+                if item.get("action") == "settle"
+            ):
+                raise LeaderOrchestrateError(
+                    f"terminal lock settle failed for {worker_id} inside the "
+                    "authorization boundary"
+                )
+            if any(item.get("action") == "settle" for item in settle_actions):
+                payload, error = _load_locks_payload(root, worker_id=worker_id)
+                if error is not None or not isinstance(payload, dict):
+                    raise LeaderOrchestrateError(
+                        f"lock state unavailable for {worker_id} after terminal settle"
+                    )
+                scoped_locks = {"locks": _selected_locks(payload, [worker_id])}
+                decision = evaluate_auto_rebind_decision(
+                    check_payload, scoped_locks, backend=backend
+                )
+                if not decision.get("allowed"):
+                    raise LeaderOrchestrateError(
+                        f"worker {worker_id} is no longer an eligible repair "
+                        "target after terminal settle"
+                    )
+                port = int(decision.get("port") or 0)
+            result = subprocess.run(
+                [
+                    str(root / "bin" / "omx_visible_rebind"),
+                    "rebind",
+                    "--root",
+                    str(root),
+                    "--worker",
+                    worker_id,
+                    "--port",
+                    str(port),
+                    "--runtime-backend",
+                    backend,
+                    "--allow-rebind",
+                    "--json",
+                ],
+                cwd=str(root),
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+    except OperationAuthorizationError as exc:
+        raise LeaderOrchestrateError(str(exc)) from exc
+    if int(result.returncode) != 0:
+        message = (
+            f"binding repair rebind failed for {worker_id}: "
+            f"{result.stderr or result.stdout}"
+        )
+        if _rebind_lock_refusal(result.stdout or ""):
+            raise RecoveryGuidanceError(message, None)
+        raise LeaderOrchestrateError(message)
+    if not isinstance(result.stdout, str) or not result.stdout:
+        raise LeaderOrchestrateError(
+            f"binding repair rebind output for {worker_id} is empty"
+        )
+    try:
+        repaired = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise LeaderOrchestrateError(
+            f"binding repair rebind output for {worker_id} is not valid JSON: {exc}"
+        ) from exc
+    if not isinstance(repaired, dict):
+        raise LeaderOrchestrateError(
+            f"binding repair rebind output for {worker_id} is not a JSON object"
+        )
+    if type(repaired.get("schema_version")) is not int or repaired["schema_version"] != 1:
+        raise LeaderOrchestrateError(
+            f"binding repair rebind output for {worker_id} has an unsupported schema_version"
+        )
+    if str(repaired.get("root") or "") != str(root):
+        raise LeaderOrchestrateError(
+            f"binding repair rebind output for {worker_id} observed a different root"
+        )
+    post_check = repaired.get("post_rebind_check")
+    if not isinstance(post_check, dict):
+        raise LeaderOrchestrateError(
+            f"binding repair rebind output for {worker_id} is missing the "
+            "post_rebind_check object"
+        )
+    if str(post_check.get("root") or "") != str(root):
+        raise LeaderOrchestrateError(
+            f"binding repair postcheck for {worker_id} observed a different root"
+        )
+    if str(post_check.get("worker_id") or "") != worker_id:
+        raise LeaderOrchestrateError(
+            f"binding repair postcheck for {worker_id} observed the wrong worker"
+        )
+    if type(post_check.get("schema_version")) is not int or post_check["schema_version"] != 1:
+        raise LeaderOrchestrateError(
+            f"binding repair postcheck for {worker_id} has an unsupported schema_version"
+        )
+    post_registry = post_check.get("registry")
+    if not isinstance(post_registry, dict):
+        raise LeaderOrchestrateError(
+            f"binding repair postcheck for {worker_id} is missing the registry observation"
+        )
+    if (
+        post_check.get("ok") is not True
+        or post_check.get("ready_for_dispatch") is not True
+        or str(post_check.get("status") or "") != "current_binding_ok"
+    ):
+        raise LeaderOrchestrateError(
+            f"binding repair postcheck for {worker_id} is not a healthy "
+            "current-binding result"
+        )
+    repaired_port = repaired.get("port")
+    post_port = post_registry.get("port")
+    if type(repaired_port) is not int or type(post_port) is not int:
+        raise LeaderOrchestrateError(
+            f"binding repair rebind output for {worker_id} has non-integer ports"
+        )
+    repaired_transaction = repaired.get("binding_transaction_id")
+    repaired_lease = repaired.get("binding_lease_id")
+    repaired_generation = repaired.get("binding_generation")
+    post_generation = post_registry.get("binding_generation")
+    if (
+        str(repaired.get("worker_id") or "") != worker_id
+        or repaired_port <= 0
+        or repaired_port != port
+        or str(repaired.get("pane_id") or "") != str(decision.get("live_pane_id") or "")
+        or not isinstance(repaired_transaction, str)
+        or not repaired_transaction
+        or post_registry.get("binding_transaction_id") != repaired_transaction
+        or str(post_registry.get("pane_id") or "") != str(repaired.get("pane_id") or "")
+        or post_port != repaired_port
+        or not isinstance(repaired_lease, str)
+        or not repaired_lease
+        or post_registry.get("binding_lease_id") != repaired_lease
+        or type(repaired_generation) is not int
+        or repaired_generation < 0
+        or type(post_generation) is not int
+        or post_generation != repaired_generation
+    ):
+        raise LeaderOrchestrateError(
+            f"binding repair rebind output is not the required success result for {worker_id}"
+        )
+    return {
+        "action": "rebound",
+        "worker_id": worker_id,
+        "port": port,
+        "registry_pane_id": str(decision.get("registry_pane_id") or ""),
+        "live_pane_id": str(decision.get("live_pane_id") or ""),
+    }
+
+
+def _stabilize_run_payload(args: argparse.Namespace, payload: dict[str, object]) -> dict[str, object]:
+    if payload.get("route") != "langgraph":
+        return payload
+    if parse_workers(args.worker) or bool(args.all_production_workers):
+        return payload
+    root = root_path(args.root)
+    worker_ids = [str(item) for item in payload.get("workers", [])]
+    if _workers_still_ready(root, worker_ids):
+        return payload
+    reroute_args = copy.deepcopy(args)
+    try:
+        next_payload = plan_payload(reroute_args)
+        next_workers = [str(item) for item in next_payload.get("workers", [])]
+        if next_workers and _workers_still_ready(root, next_workers):
+            return next_payload
+    except LeaderOrchestrateError:
+        pass
+    original_fanout = int(args.fanout) if args.fanout else len(worker_ids)
+    while original_fanout > 1:
+        original_fanout -= 1
+        reroute_args = copy.deepcopy(args)
+        reroute_args.fanout = original_fanout
+        try:
+            next_payload = plan_payload(reroute_args)
+        except LeaderOrchestrateError:
+            continue
+        next_workers = [str(item) for item in next_payload.get("workers", [])]
+        if next_workers and _workers_still_ready(root, next_workers):
+            return next_payload
+    reroute_args = copy.deepcopy(args)
+    reroute_args.fanout = None
+    return plan_payload(reroute_args)
+
+
+def command_plan(args: argparse.Namespace) -> int:
+    payload = plan_payload(args)
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
+    else:
+        print(f"route: {payload['route']}")
+        print(f"backend: {payload['backend']}")
+        print(f"workers: {', '.join(payload['workers'])}")
+        print(f"reason: {payload['reason']}")
+        if payload.get("prompt_delivery_mode"):
+            print(f"prompt_delivery_mode: {payload['prompt_delivery_mode']}")
+        _print_lane_assignments(payload)
+        if payload["task_contract_workers"]:
+            print(
+                "task_contract_workers: "
+                + ", ".join(payload["task_contract_workers"])
+            )
+        print(f"argv: {' '.join(payload['argv'])}")
+    return 0
+
+
+
+def _operator_initial_server_canary_selector(
+    args: argparse.Namespace,
+) -> dict[str, str] | None:
+    """Load the optional public initial-dispatch selector from one JSON file.
+
+    The file must contain exactly one ``opencode_server_prompt_async_canary``
+    selector object: an absolute pinned ``candidate_manifest_path``, the
+    matching sha256 ``candidate_bundle_digest``, and either an existing
+    ``ses_`` session id or ``session_mode: "create"``. Validation reuses the
+    fail-closed extractor; any problem raises before a grant is minted.
+    Absent option returns None and keeps ordinary TUI dispatch unchanged.
+    """
+    raw = str(getattr(args, "initial_dispatch_selector_json", "") or "").strip()
+    if not raw:
+        return None
+    path = Path(raw).expanduser()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise LeaderOrchestrateError(
+            f"--initial-dispatch-selector-json is not readable: {exc}"
+        ) from exc
+    except json.JSONDecodeError as exc:
+        raise LeaderOrchestrateError(
+            f"--initial-dispatch-selector-json is not valid JSON: {exc}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise LeaderOrchestrateError(
+            "--initial-dispatch-selector-json must contain one JSON object"
+        )
+    try:
+        return extract_opencode_server_prompt_async_canary(
+            {"opencode_server_prompt_async_canary": payload}
+        )
+    except OperationAuthorizationError as exc:
+        raise LeaderOrchestrateError(
+            f"invalid --initial-dispatch-selector-json: {exc}"
+        ) from exc
+
+
+def _authorized_live_draft_check(args: argparse.Namespace) -> dict[str, object]:
+    from visible_agent_orchestrator.draft_check import (
+        DraftCheckError,
+        validate_draft_check_contract,
+    )
+
+    raw_root = str(getattr(args, "draft_check_evidence_root", "") or "").strip()
+    if not raw_root:
+        raise LeaderOrchestrateError(
+            "--draft-check-jev-live requires --draft-check-evidence-root"
+        )
+    try:
+        selected = validate_draft_check_contract(
+            {
+                "draft_check": {
+                    "enabled": True,
+                    "jev_live": True,
+                    "evidence_root": raw_root,
+                }
+            }
+        )
+    except DraftCheckError as exc:
+        raise LeaderOrchestrateError(str(exc)) from exc
+    assert isinstance(selected, dict)
+    return selected
+
+
+def _operator_base_task_contract(
+    args: argparse.Namespace,
+    worker_id: str,
+) -> dict[str, object]:
+    """Exact base contract bound into the grant for this worker."""
+    title = leader_runtime.render_worker_template(str(args.title), worker_id)
+    body = leader_runtime.render_worker_template(str(args.body), worker_id)
+    title_body_hash = "sha256:" + hashlib.sha256(
+        json.dumps(
+            {"title": title, "body": body},
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    contract: dict[str, object] = {
+        "worker_id": worker_id,
+        "title_body_hash": title_body_hash,
+    }
+    if bool(getattr(args, "allow_visible_full_prompt", False)):
+        contract["allow_visible_full_prompt"] = True
+    raw_actions = [
+        str(value).strip()
+        for value in list(getattr(args, "session_action", []) or [])
+        if str(value).strip()
+    ]
+    if len(raw_actions) == 1 and "=" not in raw_actions[0]:
+        contract["session_action"] = raw_actions[0]
+    else:
+        for value in raw_actions:
+            if "=" not in value:
+                continue
+            mapped_worker, mapped_action = (part.strip() for part in value.split("=", 1))
+            if mapped_worker == worker_id and mapped_action:
+                contract["session_action"] = mapped_action
+                break
+    reason = str(getattr(args, "session_action_reason", "") or "").strip()
+    if reason:
+        contract["session_action_reason"] = reason
+    rotation_reason = str(getattr(args, "rotation_reason", "") or "").strip()
+    if rotation_reason:
+        contract["rotation_reason"] = rotation_reason
+    packet_type = str(getattr(args, "rehydration_packet_type", "") or "").strip()
+    if packet_type:
+        contract["rehydration_packet_type"] = packet_type
+    selector = _operator_initial_server_canary_selector(args)
+    if selector is not None:
+        contract["opencode_server_prompt_async_canary"] = selector
+    if bool(getattr(args, "draft_check_jev_live", False)):
+        contract["draft_check"] = _authorized_live_draft_check(args)
+    elif bool(getattr(args, "draft_check", False)):
+        contract["draft_check"] = {"enabled": True}
+    handoff_state = getattr(args, "predecessor_handoff_state", None)
+    if handoff_state is None:
+        handoff_file = str(
+            getattr(args, "predecessor_handoff_file", "") or ""
+        ).strip()
+        if handoff_file:
+            raise LeaderOrchestrateError(
+                "predecessor handoff state missing; validate the handoff "
+                "before building the task contract"
+            )
+    if isinstance(handoff_state, dict) and handoff_state.get(
+        "handoff_sha256"
+    ):
+        record = handoff_state.get("record")
+        predecessor = (
+            record.get("predecessor")
+            if isinstance(record, dict)
+            and isinstance(record.get("predecessor"), dict)
+            else {}
+        )
+        contract["predecessor_handoff"] = {
+            "handoff_sha256": str(handoff_state["handoff_sha256"]),
+            "predecessor_task": str(predecessor.get("task") or ""),
+            "predecessor_run": str(predecessor.get("run") or ""),
+            "successor_task": str(getattr(args, "task_id", "") or ""),
+            "successor_attempt": str(getattr(args, "attempt_id", "") or ""),
+            "worker_id": worker_id,
+        }
+    return contract
+
+
+def _operator_expected_contract_hash(
+    args: argparse.Namespace,
+    *,
+    worker_id: str,
+    task_id: str,
+    attempt_id: str,
+    prepared_base: dict[str, object] | None = None,
+) -> str:
+    """Canonical contract hash of the complete prepared base contract."""
+    base_contract = (
+        dict(prepared_base)
+        if prepared_base is not None
+        else _operator_base_task_contract(args, worker_id)
+    )
+    operation_contract = derive_operation_contract(
+        "worker_dispatch",
+        base_contract,
+    )
+    return _external_harness_derived_contract_hash(
+        task_contract=base_contract,
+        operation_contract=operation_contract,
+        worker_id=worker_id,
+        task_id=task_id,
+        attempt_id=attempt_id,
+    )
+
+
+def _classify_operator_dispatch_bridge(
+    args: argparse.Namespace,
+    root: Path,
+) -> dict[str, object] | None:
+    """Read-only fresh/replay/conflict classification before any planning.
+
+    The bridge is consume-only: the trusted host prepares the grant through
+    the operation_authorization library (see
+    docs/framework-team/VISIBLE_DISPATCH_README.md) and the operator passes
+    the emitted prepared task contract as --task-contract-json. This runs
+    before plan_payload, worker dispatchability evaluation,
+    recommended_auto_recover_workers, settle-latest, auto-rebind, and the
+    dispatch subprocess. It never mutates the ledger and never reconciles an
+    active grant. Returns None when the bridge does not apply.
+    """
+    if not bool(getattr(args, "allow_real", False)):
+        return None
+    raw = str(getattr(args, "task_contract_json", "") or "").strip()
+    if not raw:
+        return {"classification": "missing"}
+    workers = parse_workers(args.worker)
+    if len(workers) != 1:
+        raise LeaderOrchestrateError(
+            "real operator dispatch requires exactly one explicit --worker; "
+            "fresh authorization never uses a mutable default worker"
+        )
+    worker_id = str(workers[0])
+    try:
+        contract = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise LeaderOrchestrateError(
+            f"invalid --task-contract-json: {exc}"
+        ) from exc
+    if not isinstance(contract, dict):
+        raise LeaderOrchestrateError(
+            "--task-contract-json must be a JSON object"
+        )
+    capability = contract.get("operation_capability")
+    if not isinstance(capability, dict):
+        raise LeaderOrchestrateError(
+            "prepared task contract must embed operation_capability"
+        )
+    task_id = str(capability.get("task_id") or "")
+    attempt_id = str(capability.get("attempt_id") or "")
+    authorization_id = str(capability.get("authorization_id") or "")
+    if not task_id or not attempt_id or not authorization_id:
+        raise LeaderOrchestrateError(
+            "operation_capability must carry task_id, attempt_id, and "
+            "authorization_id"
+        )
+    bridge: dict[str, object] = {
+        "classification": "conflict",
+        "authorization_id": authorization_id,
+        "task_id": task_id,
+        "attempt_id": attempt_id,
+        "worker_id": worker_id,
+        "task_contract_json": raw,
+    }
+
+    def conflict(reason: str) -> dict[str, object]:
+        bridge["replay_conflict"] = reason
+        return bridge
+
+    scope = capability.get("scope")
+    scope = dict(scope) if isinstance(scope, dict) else {}
+    if str(scope.get("kind") or "") != "worker" or str(
+        scope.get("id") or ""
+    ) != worker_id:
+        return conflict(
+            "capability scope does not match the explicit --worker; the "
+            "existing grant is left untouched"
+        )
+    base_contract = {
+        str(key): value
+        for key, value in contract.items()
+        if key != "operation_capability"
+    }
+    ordinary = _operator_base_task_contract(args, worker_id)
+    extra_keys = sorted(set(base_contract) - set(ordinary))
+    if extra_keys and extra_keys != ["opencode_server_prompt_async_canary"]:
+        return conflict(
+            "prepared task contract does not match the current worker and "
+            "rendered title/body; the existing grant is left untouched"
+        )
+    ordinary_view = {
+        key: value
+        for key, value in base_contract.items()
+        if key != "opencode_server_prompt_async_canary"
+    }
+    if "opencode_server_prompt_async_canary" in ordinary:
+        if (
+            base_contract.get("opencode_server_prompt_async_canary")
+            != ordinary["opencode_server_prompt_async_canary"]
+        ):
+            return conflict(
+                "prepared task contract selector does not match the current "
+                "--initial-dispatch-selector-json input; the existing grant "
+                "is left untouched"
+            )
+        ordinary = {
+            key: value
+            for key, value in ordinary.items()
+            if key != "opencode_server_prompt_async_canary"
+        }
+    if ordinary_view != ordinary:
+        return conflict(
+            "prepared task contract does not match the current worker and "
+            "rendered title/body; the existing grant is left untouched"
+        )
+    if "opencode_server_prompt_async_canary" in base_contract:
+        try:
+            extract_opencode_server_prompt_async_canary(base_contract)
+        except OperationAuthorizationError as exc:
+            return conflict(str(exc))
+    expected_hash = _operator_expected_contract_hash(
+        args,
+        worker_id=worker_id,
+        task_id=task_id,
+        attempt_id=attempt_id,
+        prepared_base=base_contract,
+    )
+    if str(capability.get("contract_hash") or "") != expected_hash:
+        return conflict(
+            "capability contract hash does not match the current "
+            "invocation; the existing grant is left untouched"
+        )
+    try:
+        ledger = external_harness_authorization_ledger(root, task_id, attempt_id)
+        existing = next(
+            (
+                record
+                for record in ledger.records()
+                if record.get("authorization_id") == authorization_id
+            ),
+            None,
+        )
+    except OperationAuthorizationError as exc:
+        raise LeaderOrchestrateError(str(exc)) from exc
+    if existing is None:
+        return conflict(
+            "no host-prepared grant exists for this capability; the ledger "
+            "is left untouched"
+        )
+    bridge["ledger_sequence"] = int(existing["sequence"])
+    durable = existing.get("capability")
+    if not isinstance(durable, dict) or _canonical_json_hash(
+        dict(durable)
+    ) != _canonical_json_hash(dict(capability)):
+        return conflict(
+            "capability does not match the ledger record; the ledger is "
+            "left untouched"
+        )
+    if ledger.active_authorization(authorization_id) is None:
+        bridge["classification"] = "replay"
+        return bridge
+    bridge["classification"] = "fresh"
+    return bridge
+
+
+def _inactive_grant_consumption_state(ledger: object, authorization_id: str) -> str:
+    records = getattr(ledger, "records", lambda: [])()
+    last_revoke: dict[str, object] | None = None
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        if (
+            record.get("decision") == "revoke"
+            and record.get("revokes_authorization_id") == authorization_id
+        ):
+            last_revoke = record
+    if last_revoke is None:
+        return "unknown"
+    provenance = str(last_revoke.get("provenance") or "")
+    if provenance.endswith("-consume") or provenance == "dispatch-applied-consume":
+        return "consumed"
+    return "revoked"
+
+
+def _parse_dispatch_identity(stdout: str) -> dict[str, str]:
+    identity = {"run_id": "", "task_id": "", "task_dir": ""}
+    for line in str(stdout or "").splitlines():
+        stripped = line.strip()
+        for key in identity:
+            prefix = f"{key}:"
+            if stripped.startswith(prefix):
+                identity[key] = stripped.split(":", 1)[1].strip()
+    return identity
+
+
+def _parse_run_preflight(stdout: str) -> dict[str, object]:
+    for line in str(stdout or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("run_preflight_json:"):
+            raw = stripped.split(":", 1)[1].strip()
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                break
+            if isinstance(parsed, dict):
+                return parsed
+    return {}
+
+
+def _unknown_result_receipt() -> dict[str, object]:
+    return {
+        "schema": "visible-task-result-receipt/v1",
+        "run_id": "",
+        "task_id": "",
+        "task_dir": "",
+        "report_path": "",
+        "protocol_terminal_state": "unknown",
+        "protocol_complete": False,
+        "semantic_success": "unknown",
+        "acceptance_result": "unknown",
+        "lock_state": "unknown",
+        "duration_seconds": None,
+        "duration_status": "unknown",
+        "unknown_fields": [
+            "run_id",
+            "task_id",
+            "task_dir",
+            "protocol_terminal_state",
+            "semantic_success",
+            "acceptance_result",
+            "lock_state",
+            "duration_seconds",
+        ],
+    }
+
+
+def _compact_grant(result: dict[str, object] | None) -> dict[str, object]:
+    payload = dict(result or {})
+    compact: dict[str, object] = {}
+    for key in (
+        "authorization_id",
+        "attempt_id",
+        "consumption_state",
+        "reconcile_decision",
+        "reconcile_reason",
+        "ledger_sequence",
+        "replay_conflict",
+        "event_replay",
+        "classification",
+    ):
+        if key in payload and payload[key] is not None:
+            compact[key] = payload[key]
+    return compact
+
+
+def _final_accepted_terminal_receipt(receipt: dict[str, object]) -> bool:
+    # The task-state receipt contract defines protocol_complete as a valid
+    # terminal state (completed/failed/blocked), so accepted terminal facts
+    # suppress active recovery guidance for every accepted terminal outcome.
+    # A matching retained owner lock is classified stale_terminal_lock by the
+    # same terminal truth and does not make the accepted evidence unaccepted.
+    return bool(
+        receipt.get("protocol_complete") is True
+        and receipt.get("acceptance_result") == "accepted"
+        and receipt.get("lock_state") in {"none", "stale_terminal_lock"}
+    )
+
+
+def _final_accepted_completed_receipt(receipt: dict[str, object]) -> bool:
+    # Success-exit precedence keeps the settled-completed condition: an
+    # accepted completed task whose matching owner lock still awaits
+    # settlement (stale_terminal_lock) is not a lock-free completed receipt.
+    return bool(
+        receipt.get("protocol_terminal_state") == "completed"
+        and _final_accepted_terminal_receipt(receipt)
+        and receipt.get("lock_state") == "none"
+    )
+
+
+DELIVERY_SESSION_MISMATCH_STATUS = "live_session_mismatch"
+
+
+def _delivery_session_identity_mismatch(tdir: Path) -> dict[str, object] | None:
+    """Project a confirmed post-delivery session identity mismatch (#1007).
+
+    Reads only the leaf facts the adapter already recorded in the task's
+    ``delivery.json``: when the post-delivery session observation failed
+    because the fenced session is not among the observed live sessions
+    (``live_session_mismatch``), the task is running under an identity the
+    acceptance fence cannot satisfy, which is not ordinary same-session
+    pending work. Missing, unreadable, or non-mismatch evidence returns
+    ``None`` so ordinary pending classification is unchanged.
+    """
+    try:
+        delivery = json.loads((tdir / "delivery.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(delivery, dict):
+        return None
+    if delivery.get("post_delivery_session_observation_ok") is not False:
+        return None
+    observation = delivery.get("live_session_observation")
+    if not isinstance(observation, dict):
+        return None
+    status = str(observation.get("status") or "")
+    if status != DELIVERY_SESSION_MISMATCH_STATUS:
+        return None
+    session_ids = [
+        str(item or "").strip()
+        for item in observation.get("session_ids") or []
+        if str(item or "").strip()
+    ]
+    return {
+        "status": status,
+        "expected_session_id": str(observation.get("expected_session_id") or ""),
+        "observed_session_ids": sorted(session_ids),
+        "evidence": "delivery.json:live_session_observation",
+        "next_safe_action": "preserve_fence_evidence_and_use_worker_scoped_recovery",
+        "note": (
+            "the fenced session is not among the worker's observed live "
+            "sessions, so an identical finish stays refused while this "
+            "mismatch is unresolved; transport acceptance is not verified "
+            "session delivery. Do not silently adopt the observed session "
+            "or its model, resend the task, hand-edit the fence or owner "
+            "lock, or retry heartbeat plus an identical finish. Keep the "
+            "owner lock and evidence; resolve identity through the "
+            "operator-confirmed session or the existing authorized "
+            "worker-scoped recovery closeout with its stopped/writer-exit/"
+            "identity gates"
+        ),
+    }
+
+
+def _healthy_pending_wait_receipt(
+    root: Path,
+    *,
+    dispatch_returncode: int,
+    polled_result: tuple[bool, dict[str, str], dict[str, object]],
+    worker_id: str,
+    task_id: str,
+    attempt_id: str,
+) -> bool:
+    task_created, queryable, receipt = polled_result
+    if not (
+        dispatch_returncode == 1
+        and task_created
+        and worker_id and task_id and attempt_id
+        and queryable.get("task_id") == task_id
+        and receipt.get("run_id") == queryable.get("run_id")
+        and receipt.get("task_id") == task_id
+        and receipt.get("protocol_terminal_state") in {"received", "running"}
+        and receipt.get("protocol_complete") is False
+        and receipt.get("acceptance_result") == "pending"
+        and receipt.get("lock_state") == "active_lock"
+        and receipt.get("provider_error_detected") is False
+    ):
+        return False
+    import omx_visible_task_state as task_state
+
+    try:
+        tdir = task_state.task_dir(root, queryable["run_id"], task_id)
+        if _delivery_session_identity_mismatch(tdir) is not None:
+            # #1007: a confirmed post-delivery session identity mismatch is
+            # not ordinary healthy same-session pending work; the public
+            # receipt must expose the mismatch distinctly instead.
+            return False
+        summary = json.loads((tdir.parents[1] / "summary.json").read_text(encoding="utf-8"))
+        access = read_checkpoint_access(root, tdir)
+    except (OSError, ValueError, task_state.TaskStateError):
+        return False
+    identity = access["identity"]
+    return bool(
+        access.get("ok") is True
+        and access.get("mode") == "active"
+        and identity.get("worker") == worker_id
+        and identity.get("attempt_id") == attempt_id
+        and isinstance(summary, dict)
+        and summary.get("run_id") == queryable["run_id"]
+        and summary.get("task_id") == task_id
+        and summary.get("worker") == worker_id
+        and type(summary.get("submit_returncode")) is int
+        and summary["submit_returncode"] == 0
+        and type(summary.get("wait_returncode")) is int
+        and summary["wait_returncode"] == 1
+        and summary.get("wait_result") in {"running_or_incomplete", "delivery_uncertain"}
+        and summary.get("pending_after_timeout") is True
+        and summary.get("doctor_ok") is True
+        and type(summary.get("collect_returncode")) is int
+        and summary["collect_returncode"] == 1
+        and summary.get("collect_completed") is True
+    )
+
+
+def _report_contract_failed(
+    root: Path,
+    run_id: str,
+    task_id: str,
+) -> bool:
+    if str(_THIS_FILE.parent) not in sys.path:
+        sys.path.insert(0, str(_THIS_FILE.parent))
+    import omx_visible_task_state as task_state
+
+    try:
+        tdir = task_state.task_dir(root, run_id, task_id)
+        validation = json.loads(
+            (tdir / "report_contract_validation.json").read_text(
+                encoding="utf-8"
+            )
+        )
+    except Exception:
+        return False
+    return bool(
+        isinstance(validation, dict)
+        and validation.get("configured")
+        and validation.get("semantic_status") == "failed"
+    )
+
+
+def _queryable_result_receipt(
+    root: Path,
+    identity: dict[str, str],
+) -> tuple[bool, dict[str, str], dict[str, object]]:
+    run_id = str(identity.get("run_id") or "").strip()
+    task_id = str(identity.get("task_id") or "").strip()
+    task_dir_value = str(identity.get("task_dir") or "").strip()
+    if str(_THIS_FILE.parent) not in sys.path:
+        sys.path.insert(0, str(_THIS_FILE.parent))
+    import omx_visible_task_state as task_state
+
+    try:
+        if task_dir_value:
+            run_id, task_id = task_state.resolve_task_identity(
+                root,
+                run=run_id or None,
+                task=task_id or None,
+                task_dir_value=task_dir_value,
+            )
+        elif run_id and task_id:
+            run_id = task_state.canonical_run_id(run_id)
+            task_id = task_state.safe_id(task_id, "task")
+        else:
+            return False, {"run_id": "", "task_id": "", "task_dir": ""}, _unknown_result_receipt()
+        truth = task_state.truth_for_task(root, run_id, task_id)
+    except Exception:
+        return False, {"run_id": "", "task_id": "", "task_dir": ""}, _unknown_result_receipt()
+    receipt = truth.get("result_receipt")
+    if not isinstance(receipt, dict):
+        receipt = _unknown_result_receipt()
+    else:
+        receipt = dict(receipt)
+        # #910: project the already-derived full-truth diagnostics and time
+        # facts into this local operator-output view; the stored task-state
+        # schema is unchanged. generated_at is the query generation time and
+        # last_event_ts the newest protocol/report/marker/sidecar event time.
+        if "provider_error_detected" in truth:
+            receipt["provider_error_detected"] = truth["provider_error_detected"]
+            if truth.get("provider_error_kind"):
+                receipt["provider_error_kind"] = str(truth["provider_error_kind"])
+        if truth.get("generated_at"):
+            receipt["generated_at"] = str(truth["generated_at"])
+        if truth.get("last_event_ts"):
+            receipt["last_event_ts"] = str(truth["last_event_ts"])
+    return True, {
+        "run_id": run_id,
+        "task_id": task_id,
+        "task_dir": str(truth.get("task_dir") or task_dir_value),
+    }, receipt
+
+
+def _late_receipt_observe_command(
+    root: Path,
+    *,
+    task_created: bool,
+    queryable: dict[str, str],
+    receipt: dict[str, object],
+    attempt_id: str,
+) -> str:
+    """Copyable read-only wait --observe command for a retained task whose
+    later truth shows received/running progress after a non-zero dispatch
+    exit (#910). Advisory hint only: it never retries, releases locks, or
+    treats started as completion, and wait --observe still applies its own
+    owner/attempt gates. A confirmed task-bound provider diagnosis keeps
+    precedence over this healthy-running hint even while the raw protocol
+    state stays running; other non-complete states are not proof of late
+    running progress either."""
+    if not task_created:
+        return ""
+    run_id = str(queryable.get("run_id") or "")
+    task_id = str(queryable.get("task_id") or "")
+    if not run_id or not task_id:
+        return ""
+    if receipt.get("provider_error_detected") is True:
+        return ""
+    if str(receipt.get("protocol_terminal_state") or "") not in {
+        "received",
+        "running",
+    }:
+        return ""
+    expected_attempt = str(attempt_id or "").strip()
+    if not expected_attempt:
+        return ""
+    return shlex.join(
+        [
+            str(root / "bin" / "omx_visible_dispatch"),
+            "wait",
+            "--root",
+            str(root),
+            "--run",
+            run_id,
+            "--task",
+            task_id,
+            "--observe",
+            "--compact",
+            "--attempt-id",
+            expected_attempt,
+        ]
+    )
+
+
+def _print_operator_machine_receipt(
+    *,
+    returncode: int,
+    grant: dict[str, object] | None,
+    identity: dict[str, str] | None = None,
+    root: Path | None = None,
+    stdout_log: str = "",
+    stderr_log: str = "",
+    polled_result: tuple[bool, dict[str, str], dict[str, object]] | None = None,
+    dispatch_returncode: int | None = None,
+    next_observe_command: str = "",
+    pending_wait: bool = False,
+    session_identity_mismatch: dict[str, object] | None = None,
+) -> None:
+    parsed = dict(identity or {})
+    task_created = False
+    receipt = _unknown_result_receipt()
+    queryable = {"run_id": "", "task_id": "", "task_dir": ""}
+    if polled_result is not None:
+        task_created, queryable, receipt = polled_result
+    elif root is not None:
+        task_created, queryable, receipt = _queryable_result_receipt(root, parsed)
+    recovery = None
+    if isinstance(grant, dict):
+        maybe_recovery = grant.get("recovery_guidance")
+        if isinstance(maybe_recovery, dict) and maybe_recovery:
+            recovery = maybe_recovery
+    payload = {
+        "schema": "visible-operator-dispatch-receipt/v1",
+        "ok": int(returncode) == 0,
+        "returncode": int(returncode),
+        "task_created": task_created,
+        "run_id": queryable["run_id"],
+        "task_id": queryable["task_id"],
+        "task_dir": queryable["task_dir"],
+        "grant": _compact_grant(grant),
+        "result_receipt": receipt,
+        "run_preflight": _parse_run_preflight(stdout_log),
+    }
+    if dispatch_returncode is not None and int(dispatch_returncode) != int(returncode):
+        payload["dispatch_returncode"] = int(dispatch_returncode)
+        if not pending_wait:
+            payload["final_result_precedence"] = (
+                "accepted completed task truth overrides historical dispatch exit"
+            )
+    if pending_wait:
+        payload["run_wait_result"] = "pending"
+    if session_identity_mismatch is not None:
+        payload["session_identity_mismatch"] = session_identity_mismatch
+    if next_observe_command:
+        payload["next_observe_command"] = next_observe_command
+        payload["next_observe_note"] = (
+            "historical dispatch output precedes the latest task truth; "
+            "this read-only observation command does not retry, release "
+            "locks, or finish the task"
+        )
+    if recovery is not None:
+        payload["recovery_guidance"] = recovery
+    print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
+    if stdout_log:
+        print(stdout_log, end="", file=sys.stderr)
+    if stderr_log:
+        print(stderr_log, end="", file=sys.stderr)
+
+
+def _operator_dispatch_bridge_result(
+    payload: dict[str, object],
+    bridge: dict[str, object],
+) -> dict[str, object]:
+    """Consumption state after a dispatch attempt or on event replay.
+
+    run-one consumes the grant on deterministic applied/rejected outcomes and
+    preserves it on ambiguous delivery. Whenever the grant is still active,
+    deterministic reconciliation decides from runtime evidence only;
+    ambiguous evidence stays active/reconcile-needed. A replayed event is
+    reconciled the same way and is never redispatched.
+    """
+    root = Path(str(payload["root"]))
+    task_id = str(bridge["task_id"])
+    attempt_id = str(bridge["attempt_id"])
+    authorization_id = str(bridge["authorization_id"])
+    result = dict(bridge)
+    try:
+        ledger = external_harness_authorization_ledger(root, task_id, attempt_id)
+        if ledger.active_authorization(authorization_id) is None:
+            result["consumption_state"] = _inactive_grant_consumption_state(
+                ledger,
+                authorization_id,
+            )
+            return result
+        outcome = reconcile_external_harness_grant(
+            root=root,
+            authorization_id=authorization_id,
+            task_id=task_id,
+            attempt_id=attempt_id,
+        )
+    except OperationAuthorizationError as exc:
+        raise LeaderOrchestrateError(str(exc)) from exc
+    result["consumption_state"] = str(outcome["consumption_state"])
+    result["reconcile_decision"] = str(outcome["decision"])
+    result["reconcile_reason"] = str(outcome["reconcile_reason"])
+    return result
+
+
+def _print_operator_dispatch_bridge(result: dict[str, object]) -> None:
+    lines = [
+        f"authorization_id: {result['authorization_id']}",
+        f"attempt_id: {result['attempt_id']}",
+    ]
+    if result.get("ledger_sequence") is not None:
+        lines.append(f"ledger_sequence: {result['ledger_sequence']}")
+    if result.get("replay_conflict"):
+        lines.append(f"replay_conflict: {result['replay_conflict']}")
+    else:
+        lines.append(f"consumption_state: {result['consumption_state']}")
+        if result.get("reconcile_decision"):
+            lines.append(f"reconcile_decision: {result['reconcile_decision']}")
+            lines.append(f"reconcile_reason: {result['reconcile_reason']}")
+        if result.get("event_replay"):
+            lines.append("dispatch_skipped: event_already_authorized")
+    for line in lines:
+        print(line)
+    guidance = result.get("recovery_guidance")
+    if isinstance(guidance, dict) and guidance:
+        _print_recovery_guidance(guidance, file=sys.stdout)
+
+
+_DISPATCH_MODULE_CACHE: dict[str, object] = {}
+
+
+def _load_visible_dispatch_module():
+    """Load the sibling dispatch script once for shared handoff validation."""
+    cached = _DISPATCH_MODULE_CACHE.get("module")
+    if cached is not None:
+        return cached
+    import importlib.machinery
+    import importlib.util
+
+    script = Path(__file__).resolve().parent / "omx_visible_dispatch"
+    loader = importlib.machinery.SourceFileLoader(
+        "omx_visible_dispatch_handoff_shared", str(script)
+    )
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[loader.name] = module
+    loader.exec_module(module)
+    _DISPATCH_MODULE_CACHE["module"] = module
+    return module
+
+
+def _predecessor_handoff_pregrant_state(
+    args: argparse.Namespace,
+    root: Path,
+) -> dict[str, object] | None:
+    """Validate an optional predecessor handoff before any grant is minted.
+
+    Read-only: the predecessor's accepted terminal, retained evidence,
+    coordinator writer coverage and successor identity are validated through
+    the dispatch module's real validators before authorization; no ledger,
+    task or lock mutation happens here. Returns None when no handoff file is
+    supplied so ordinary dispatch stays unchanged.
+    """
+    handoff_file = str(
+        getattr(args, "predecessor_handoff_file", "") or ""
+    ).strip()
+    if not handoff_file:
+        return None
+    raw_worker = getattr(args, "worker", "") or ""
+    if isinstance(raw_worker, str):
+        raw_worker = [raw_worker]
+    workers = parse_workers(raw_worker)
+    if len(workers) != 1:
+        raise LeaderOrchestrateError(
+            "--predecessor-handoff-file requires exactly one explicit --worker"
+        )
+    successor_task_id = str(getattr(args, "task_id", "") or "").strip()
+    successor_attempt_id = str(getattr(args, "attempt_id", "") or "").strip()
+    if not successor_task_id or not successor_attempt_id:
+        raise LeaderOrchestrateError(
+            "--predecessor-handoff-file requires --task-id and --attempt-id "
+            "naming the successor dispatch identity"
+        )
+    dispatch = _load_visible_dispatch_module()
+    handoff_path = Path(handoff_file)
+    if not handoff_path.is_file():
+        raise LeaderOrchestrateError(
+            f"predecessor handoff file not found: {handoff_path}"
+        )
+    try:
+        record = json.loads(handoff_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise LeaderOrchestrateError(
+            f"predecessor handoff file is not valid JSON: {exc}"
+        ) from exc
+    if not isinstance(record, dict):
+        raise LeaderOrchestrateError(
+            "predecessor handoff file must contain a JSON object"
+        )
+    errors = dispatch.predecessor_handoff_errors(
+        root,
+        record,
+        successor_task_id=successor_task_id,
+        successor_attempt_id=successor_attempt_id,
+        successor_worker_id=workers[0],
+    )
+    if errors:
+        raise LeaderOrchestrateError(
+            "predecessor handoff refused: " + "; ".join(errors)
+        )
+    return {
+        "record": record,
+        "handoff_sha256": dispatch.handoff_record_hash(record),
+    }
+
+
+def _validate_leader_authorization_args(args: argparse.Namespace) -> None:
+    selector_set = bool(
+        str(getattr(args, "initial_dispatch_selector_json", "") or "").strip()
+    )
+    draft_check_selected = bool(getattr(args, "draft_check", False)) or bool(
+        getattr(args, "draft_check_jev_live", False)
+    )
+    if draft_check_selected and (
+        str(getattr(args, "lane_contracts", "") or "").strip()
+        or str(getattr(args, "emit_lane_contracts", "") or "").strip()
+    ):
+        raise LeaderOrchestrateError(
+            "--draft-check cannot be combined with --lane-contracts or "
+            "--emit-lane-contracts; lane assignments own their task "
+            "contracts and would silently drop the draft-check selection"
+        )
+    if selector_set and str(getattr(args, "task_contract_json", "") or "").strip():
+        raise LeaderOrchestrateError(
+            "--initial-dispatch-selector-json cannot be combined with "
+            "--task-contract-json; one input must own the task contract"
+        )
+    if selector_set and not bool(getattr(args, "authorize_leader", False)):
+        raise LeaderOrchestrateError(
+            "--initial-dispatch-selector-json requires --authorize-leader"
+        )
+    if not bool(getattr(args, "authorize_leader", False)):
+        return
+    if str(getattr(args, "task_contract_json", "") or "").strip():
+        raise LeaderOrchestrateError(
+            "--authorize-leader cannot be combined with --task-contract-json"
+        )
+    if not bool(getattr(args, "allow_real", False)):
+        raise LeaderOrchestrateError("--authorize-leader requires --allow-real")
+    workers = parse_workers(args.worker)
+    if len(workers) != 1:
+        raise LeaderOrchestrateError(
+            "--authorize-leader requires exactly one explicit --worker"
+        )
+    if not (
+        str(getattr(args, "task_id", "") or "").strip()
+        and str(getattr(args, "attempt_id", "") or "").strip()
+        and str(getattr(args, "event_id", "") or "").strip()
+    ):
+        raise LeaderOrchestrateError(
+            "--authorize-leader requires --task-id, --attempt-id, and --event-id"
+        )
+
+
+def _mint_leader_authorization(args: argparse.Namespace, root: Path) -> str:
+    worker_id = str(parse_workers(args.worker)[0])
+    try:
+        prepared = prepare_external_harness_grant(
+            root=root,
+            task_id=str(args.task_id).strip(),
+            attempt_id=str(args.attempt_id).strip(),
+            worker_id=worker_id,
+            task_contract=_operator_base_task_contract(args, worker_id),
+            event_id=str(args.event_id).strip(),
+        )
+    except OperationAuthorizationError as exc:
+        raise LeaderOrchestrateError(str(exc)) from exc
+    return json.dumps(
+        prepared["prepared_task_contract"],
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _validate_session_actions_before_writes(args: argparse.Namespace) -> None:
+    """Pure session-action validation before any grant, rebind, or task write."""
+    workers = parse_workers(getattr(args, "worker", []) or [])
+    if not workers:
+        return
+    try:
+        resolve_session_actions(
+            [
+                str(value).strip()
+                for value in list(getattr(args, "session_action", []) or [])
+                if str(value).strip()
+            ],
+            workers,
+            reason=str(getattr(args, "session_action_reason", "") or ""),
+            rotation_reason=str(getattr(args, "rotation_reason", "") or ""),
+            rehydration_packet_type=str(
+                getattr(args, "rehydration_packet_type", "") or ""
+            ),
+            required=bool(getattr(args, "allow_real", False)),
+        )
+    except SessionActionError as exc:
+        raise LeaderOrchestrateError(str(exc)) from exc
+
+
+def _reject_discovery_payload(port: int, message: str) -> LeaderOrchestrateError:
+    return LeaderOrchestrateError(
+        f"current-window worker discovery for port {port} is not a usable "
+        f"caller-scoped tmux result: {message}"
+    )
+
+
+_CALLER_PANE_RECOVERY_GUIDANCE = (
+    "verify the real caller pane from task-bound pane/process evidence "
+    "(ask the user when unclear), then correct TMUX_PANE for this control "
+    "subprocess only; never select another window or impersonate a worker"
+)
+
+
+def _rebind_subcommand_failure(
+    payload: dict[str, object],
+    *,
+    stderr: str,
+) -> dict[str, str] | None:
+    """Extract a failed rebind subcommand's own diagnostic.
+
+    A failed rebind subcommand exits nonzero and prints its known-failure
+    envelope ({"ok": false, "message": ...}) instead of the success schema.
+    That message and stderr are the real failure cause and must surface
+    before any successful-payload schema/root validation, so a missing or
+    stale caller pane is never mislabeled as an unsupported schema or a
+    different root. Successful or malformed success-shaped payloads keep
+    their strict validation and return None here.
+    """
+    if payload.get("ok") is not False:
+        return None
+    message = payload.get("message")
+    if type(message) is not str or not message.strip():
+        return None
+    classification = (
+        "caller_pane_missing"
+        if "can't find pane" in message
+        else "worker_missing_from_registry"
+        if "worker not found in registry" in message
+        else "rebind_subcommand_failed"
+    )
+    return {
+        "classification": classification,
+        "message": " ".join(message.split()),
+        "stderr": " ".join(str(stderr or "").split()),
+    }
+
+
+def _rebind_subcommand_failure_error(
+    prefix: str,
+    payload: dict[str, object],
+    *,
+    stderr: str,
+) -> LeaderOrchestrateError | None:
+    failure = _rebind_subcommand_failure(payload, stderr=stderr)
+    if failure is None:
+        return None
+    detail = failure["message"] + (
+        f"; stderr: {failure['stderr']}" if failure["stderr"] else ""
+    )
+    if failure["classification"] == "worker_missing_from_registry":
+        # A missing registry entry is an identity-diagnosis fact, not a root
+        # mismatch (#779): name the supported discovery/rebind paths without
+        # claiming any historical alias is automatically authorized.
+        return LeaderOrchestrateError(
+            f"{prefix} failed before producing a usable result "
+            f"[{failure['classification']}]: {detail}. "
+            "Recovery: the registry has no entry for this worker id. Use "
+            "current-window discovery to identify verified existing "
+            "mappings of the intended instance; an existing alias entry can "
+            "be rebind-checked and repaired with a target-scoped rebind "
+            "under explicit authorization, or the instance can be "
+            "registered under the intended id through register-visible. Do "
+            "not edit registry JSON, reuse unverified historical aliases, "
+            "or interpret this as a different-root observation."
+        )
+    if failure["classification"] != "caller_pane_missing":
+        # Non-caller failures keep their own cause; caller-pane correction
+        # advice would be misleading for them (#818).
+        return LeaderOrchestrateError(
+            f"{prefix} failed before producing a usable result "
+            f"[{failure['classification']}]: {detail}."
+        )
+    return LeaderOrchestrateError(
+        f"{prefix} failed before producing a usable result "
+        f"[{failure['classification']}]: {detail}. "
+        f"Recovery: {_CALLER_PANE_RECOVERY_GUIDANCE}"
+    )
+
+
+def _validate_discovery_payload(
+    payload: dict[str, object],
+    *,
+    root: Path,
+    port: int,
+    caller_pane: str,
+) -> None:
+    """Validate the discover subprocess result at this trust boundary.
+
+    A rc-0/strong/pane-shaped payload is only trusted when it carries the
+    documented schema, echoes the exact requested integer port, reports no
+    discovery errors, and proves the observation ran inside tmux scoped to
+    the caller's TMUX_PANE window (not an rmux or otherwise unscoped pane
+    list).
+    """
+    if type(payload.get("schema_version")) is not int or payload["schema_version"] != 1:
+        raise _reject_discovery_payload(port, "unsupported schema_version")
+    if type(payload.get("port")) is not int or payload["port"] != port:
+        raise _reject_discovery_payload(port, "discovery observed a different port")
+    errors = payload.get("errors")
+    if not isinstance(errors, list):
+        raise _reject_discovery_payload(port, "discovery errors is not an array")
+    if errors:
+        raise _reject_discovery_payload(
+            port,
+            "; ".join(str(item) for item in errors),
+        )
+    tmux = payload.get("tmux")
+    display = tmux.get("display") if isinstance(tmux, dict) else None
+    display_stdout = (
+        str(display.get("stdout") or "") if isinstance(display, dict) else ""
+    )
+    # The documented display-message output is `session:window.index %pane\n`;
+    # compare the complete final pane token so caller %2 never matches %27.
+    pane_token = (
+        display_stdout.strip().split()[-1] if display_stdout.strip() else ""
+    )
+    if not (
+        isinstance(tmux, dict)
+        and tmux.get("inside_tmux") is True
+        and tmux.get("inside_rmux") is False
+        and str(tmux.get("runtime_substrate") or "") == "tmux"
+        and isinstance(tmux.get("errors"), list)
+        and not tmux["errors"]
+        and isinstance(display, dict)
+        and type(display.get("returncode")) is int
+        and int(display["returncode"]) == 0
+        and pane_token == caller_pane
+    ):
+        raise _reject_discovery_payload(
+            port,
+            "discovery is not bound to the caller's current tmux window",
+        )
+    if str(payload.get("root") or "") != str(root):
+        raise _reject_discovery_payload(port, "discovery observed a different root")
+
+
+def _resolve_current_window_worker_id(root: Path, port: int, caller_pane: str) -> str:
+    """Resolve the caller's current tmux window + port to one worker id.
+
+    Read-only identity resolution: reuses the existing TMUX_PANE-anchored
+    rebind discovery (current-window panes, listener/process correlation)
+    and the visible worker registry. It answers "who is the target" only;
+    lease freshness, locks, and dispatch eligibility stay with the existing
+    downstream gates, so a unique target with an expired lease remains
+    resolvable for the sanctioned recovery chain.
+    """
+    port = int(port)
+    if not 0 < port <= 65535:
+        raise LeaderOrchestrateError(
+            "--current-window-worker-port must be a TCP port between 1 and 65535"
+        )
+    discovery = _run_json_command(
+        [
+            str(root / "bin" / "omx_visible_rebind"),
+            "discover",
+            "--root",
+            str(root),
+            "--port",
+            str(port),
+            "--json",
+        ],
+        root,
+    )
+    if int(discovery.get("returncode", 1)) not in (0, 1):
+        raise LeaderOrchestrateError(
+            f"current-window worker discovery for port {port} failed: "
+            f"{discovery.get('stderr') or discovery.get('stdout')}"
+        )
+    payload = discovery.get("json")
+    if not isinstance(payload, dict) or not payload:
+        raise LeaderOrchestrateError(
+            f"current-window worker discovery for port {port} returned no JSON object"
+        )
+    if int(discovery.get("returncode", 1)) != 0:
+        failure_error = _rebind_subcommand_failure_error(
+            f"current-window worker discovery for port {port}",
+            payload,
+            stderr=str(discovery.get("stderr") or ""),
+        )
+        if failure_error is not None:
+            raise failure_error
+    _validate_discovery_payload(payload, root=root, port=port, caller_pane=caller_pane)
+    if (
+        str(payload.get("binding_confidence") or "") != "strong"
+        or not re.fullmatch(r"%[0-9]+", str(payload.get("pane_id") or ""))
+    ):
+        reasons = (
+            "; ".join(str(item) for item in payload.get("errors") or [])
+            or "no strong current-window binding candidate"
+        )
+        raise LeaderOrchestrateError(
+            f"port {port} has no strong live binding in the caller's current "
+            f"tmux window: {reasons}"
+        )
+    try:
+        records = load_visible_workers(root)
+    except RegistryError as exc:
+        raise LeaderOrchestrateError(str(exc)) from exc
+    port_matched: list[tuple[str, dict[str, object]]] = []
+    candidates: list[dict[str, object]] = []
+    for record in records:
+        if record.get("port") != port or not str(record.get("worker_id") or ""):
+            continue
+        worker_id = str(record["worker_id"])
+        port_matched.append((worker_id, record))
+        if not bool(record.get("binding_alias_inactive_stale")):
+            candidates.append(record)
+    if not candidates:
+        if port_matched:
+            raise LeaderOrchestrateError(
+                f"port {port} matches only inactive-stale registry records: "
+                + ", ".join(sorted(worker for worker, _ in port_matched))
+            )
+        raise LeaderOrchestrateError(
+            f"no registered visible worker matches current-window port {port}"
+        )
+    if len(candidates) > 1:
+        raise LeaderOrchestrateError(
+            f"current-window port {port} is ambiguous between registered workers: "
+            + ", ".join(sorted(str(record.get("worker_id")) for record in candidates))
+        )
+    record = candidates[0]
+    alias_conflicts = record.get("binding_alias_conflicts")
+    if isinstance(alias_conflicts, list) and alias_conflicts:
+        raise LeaderOrchestrateError(
+            f"current-window port {port} resolves to worker "
+            f"{record.get('worker_id')} with physical binding alias conflicts: "
+            + "; ".join(str(item) for item in alias_conflicts)
+        )
+    return str(record["worker_id"])
+
+
+def _apply_current_window_worker_selection(
+    args: argparse.Namespace,
+    root: Path,
+) -> None:
+    """Freeze the current-window+port selection onto one explicit worker.
+
+    The selector is mutually exclusive with --worker, --fanout, and
+    --all-production-workers to keep single-target semantics. After the
+    unique identity is resolved it is frozen onto args.worker so grant,
+    replay-conflict, recovery, and dispatch all use the same explicit
+    target; the selector flag is cleared so nothing downstream re-selects.
+    """
+    port = getattr(args, "current_window_worker_port", None)
+    if port is None:
+        return
+    conflicts = []
+    if parse_workers(getattr(args, "worker", []) or []):
+        conflicts.append("--worker")
+    if bool(getattr(args, "all_production_workers", False)):
+        conflicts.append("--all-production-workers")
+    if getattr(args, "fanout", None) is not None:
+        conflicts.append("--fanout")
+    if conflicts:
+        raise LeaderOrchestrateError(
+            "--current-window-worker-port is mutually exclusive with "
+            + ", ".join(sorted(conflicts))
+        )
+    caller_pane = str(os.environ.get("TMUX_PANE") or "").strip()
+    if not re.fullmatch(r"%[0-9]+", caller_pane):
+        raise LeaderOrchestrateError(
+            "--current-window-worker-port requires the caller's TMUX_PANE; "
+            "refusing to scan other tmux sessions or windows"
+        )
+    worker_id = _resolve_current_window_worker_id(root, int(port), caller_pane)
+    args.worker = [worker_id]
+    args.current_window_worker_port = None
+
+
+def resolve_body_file_argument(args: argparse.Namespace) -> None:
+    """Resolve --body-file into args.body before any grant, task, or lock
+    mutation. The CLI enforces --body/--body-file exclusivity at parse time;
+    programmatic callers select file input by setting body_file. The path is
+    used exactly as provided, the file is consumed as exact UTF-8 bytes
+    without newline translation, and only the regular file actually opened is
+    accepted, so non-regular inputs such as FIFOs are rejected without
+    waiting for a writer."""
+    if not hasattr(args, "body_file"):
+        return
+    body_file = getattr(args, "body_file", None)
+    if body_file is None:
+        if getattr(args, "body", None) is None:
+            raise LeaderOrchestrateError("--body or --body-file is required")
+        return
+    descriptor = -1
+    try:
+        descriptor = os.open(str(body_file), os.O_RDONLY | os.O_NONBLOCK)
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise LeaderOrchestrateError(
+                f"body_file_unreadable: not a regular file: {body_file}"
+            )
+        chunks = []
+        while True:
+            chunk = os.read(descriptor, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        raw = b"".join(chunks)
+    except OSError as exc:
+        raise LeaderOrchestrateError(
+            f"body_file_unreadable: {body_file}: {exc}"
+        ) from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    try:
+        args.body = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise LeaderOrchestrateError(
+            f"body_file_invalid_utf8: {body_file}: {exc}"
+        ) from exc
+
+
+def _apply_body_file_transport(
+    args: argparse.Namespace,
+    payload: dict,
+) -> Path | None:
+    """When the entry was invoked with --body-file, stage the worker-rendered
+    dispatch body in a private temp file and pass --body-file down to the
+    dispatch child, so the body never appears in any child process argv.
+    Returns the staged path; the caller unlinks it in a finally when the
+    child exits, including on failure."""
+    if not _body_file_input(args):
+        return None
+    if payload.get("route") != "dispatch":
+        raise LeaderOrchestrateError(
+            "--body-file requires the single-worker dispatch route"
+        )
+    argv = [str(item) for item in payload.get("argv", [])]
+    try:
+        index = argv.index("--body")
+    except ValueError:
+        raise LeaderOrchestrateError(
+            "--body-file transport could not locate the dispatch --body argument"
+        ) from None
+    rendered = argv[index + 1]
+    fd, staged = tempfile.mkstemp(prefix="omx-body-file-", suffix=".txt")
+    staged_path = Path(staged)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(rendered.encode("utf-8"))
+    except BaseException:
+        staged_path.unlink(missing_ok=True)
+        raise
+    argv[index] = "--body-file"
+    argv[index + 1] = str(staged_path)
+    payload["argv"] = argv
+    return staged_path
+
+
+def _body_file_input(args: argparse.Namespace) -> bool:
+    return getattr(args, "body_file", None) is not None
+
+
+def _require_body_file_dispatch_route(args: argparse.Namespace, root: Path) -> None:
+    """Refuse file body input before any grant, repair, settle, or task
+    mutation when the pure route decision would not take the single-worker
+    dispatch route. Uses the shared no-write routing inputs: no worker
+    validation, health probing, or lane writes happen here, so repairable
+    bindings such as an expired lease still reach the sanctioned repair
+    path instead of being rejected as a route failure."""
+    if not _body_file_input(args):
+        return
+    route, _reason = leader_runtime.file_input_route(
+        root,
+        requested_workers=parse_workers(args.worker),
+        all_production_workers=bool(args.all_production_workers),
+        fanout=args.fanout,
+        inner_mode=str(getattr(args, "inner_mode", "") or ""),
+        topology_metadata=str(getattr(args, "topology_metadata", "") or ""),
+        task_profile=str(getattr(args, "task_profile", "") or ""),
+        require_confirmation=bool(args.require_confirmation),
+        force_langgraph=bool(args.force_langgraph)
+        or bool(
+            _lane_task_contract_workers(
+                str(getattr(args, "lane_contracts", "") or "")
+            )
+        ),
+        title=str(args.title),
+        body=str(args.body or ""),
+    )
+    if route != "dispatch":
+        raise LeaderOrchestrateError(
+            "--body-file requires the single-worker dispatch route"
+        )
+
+
+def _run_receipt_out_path(args: argparse.Namespace) -> Path | None:
+    value = str(getattr(args, "receipt_out", "") or "").strip()
+    if not value:
+        return None
+    path = Path(value)
+    if not path.is_absolute():
+        # Resolve against the parent's cwd once: the dispatch child runs
+        # with a different cwd and must receive one fixed absolute path.
+        path = (Path.cwd() / path).resolve()
+    return path
+
+
+def _validate_receipt_out_route(args: argparse.Namespace, receipt_out: Path | None) -> None:
+    if receipt_out is None:
+        return
+    unsupported = []
+    workers = [str(item) for item in (getattr(args, "worker", None) or [])]
+    current_window_port = getattr(args, "current_window_worker_port", None)
+    if current_window_port is not None:
+        if workers:
+            unsupported.append("--worker with --current-window-worker-port")
+    elif len(workers) != 1:
+        unsupported.append(f"--worker count={len(workers)}")
+    if getattr(args, "all_production_workers", False):
+        unsupported.append("--all-production-workers")
+    if getattr(args, "fanout", None):
+        unsupported.append("--fanout")
+    if bool(getattr(args, "force_langgraph", False)):
+        unsupported.append("--force-langgraph")
+    if str(getattr(args, "inner_mode", "") or ""):
+        unsupported.append("--inner-mode")
+    if str(getattr(args, "topology_metadata", "") or "").strip():
+        unsupported.append("--topology-metadata")
+    if str(getattr(args, "lane_contracts", "") or "").strip():
+        unsupported.append("--lane-contracts")
+    if unsupported:
+        raise LeaderOrchestrateError(
+            "--receipt-out requires the single-worker dispatch route; "
+            "unsupported with: " + ", ".join(unsupported)
+        )
+
+
+def _write_run_receipt_out(
+    path: Path | None,
+    *,
+    phase: str,
+    args: argparse.Namespace,
+    required: bool = False,
+    **fields: object,
+) -> None:
+    """Durable phase receipt for --receipt-out.
+
+    The first (``starting``) write is ``required``: an explicitly requested
+    receipt that cannot be written refuses the run before any dispatch or
+    grant side effect. Later writes are advisory diagnostics: a failure is
+    reported honestly on stderr but never changes the real dispatch result
+    or triggers a retry.
+    """
+    if path is None:
+        return
+    payload = {
+        "schema": "visible-orchestrate-run-receipt/v1",
+        "phase": phase,
+        "worker_id": ",".join(
+            str(item) for item in (getattr(args, "worker", None) or [])
+        ),
+        "task_id": str(getattr(args, "task_id", "") or ""),
+        "attempt_id": str(getattr(args, "attempt_id", "") or ""),
+        "event_id": str(getattr(args, "event_id", "") or ""),
+        "written_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        **fields,
+    }
+    try:
+        durable_atomic_write(
+            path,
+            json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False)
+            + "\n",
+        )
+    except OSError as exc:
+        print(
+            f"receipt_out_write_failed: {phase}: {exc}",
+            file=sys.stderr,
+        )
+        if required:
+            raise LeaderOrchestrateError(
+                f"--receipt-out path is not writable, refusing before any "
+                f"dispatch or grant side effect: {path}: {exc}"
+            ) from exc
+
+
+def _read_receipt_snapshot(path: Path | None) -> dict[str, object] | None:
+    """Read the receipt file as it stands, if readable."""
+    if path is None:
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _unknown_receipt_identity() -> dict[str, object]:
+    return {
+        "run_id": None,
+        "identity_task_id": None,
+        "task_dir": None,
+        "dispatch_claim_path": None,
+        "task_created": None,
+        "attempt_id": None,
+    }
+
+
+def _merge_child_receipt_identity(
+    prior: dict[str, object] | None,
+    *,
+    current_task_id: str,
+    current_attempt_id: str,
+    current_worker_id: str,
+    accept_phases: set[str],
+) -> dict[str, object]:
+    """Preserve an exactly matching prior receipt's identity (#816/#800).
+
+    Adoption requires the validated current task id, attempt id, and worker
+    id to be complete and to equal the prior receipt's fields exactly, and
+    the prior phase to be one of ``accept_phases``. Anything missing or
+    mismatched returns explicit unknown values (None) - never fabricated,
+    and an older attempt's receipt is never adopted for a new attempt.
+    This records identity consistency only; the receipt gains no completion
+    authority."""
+    if not prior:
+        return _unknown_receipt_identity()
+    if not (
+        current_task_id
+        and current_attempt_id
+        and current_worker_id
+        and str(prior.get("task_id") or "") == current_task_id
+        and str(prior.get("attempt_id") or "") == current_attempt_id
+        and str(prior.get("worker_id") or "") == current_worker_id
+        and str(prior.get("phase") or "") in accept_phases
+    ):
+        return _unknown_receipt_identity()
+    def preserve(value: object) -> object:
+        # An explicitly recorded None stays unknown; a known value stays a
+        # string. Coercing None to "" would turn unknown into fake
+        # knowledge on the next replay round.
+        return None if value is None else str(value or "")
+
+    return {
+        "run_id": preserve(prior.get("run_id")),
+        "identity_task_id": preserve(prior.get("task_id")),
+        "task_dir": preserve(prior.get("task_dir")),
+        "dispatch_claim_path": preserve(prior.get("dispatch_claim_path")),
+        "task_created": (
+            None
+            if prior.get("task_created") is None
+            else prior.get("task_created") is True
+        ),
+        "attempt_id": preserve(prior.get("attempt_id")),
+    }
+
+
+def command_run(args: argparse.Namespace) -> int:
+    if args.body is None or not str(args.body).strip():
+        raise LeaderOrchestrateError(
+            "empty_task_body: --body must contain the non-empty task contract body"
+        )
+    root = root_path(args.root)
+    receipt_out = _run_receipt_out_path(args)
+    _validate_receipt_out_route(args, receipt_out)
+    pre_start_receipt = _read_receipt_snapshot(receipt_out)
+    _write_run_receipt_out(receipt_out, phase="starting", args=args, required=True)
+    try:
+        _apply_current_window_worker_selection(args, root)
+        _require_body_file_dispatch_route(args, root)
+        _validate_leader_authorization_args(args)
+        predecessor_handoff_state = _predecessor_handoff_pregrant_state(args, root)
+        if predecessor_handoff_state is not None:
+            args.predecessor_handoff_state = predecessor_handoff_state
+        classification = _classify_operator_dispatch_bridge(args, root)
+        if classification is not None and classification["classification"] == "conflict":
+            if args.json:
+                _print_operator_machine_receipt(
+                    returncode=2,
+                    grant=classification,
+                    root=root,
+                )
+            else:
+                _print_operator_dispatch_bridge(classification)
+            _write_run_receipt_out(
+                receipt_out,
+                phase="operator_bridge_conflict",
+                args=args,
+                returncode=2,
+            )
+            return 2
+        if classification is not None and classification["classification"] == "replay":
+            classification["event_replay"] = True
+            replay = _operator_dispatch_bridge_result({"root": str(root)}, classification)
+            if args.json:
+                _print_operator_machine_receipt(
+                    returncode=3,
+                    grant=replay,
+                    root=root,
+                )
+            else:
+                _print_operator_dispatch_bridge(replay)
+            replay_task_id = str(classification.get("task_id") or "")
+            replay_attempt_id = str(classification.get("attempt_id") or "")
+            replay_worker_id = str(classification.get("worker_id") or "")
+            replay_identity = _merge_child_receipt_identity(
+                pre_start_receipt,
+                current_task_id=replay_task_id,
+                current_attempt_id=replay_attempt_id,
+                current_worker_id=replay_worker_id,
+                accept_phases={
+                    "claim_reserved",
+                    "task_prepared",
+                    "dispatch_exit",
+                    "operator_bridge_replay",
+                },
+            )
+            _write_run_receipt_out(
+                receipt_out,
+                phase="operator_bridge_replay",
+                args=args,
+                returncode=3,
+                task_id=replay_task_id or "unknown",
+                attempt_id=replay_attempt_id or "unknown",
+                event_id=str(getattr(args, "event_id", "") or "") or "unknown",
+                run_id=replay_identity.get("run_id"),
+                identity_task_id=replay_identity.get("identity_task_id"),
+                task_dir=replay_identity.get("task_dir"),
+                dispatch_claim_path=replay_identity.get("dispatch_claim_path"),
+                task_created=replay_identity.get("task_created"),
+            )
+            return 3
+        _validate_session_actions_before_writes(args)
+        authorize_leader = bool(getattr(args, "authorize_leader", False))
+        if authorize_leader and (
+            classification is None or classification.get("classification") == "missing"
+        ):
+            prepared_json = _mint_leader_authorization(args, root)
+            args = copy.copy(args)
+            args.task_contract_json = prepared_json
+            classification = _classify_operator_dispatch_bridge(args, root)
+            if classification is None or classification.get("classification") != "fresh":
+                raise LeaderOrchestrateError(
+                    "leader authorization did not produce a fresh grant"
+                )
+        repair_action: dict[str, object] | None = None
+        recovery_blocked_reason: str | None = None
+        if (
+            classification is not None
+            and classification.get("classification") == "fresh"
+            and not bool(getattr(args, "no_auto_rebind_pane_drift", False))
+        ):
+            inner_mode = str(getattr(args, "inner_mode", "") or "")
+            if not inner_mode:
+                topology_metadata_value = str(
+                    getattr(args, "topology_metadata", "") or ""
+                )
+                if topology_metadata_value:
+                    resolved_topology = resolve_topology_metadata(
+                        topology_metadata_value
+                    )
+                    inner_mode = str(
+                        resolved_topology.get("resolved_inner_mode") or ""
+                    )
+            if bool(getattr(args, "force_langgraph", False)) or inner_mode:
+                recovery_blocked_reason = (
+                    "fresh bridge recovery requires the single-worker dispatch "
+                    "route; force_langgraph/inner_mode requested"
+                )
+            elif bool(getattr(args, "require_confirmation", False)):
+                recovery_blocked_reason = (
+                    "fresh bridge recovery requires the single-worker dispatch "
+                    "route; require_confirmation requested"
+                )
+            elif str(getattr(args, "lane_contracts", "") or "").strip():
+                recovery_blocked_reason = (
+                    "fresh bridge recovery requires the single-worker dispatch "
+                    "route; lane_contracts requested"
+                )
+        if (
+            classification is not None
+            and classification.get("classification") == "fresh"
+            and recovery_blocked_reason is None
+            and not bool(getattr(args, "no_auto_rebind_pane_drift", False))
+        ):
+            try:
+                repair_action = _repair_binding_under_fresh_grant(
+                    root,
+                    classification,
+                    backend=str(args.backend),
+                    bridge_args=args,
+                )
+            except LeaderOrchestrateError as exc:
+                bridge_state = dict(classification)
+                if isinstance(exc, RecoveryGuidanceError) and exc.guidance is not None:
+                    bridge_state["recovery_guidance"] = exc.guidance
+                try:
+                    failure_ledger = external_harness_authorization_ledger(
+                        root,
+                        str(classification["task_id"]),
+                        str(classification["attempt_id"]),
+                    )
+                    if failure_ledger.active_authorization(
+                        str(classification["authorization_id"])
+                    ) is None:
+                        bridge_state["consumption_state"] = (
+                            _inactive_grant_consumption_state(
+                                failure_ledger,
+                                str(classification["authorization_id"]),
+                            )
+                        )
+                    else:
+                        bridge_state["consumption_state"] = "active"
+                    bridge_state["reconcile_decision"] = "reconcile-needed"
+                    bridge_state["reconcile_reason"] = (
+                        "binding repair failed before dispatch; grant left for "
+                        "host reconcile"
+                    )
+                except OperationAuthorizationError:
+                    bridge_state["consumption_state"] = "unknown"
+                    bridge_state["reconcile_decision"] = "reconcile-needed"
+                    bridge_state["reconcile_reason"] = (
+                        "binding repair failed and ledger state is unreadable"
+                    )
+                if args.json:
+                    _print_operator_machine_receipt(
+                        returncode=2,
+                        grant=bridge_state,
+                        root=root,
+                    )
+                else:
+                    _print_operator_dispatch_bridge(bridge_state)
+                raise
+        payload = _stabilize_run_payload(args, plan_payload(args))
+        if classification is not None and classification["classification"] == "missing":
+            if payload.get("route") != "dispatch":
+                if authorize_leader:
+                    raise LeaderOrchestrateError(
+                        "operator dispatch bridge requires the single-worker dispatch route"
+                    )
+                classification = None
+            elif not authorize_leader:
+                raise LeaderOrchestrateError(
+                    "real dispatch requires a host-prepared task contract: the "
+                    "trusted host prepares the grant through the "
+                    "operation_authorization library and the operator passes "
+                    "--task-contract-json; see "
+                    "docs/framework-team/VISIBLE_DISPATCH_README.md"
+                )
+        if classification is not None and classification["classification"] != "missing":
+            if payload.get("route") != "dispatch":
+                raise LeaderOrchestrateError(
+                    "operator dispatch bridge requires the single-worker dispatch route"
+                )
+            if [str(item) for item in payload.get("workers", [])] != [
+                str(classification["worker_id"])
+            ]:
+                raise LeaderOrchestrateError(
+                    "selected payload worker does not match the explicit --worker"
+                )
+        if payload.get("route") == "langgraph":
+            argv = list(payload.get("argv", []))
+            runtime_preflight = _langgraph_runtime_preflight(root, entrypoint=argv[0] if argv else None)
+            if not bool(runtime_preflight.get("ok")):
+                blocker = _langgraph_runtime_blocker(runtime_preflight, list(payload.get("workers", [])))
+                failure = {
+                    "ok": False,
+                    "route": "langgraph",
+                    "workers": list(payload.get("workers", [])),
+                    "runtime_preflight": runtime_preflight,
+                    "blocker": blocker,
+                }
+                if args.json:
+                    print(json.dumps(failure, indent=2, sort_keys=True, ensure_ascii=False))
+                else:
+                    print("route: langgraph")
+                    print(f"runtime_preflight_status: {runtime_preflight.get('status')}")
+                    print(f"runtime_preflight_dependency: {runtime_preflight.get('dependency')}")
+                    print(f"runtime_preflight_diagnostic: {runtime_preflight.get('diagnostic')}")
+                    print(f"safe_fallback: {runtime_preflight.get('safe_fallback')}")
+                    print(f"blocker: {blocker.get('type')}")
+                _write_run_receipt_out(
+                    receipt_out,
+                    phase="langgraph_runtime_preflight_failed",
+                    args=args,
+                    returncode=2,
+                    runtime_preflight_status=str(runtime_preflight.get("status") or ""),
+                )
+                return 2
+        healed_workers: list[str] = []
+        selected_workers = [str(item) for item in payload["workers"]]
+        if payload.get("route") != "dispatch":
+            for worker_id in recommended_auto_recover_workers(root, selected_workers):
+                settle = subprocess.run(
+                    [
+                        str(root / "bin" / "omx_visible_dispatch"),
+                        "settle-latest",
+                        "--root",
+                        str(root),
+                        "--worker",
+                        worker_id,
+                        "--allow-terminal-archive",
+                    ],
+                    cwd=str(root),
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+                if authorize_leader and int(settle.returncode) != 0:
+                    raise LeaderOrchestrateError(
+                        f"settle-latest failed for {worker_id}: "
+                        f"{settle.stderr or settle.stdout}"
+                    )
+                healed_workers.append(worker_id)
+        auto_rebind_actions: list[dict[str, object]] = []
+        if bool(getattr(args, "allow_real", False)) and not bool(getattr(args, "no_auto_rebind_pane_drift", False)):
+            late_workers = [
+                worker_id
+                for worker_id in selected_workers
+                if not (
+                    classification is not None
+                    and classification.get("classification") == "fresh"
+                    and worker_id == str(classification["worker_id"])
+                )
+            ]
+            auto_rebind_actions = (
+                auto_rebind_pane_drift(
+                    root,
+                    backend=str(getattr(args, "backend", "tmux-reference") or "tmux-reference"),
+                    requested_workers=late_workers,
+                    all_production_workers=False,
+                    fanout=len(selected_workers),
+                )
+                if late_workers
+                else []
+            )
+        if repair_action is not None and repair_action.get("action") == "rebound":
+            print(
+                "binding_repaired_under_fresh_grant: "
+                f"{repair_action.get('worker_id')} "
+                f"{repair_action.get('registry_pane_id') or '-'}->"
+                f"{repair_action.get('live_pane_id') or '-'} "
+                f"port={repair_action.get('port')}",
+                file=sys.stderr,
+            )
+        if not args.json:
+            if healed_workers:
+                print(f"auto_recovered_workers: {', '.join(healed_workers)}")
+            for item in auto_rebind_actions:
+                if item.get("action") == "rebound":
+                    print(
+                        "auto_rebound_pane_drift: "
+                        f"{item.get('worker_id')} {item.get('registry_pane_id') or '-'}->{item.get('live_pane_id') or '-'} "
+                        f"port={item.get('port')}"
+                    )
+            print(f"route: {payload['route']}")
+            print(f"workers: {', '.join(payload['workers'])}")
+            print(f"reason: {payload['reason']}")
+            _print_lane_assignments(payload)
+        elif auto_rebind_actions:
+            for item in auto_rebind_actions:
+                if item.get("action") == "rebound":
+                    print(
+                        "auto_rebound_pane_drift: "
+                        f"{item.get('worker_id')} {item.get('registry_pane_id') or '-'}->{item.get('live_pane_id') or '-'} "
+                        f"port={item.get('port')}",
+                        file=sys.stderr,
+                    )
+        if authorize_leader and classification is not None:
+            if [str(item) for item in payload.get("workers", [])] != [
+                str(classification["worker_id"])
+            ]:
+                raise LeaderOrchestrateError(
+                    "selected payload worker does not match the explicit --worker"
+                )
+        bridge: dict[str, object] | None = None
+        if classification is not None:
+            argv = [str(item) for item in payload.get("argv", [])]
+            argv.extend(
+                ["--task-contract-json", str(classification["task_contract_json"])]
+            )
+            handoff_file_value = str(
+                getattr(args, "predecessor_handoff_file", "") or ""
+            ).strip()
+            if handoff_file_value:
+                argv.extend(
+                    ["--predecessor-handoff-file", handoff_file_value]
+                )
+            payload["argv"] = argv
+            bridge = classification
+        staged_body_file = _apply_body_file_transport(args, payload)
+    except Exception as exc:
+        _write_run_receipt_out(
+            receipt_out,
+            phase="preflight_failed",
+            args=args,
+            error=f"{type(exc).__name__}: {exc}",
+            task_created=False,
+            outcome_boundary="no_task_created",
+        )
+        raise
+    if receipt_out is not None and "--receipt-out" not in payload["argv"]:
+        payload["argv"] = [
+            *payload["argv"],
+            "--receipt-out",
+            str(receipt_out),
+        ]
+    prompt_delivery_mode = payload.get("prompt_delivery_mode")
+    if isinstance(prompt_delivery_mode, str) and prompt_delivery_mode:
+        _print_prompt_delivery_scope_notice(
+            prompt_delivery_mode,
+            json_output=bool(args.json),
+        )
+    _write_run_receipt_out(
+        receipt_out,
+        phase="dispatch_spawn",
+        args=args,
+        dispatch_argv0=str(payload["argv"][0]) if payload.get("argv") else "",
+        prompt_delivery_mode=prompt_delivery_mode,
+    )
+    try:
+        with readonly_wait_window():
+            proc = subprocess.run(
+                payload["argv"],
+                cwd=str(payload["root"]),
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+    except OSError as exc:
+        _write_run_receipt_out(
+            receipt_out,
+            phase="dispatch_spawn_failed",
+            args=args,
+            error=str(exc),
+        )
+        if bridge is None:
+            raise
+        os_bridge = _operator_dispatch_bridge_result(payload, bridge)
+        if args.json:
+            _print_operator_machine_receipt(
+                returncode=2,
+                grant=os_bridge,
+                root=root,
+            )
+        else:
+            _print_operator_dispatch_bridge(os_bridge)
+        raise LeaderOrchestrateError(
+            f"dispatch subprocess failed before task creation: {exc}"
+        ) from exc
+    finally:
+        if staged_body_file is not None:
+            staged_body_file.unlink(missing_ok=True)
+    if (
+        payload["route"] == "langgraph"
+        and int(proc.returncode) == 4
+        and bool(args.wait_for_workers)
+        and not args.thread_id
+        and _wait_for_workers(root, [str(item) for item in payload.get("workers", [])], timeout=int(args.worker_wait_timeout), interval=int(args.worker_wait_interval))
+    ):
+        if not args.json:
+            print("worker_pool_wait: cleared, retrying once")
+        with readonly_wait_window():
+            proc = subprocess.run(
+                payload["argv"],
+                cwd=str(payload["root"]),
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+    if payload["route"] == "langgraph" and int(proc.returncode) == 0:
+        settle_actions = _post_run_settle_terminal_locks(
+            Path(payload["root"]),
+            str(payload.get("backend") or args.backend or "tmux-reference"),
+            [str(item) for item in payload.get("workers", [])],
+        )
+        settle_failures = [item for item in settle_actions if int(item.get("returncode", 1)) != 0]
+        for item in settle_failures:
+            print(f"post_run_settle_warning: {json.dumps(item, sort_keys=True, ensure_ascii=False)}", file=sys.stderr)
+        subprocess.run(
+            [
+                str(Path(payload["root"]) / "bin" / "omx_visible_watcher"),
+                "once",
+                "--root",
+                str(payload["root"]),
+            ],
+            cwd=str(payload["root"]),
+            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    if (
+        payload["route"] == "langgraph"
+        and int(proc.returncode) != 0
+        and _lock_rejection_detected(proc.stdout or "", proc.stderr or "")
+    ):
+        settle_actions = _post_failure_settle_terminal_locks(
+            Path(payload["root"]),
+            str(payload.get("backend") or args.backend or "tmux-reference"),
+            [str(item) for item in payload.get("workers", [])],
+            timeout=int(getattr(args, "post_failure_settle_timeout", 180)),
+            interval=int(getattr(args, "post_failure_settle_interval", 5)),
+        )
+        settle_failures = [item for item in settle_actions if int(item.get("returncode", 0)) != 0]
+        settled = [item for item in settle_actions if item.get("action") == "settle" and int(item.get("returncode", 1)) == 0]
+        if settled:
+            print(f"post_failure_settle_recovered: {json.dumps(settled, sort_keys=True, ensure_ascii=False)}", file=sys.stderr)
+        for item in settle_failures:
+            print(f"post_failure_settle_warning: {json.dumps(item, sort_keys=True, ensure_ascii=False)}", file=sys.stderr)
+        subprocess.run(
+            [
+                str(Path(payload["root"]) / "bin" / "omx_visible_watcher"),
+                "once",
+                "--root",
+                str(payload["root"]),
+            ],
+            cwd=str(payload["root"]),
+            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    stderr = suppress_synthetic_timeout_after_recovered_completion(
+        proc.stdout or "",
+        proc.stderr or "",
+        int(proc.returncode),
+    )
+    bridge_result = (
+        _operator_dispatch_bridge_result(payload, bridge)
+        if bridge is not None
+        else None
+    )
+    lock_guidance: dict[str, object] | None = None
+    hint_worker = selected_workers[0] if len(selected_workers) == 1 else None
+    hint_backend = str(payload.get("backend") or getattr(args, "backend", None) or "tmux-reference")
+    effective_rc = int(proc.returncode)
+    polled_result: tuple[bool, dict[str, str], dict[str, object]] | None = None
+    if effective_rc != 0:
+        dispatch_identity = _parse_dispatch_identity(proc.stdout or "")
+        if any(
+            str(dispatch_identity.get(key) or "")
+            for key in ("run_id", "task_id", "task_dir")
+        ):
+            polled_result = _queryable_result_receipt(root, dispatch_identity)
+            task_created, queryable, polled_receipt = polled_result
+            if (
+                task_created
+                and _final_accepted_completed_receipt(polled_receipt)
+                and not _report_contract_failed(
+                    root,
+                    str(queryable.get("run_id") or ""),
+                    str(queryable.get("task_id") or ""),
+                )
+            ):
+                effective_rc = 0
+                print(
+                    "final_result_precedence: accepted completed task truth "
+                    f"observed after dispatch exit {int(proc.returncode)}; "
+                    "historical wait/collect facts remain in the task record",
+                    file=sys.stderr,
+                )
+    stdout_identity = _parse_dispatch_identity(proc.stdout or "")
+    bridge_task_id = (
+        str(bridge.get("task_id") or "") if isinstance(bridge, dict) else ""
+    )
+    bridge_attempt_id = (
+        str(bridge.get("attempt_id") or "") if isinstance(bridge, dict) else ""
+    )
+    bridge_worker_id = (
+        str(bridge.get("worker_id") or "") if isinstance(bridge, dict) else ""
+    )
+    validated_task_id = (
+        str(getattr(args, "task_id", "") or "") or bridge_task_id
+    )
+    validated_attempt_id = (
+        str(getattr(args, "attempt_id", "") or "") or bridge_attempt_id
+    )
+    validated_worker_id = ",".join(
+        str(item) for item in (getattr(args, "worker", None) or [])
+    ) or bridge_worker_id
+    merged_identity = _merge_child_receipt_identity(
+        _read_receipt_snapshot(receipt_out),
+        current_task_id=validated_task_id,
+        current_attempt_id=validated_attempt_id,
+        current_worker_id=validated_worker_id,
+        accept_phases={"claim_reserved", "task_prepared"},
+    )
+    pending_wait = bool(
+        payload["route"] == "dispatch"
+        and effective_rc != 0
+        and polled_result is not None
+        and _healthy_pending_wait_receipt(
+            root,
+            dispatch_returncode=int(proc.returncode),
+            polled_result=polled_result,
+            worker_id=validated_worker_id,
+            task_id=validated_task_id,
+            attempt_id=validated_attempt_id,
+        )
+    )
+    session_identity_mismatch: dict[str, object] | None = None
+    if (
+        polled_result is not None
+        and polled_result[0]
+        # #1007 fix: a retained delivery mismatch is historical evidence.
+        # Once the current task truth is an accepted terminal result
+        # (completed, failed, or blocked), the mismatch block must not
+        # issue active recovery instructions that contradict terminal
+        # truth; delivery.json itself is preserved.
+        and not _final_accepted_terminal_receipt(polled_result[2])
+    ):
+        import omx_visible_task_state as _task_state
+
+        try:
+            session_identity_mismatch = _delivery_session_identity_mismatch(
+                _task_state.task_dir(
+                    root,
+                    polled_result[1].get("run_id") or "",
+                    polled_result[1].get("task_id") or "",
+                )
+            )
+        except _task_state.TaskStateError:
+            session_identity_mismatch = None
+    if pending_wait:
+        effective_rc = 0
+    if effective_rc != 0 and _lock_rejection_detected(proc.stdout or "", proc.stderr or ""):
+        if hint_worker:
+            locks_payload, locks_error = _load_locks_payload(root, worker_id=hint_worker)
+            candidate_guidance = build_failure_recovery_guidance(
+                root=root,
+                backend=hint_backend,
+                worker_id=hint_worker,
+                locks_payload=locks_payload,
+                locks_error=locks_error,
+            )
+            if str(candidate_guidance.get("condition") or "") != "no_recovery_needed":
+                lock_guidance = candidate_guidance
+        if bridge_result is not None and lock_guidance is not None:
+            bridge_result["recovery_guidance"] = lock_guidance
+    observe_command = (
+        _late_receipt_observe_command(
+            root,
+            task_created=polled_result[0],
+            queryable=polled_result[1],
+            receipt=polled_result[2],
+            attempt_id=validated_attempt_id or str(merged_identity.get("attempt_id") or ""),
+        )
+        if polled_result is not None and (pending_wait or effective_rc != 0)
+        else ""
+    )
+    _write_run_receipt_out(
+        receipt_out,
+        phase="dispatch_exit",
+        args=args,
+        returncode=effective_rc,
+        dispatch_returncode=int(proc.returncode),
+        task_id=validated_task_id
+        or str(merged_identity.get("identity_task_id") or "")
+        or "unknown",
+        attempt_id=validated_attempt_id
+        or str(merged_identity.get("attempt_id") or "")
+        or "unknown",
+        event_id=str(getattr(args, "event_id", "") or "") or "unknown",
+        run_id=str(stdout_identity.get("run_id") or "")
+        or merged_identity.get("run_id")
+        or "",
+        identity_task_id=str(stdout_identity.get("task_id") or "")
+        or merged_identity.get("identity_task_id")
+        or "",
+        task_dir=str(stdout_identity.get("task_dir") or "")
+        or merged_identity.get("task_dir")
+        or "",
+        dispatch_claim_path=merged_identity.get("dispatch_claim_path") or "",
+        task_created=polled_result[0] if polled_result is not None else merged_identity.get("task_created"),
+        ok=effective_rc == 0,
+        **({"result_receipt": polled_result[2]} if polled_result is not None else {}),
+        next_observe_command=observe_command,
+        **({"run_wait_result": "pending"} if pending_wait else {}),
+        **(
+            {"session_identity_mismatch": session_identity_mismatch}
+            if session_identity_mismatch is not None
+            else {}
+        ),
+    )
+    if args.json and bridge_result is not None:
+        _print_operator_machine_receipt(
+            returncode=effective_rc,
+            grant=bridge_result,
+            identity=_parse_dispatch_identity(proc.stdout or ""),
+            root=root,
+            stdout_log=proc.stdout or "",
+            stderr_log=stderr or "",
+            polled_result=polled_result,
+            dispatch_returncode=int(proc.returncode) if polled_result is not None else None,
+            next_observe_command=observe_command,
+            pending_wait=pending_wait,
+            session_identity_mismatch=session_identity_mismatch,
+        )
+        if effective_rc != 0 and _lock_rejection_detected(proc.stdout or "", proc.stderr or ""):
+            _print_lock_failure_hint(
+                root,
+                worker_id=hint_worker,
+                backend=hint_backend,
+                guidance=lock_guidance,
+            )
+        return effective_rc
+    if proc.stdout:
+        print(proc.stdout, end="")
+    if stderr:
+        print(stderr, end="", file=sys.stderr)
+    if pending_wait:
+        print("ok: true")
+        print("returncode: 0")
+        print(f"dispatch_returncode: {int(proc.returncode)}")
+        print("run_wait_result: pending")
+        print("acceptance_result: pending")
+        print("protocol_complete: false")
+    if session_identity_mismatch is not None:
+        # #1007: a confirmed post-delivery session identity mismatch is not
+        # ordinary same-session pending work; print it distinctly with the
+        # bounded preserve-evidence/worker-scoped recovery route.
+        print(f"session_identity_mismatch: {session_identity_mismatch['status']}")
+        print(
+            "session_fence_expected_session: "
+            f"{session_identity_mismatch.get('expected_session_id') or '-'}"
+        )
+        observed_ids = ",".join(
+            str(item) for item in session_identity_mismatch.get("observed_session_ids") or []
+        ) or "-"
+        print(f"observed_live_sessions: {observed_ids}")
+        print(
+            "next_safe_action: "
+            f"{session_identity_mismatch.get('next_safe_action')}  # "
+            "do not adopt the observed session/model, resend, edit the fence/"
+            "lock, or retry an identical finish; resolve identity via the "
+            "operator-confirmed session or existing authorized worker-scoped "
+            "recovery closeout with its stopped/writer-exit/identity gates"
+        )
+    if polled_result is not None and (pending_wait or effective_rc != 0):
+        # #910: keep the historical dispatch output above and add the later
+        # current task truth with the exact read-only observation step when
+        # a nonterminal task is retained; started is not completion and no
+        # retry or lock release happens here.
+        latest_created, latest_queryable, latest_receipt = polled_result
+        observe_command = _late_receipt_observe_command(
+            root,
+            task_created=latest_created,
+            queryable=latest_queryable,
+            receipt=latest_receipt,
+            attempt_id=(
+                validated_attempt_id
+                or str(merged_identity.get("attempt_id") or "")
+            ),
+        )
+        if observe_command:
+            latest_state = str(
+                latest_receipt.get("protocol_terminal_state") or "unknown"
+            )
+            time_facts = []
+            truth_generated_at = str(latest_receipt.get("generated_at") or "")
+            last_event_ts = str(latest_receipt.get("last_event_ts") or "")
+            if truth_generated_at:
+                time_facts.append(f"truth_generated_at={truth_generated_at}")
+            if last_event_ts:
+                time_facts.append(f"last_event_ts={last_event_ts}")
+            time_facts_text = (
+                " " + " ".join(time_facts) if time_facts else " (no time facts available)"
+            )
+            print(
+                "latest_observation: "
+                f"run={latest_queryable.get('run_id')} "
+                f"task={latest_queryable.get('task_id')} "
+                f"state={latest_state}{time_facts_text} - the dispatch child "
+                "output above is historical; this later current task truth "
+                "is not completion"
+            )
+            print(
+                f"next_step: {observe_command}  # read-only observation; "
+                "does not retry, release locks, or finish the task"
+            )
+    if effective_rc != 0 and _lock_rejection_detected(proc.stdout or "", proc.stderr or ""):
+        _print_lock_failure_hint(
+            root,
+            worker_id=hint_worker,
+            backend=hint_backend,
+            guidance=lock_guidance,
+        )
+    if bridge_result is not None:
+        _print_operator_dispatch_bridge(bridge_result)
+    return effective_rc
+
+
+def _wait_for_workers(root: Path, workers: list[str], *, timeout: int, interval: int) -> bool:
+    deadline = time.time() + max(0, int(timeout))
+    wanted = {str(item) for item in workers if str(item)}
+    while time.time() < deadline:
+        summary = active_worker_pool_leases_summary(root)
+        active = set(summary.get("workers", []))
+        if not active.intersection(wanted):
+            return True
+        time.sleep(max(1, int(interval)))
+    return False
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="omx_visible_orchestrate",
+        description=(
+            "Single leader entrypoint that chooses single-worker dispatch or LangGraph fan-out from registry state. "
+            "For fanout-2 read-only collaboration, prefer explicit --lane-contracts when lanes naturally split."
+        ),
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    plan_cmd = sub.add_parser("plan", help="show the selected route and downstream command")
+    add_common_run_arguments(plan_cmd)
+    plan_cmd.add_argument(
+        "--body",
+        required=True,
+        help="task body text; the plan preview shows the worker-rendered body inline",
+    )
+    plan_cmd.set_defaults(func=command_plan)
+
+    run_cmd = sub.add_parser("run", help="execute the selected route")
+    add_common_run_arguments(run_cmd)
+    body_inputs = run_cmd.add_mutually_exclusive_group(required=True)
+    body_inputs.add_argument(
+        "--body",
+        default=None,
+        help="task body text; exposed in the process list while the task runs, prefer --body-file for long bodies",
+    )
+    body_inputs.add_argument(
+        "--body-file",
+        dest="body_file",
+        default=None,
+        help="read the task body from this UTF-8 file instead of --body; mutually exclusive with --body and only supported on the single-worker dispatch route (plan keeps inline --body only)",
+    )
+    run_cmd.add_argument(
+        "--authorize-leader",
+        action="store_true",
+        help=(
+            "preferred public grant entry: prepares one task/attempt grant "
+            "and consumes it through this same command. Do not call the "
+            "internal grant API."
+        ),
+    )
+    run_cmd.add_argument(
+        "--initial-dispatch-selector-json",
+        default="",
+        help=(
+            "optional public Server canary entry: path to one JSON file "
+            "containing exactly the opencode_server_prompt_async_canary "
+            "selector (absolute candidate_manifest_path, pinned "
+            "candidate_bundle_digest, and session_id or session_mode). "
+            "Requires --authorize-leader; the selector is validated and "
+            "admitted against the pinned manifest before the grant is "
+            "minted. Without it, ordinary TUI dispatch is unchanged. This "
+            "selector also admits same-task resume. Ordinary TUI tasks can "
+            "use public supplement with the bound selection and live schema "
+            "checks, or interrupt abort-only, without this selector. The "
+            "selector cannot be added to a task contract retroactively."
+        ),
+    )
+    run_cmd.add_argument("--task-id", default="")
+    run_cmd.add_argument("--attempt-id", default="")
+    run_cmd.add_argument("--event-id", default="")
+    run_cmd.add_argument(
+        "--current-window-worker-port",
+        dest="current_window_worker_port",
+        type=int,
+        default=None,
+        help=(
+            "resolve the dispatch target from the caller's current tmux "
+            "window (TMUX_PANE) and this local OpenCode listener port into "
+            "exactly one registered worker before authorization; mutually "
+            "exclusive with --worker, --fanout, and --all-production-workers"
+        ),
+    )
+    run_cmd.add_argument(
+        "--predecessor-handoff-file",
+        dest="predecessor_handoff_file",
+        default="",
+        help=(
+            "optional hash-bound predecessor handoff record; validated "
+            "before grant minting and bound into the dispatch contract so "
+            "the predecessor's single successor slot is claimed at "
+            "protected preparation"
+        ),
+    )
+    run_cmd.add_argument(
+        "--receipt-out",
+        dest="receipt_out",
+        default="",
+        help=(
+            "optional path for a durable run receipt: written atomically "
+            "before the dispatch child spawns (with the precise "
+            "task/attempt/event ids and the current phase) and rewritten "
+            "with the final result at exit, so the leader can determine "
+            "run/task identity and stage even when redirected stdout is "
+            "lost under backgrounded invocation"
+        ),
+    )
+    run_cmd.set_defaults(func=command_run)
+
+    for command_parser in sub.choices.values():
+        command_parser.set_defaults(root=None)
+    return parser
+
+
+def main(argv: list[str] | None = None, *, _admission_root: Path | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        resolve_body_file_argument(args)
+        return invoke_cli_handler("omx_visible_orchestrate", args, args.func, admission_root=_admission_root)
+    except RecoveryGuidanceError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        root = root_path(getattr(args, "root", "."))
+        workers = parse_workers(getattr(args, "worker", []) or [])
+        hint_worker = workers[0] if len(workers) == 1 else None
+        _print_lock_failure_hint(
+            root,
+            worker_id=hint_worker,
+            backend=str(getattr(args, "backend", "tmux-reference") or "tmux-reference"),
+            guidance=getattr(exc, "guidance", None),
+        )
+        return 2
+    except LeaderOrchestrateError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except LaneContractError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except AdmissionError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

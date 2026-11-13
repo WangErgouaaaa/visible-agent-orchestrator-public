@@ -1,0 +1,147 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OpenCode Runtime-Proof Executor Writer Contract",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version",
+    "writer_kind",
+    "writer_contract_id",
+    "source_executor_contract_id",
+    "source_executor_contract_sha256",
+    "source_executor_contract_validation",
+    "target_worker_id",
+    "backend_kind",
+    "writer_mode",
+    "writer_state",
+    "single_attempt_writer_contract",
+    "cleanup_proof_writer_contract",
+    "failure_timeout_contract",
+    "terminal_truth_writer_contract",
+    "future_writer_receipt_template",
+    "would_execute_opencode",
+    "would_create_temp_root",
+    "would_run_cleanup",
+    "would_write_cleanup_proof",
+    "would_write_task_local",
+    "would_write_registry",
+    "would_write_state_team",
+    "would_touch_tmux",
+    "would_call_tui",
+    "safe_next_actions",
+    "forbidden_next_actions",
+    "blocked_reasons",
+    "warnings",
+    "validation",
+    "advisory"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "writer_kind": {
+      "const": "opencode-runtime-proof-executor-writer-contract"
+    },
+    "writer_contract_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source_executor_contract_id": {
+      "type": "string"
+    },
+    "source_executor_contract_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "source_executor_contract_validation": {
+      "type": "object"
+    },
+    "target_worker_id": {
+      "type": "string"
+    },
+    "backend_kind": {
+      "const": "opencode_tui"
+    },
+    "writer_mode": {
+      "const": "no-execution"
+    },
+    "writer_state": {
+      "const": "review_only"
+    },
+    "single_attempt_writer_contract": {
+      "type": "object",
+      "required": [
+        "attempt_limit",
+        "attempt_count",
+        "attempt_index",
+        "single_attempt_only",
+        "no_retry"
+      ]
+    },
+    "cleanup_proof_writer_contract": {
+      "type": "object",
+      "required": [
+        "cleanup_receipt_path",
+        "temp_root",
+        "cleanup_required",
+        "cleanup_scope",
+        "cleanup_leftover_paths_must_be_empty",
+        "atomic_write_required"
+      ]
+    },
+    "failure_timeout_contract": {
+      "type": "object"
+    },
+    "terminal_truth_writer_contract": {
+      "type": "object"
+    },
+    "future_writer_receipt_template": {
+      "type": "object"
+    },
+    "would_execute_opencode": {
+      "const": false
+    },
+    "would_create_temp_root": {
+      "const": false
+    },
+    "would_run_cleanup": {
+      "const": false
+    },
+    "would_write_cleanup_proof": {
+      "const": false
+    },
+    "would_write_task_local": {
+      "const": false
+    },
+    "would_write_registry": {
+      "const": false
+    },
+    "would_write_state_team": {
+      "const": false
+    },
+    "would_touch_tmux": {
+      "const": false
+    },
+    "would_call_tui": {
+      "const": false
+    },
+    "safe_next_actions": {
+      "type": "array"
+    },
+    "forbidden_next_actions": {
+      "type": "array"
+    },
+    "blocked_reasons": {
+      "type": "array"
+    },
+    "warnings": {
+      "type": "array"
+    },
+    "validation": {
+      "type": "object"
+    },
+    "advisory": {
+      "type": "string"
+    }
+  }
+}

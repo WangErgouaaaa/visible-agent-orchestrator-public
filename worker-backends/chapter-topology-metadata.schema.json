@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "chapter-level topology metadata contract",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "chapter",
+    "recommended_inner_topology",
+    "recommended_roles",
+    "summary"
+  ],
+  "properties": {
+    "schema_version": { "type": "integer", "const": 1 },
+    "chapter": { "type": "string", "minLength": 1 },
+    "recommended_inner_topology": {
+      "type": "string",
+      "enum": ["1x3", "1x5", "1x7"]
+    },
+    "recommended_roles": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "summary": { "type": "string", "minLength": 1 }
+  },
+  "additionalProperties": true
+}

@@ -1,0 +1,244 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OpenCode Runtime-Proof Install/Sync Review",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version",
+    "review_kind",
+    "review_id",
+    "review_state",
+    "review_mode",
+    "source_root",
+    "target_root",
+    "phase_range",
+    "source_rollout_review_kind",
+    "source_rollout_review_validation",
+    "install_plan_summary",
+    "asset_inventory",
+    "install_plan_bindings",
+    "parity_review",
+    "install_sync_review_summary",
+    "reviewer_ack_kind",
+    "reviewer_ack_scope",
+    "reviewer_ack_expires_at",
+    "stale_installed_state_claim",
+    "unsafe_apply_wording_detected",
+    "unsafe_diff_wording_detected",
+    "unsafe_write_claims_detected",
+    "no_apply_flags",
+    "would_run_install_sync_apply",
+    "would_write_data_sync",
+    "would_copy_files",
+    "would_chmod",
+    "would_run_live_smoke",
+    "would_execute_opencode",
+    "would_touch_tmux",
+    "would_call_tui",
+    "would_write_task_local",
+    "would_write_registry",
+    "would_write_state_team",
+    "claims_installed_parity",
+    "claims_runtime_execution_proven",
+    "safe_next_actions",
+    "forbidden_next_actions",
+    "blocked_reasons",
+    "warnings",
+    "validation",
+    "advisory"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "review_kind": {
+      "const": "opencode-runtime-proof-install-sync-review"
+    },
+    "review_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "review_state": {
+      "const": "review_only"
+    },
+    "review_mode": {
+      "const": "dry-run-plan-no-apply"
+    },
+    "source_root": {
+      "type": "string"
+    },
+    "target_root": {
+      "type": "string"
+    },
+    "phase_range": {
+      "type": "array",
+      "prefixItems": [
+        {
+          "const": 15
+        },
+        {
+          "const": 16
+        },
+        {
+          "const": 17
+        },
+        {
+          "const": 18
+        },
+        {
+          "const": 19
+        },
+        {
+          "const": 20
+        },
+        {
+          "const": 23
+        },
+        {
+          "const": 26
+        },
+        {
+          "const": 30
+        }
+      ]
+    },
+    "source_rollout_review_kind": {
+      "const": "opencode-runtime-proof-rollout-review"
+    },
+    "source_rollout_review_validation": {
+      "type": "object"
+    },
+    "install_plan_summary": {
+      "type": "object",
+      "required": [
+        "dry_run",
+        "dry_run_only",
+        "writes_target",
+        "copies_files",
+        "chmod",
+        "live_smoke",
+        "file_count",
+        "action_counts"
+      ]
+    },
+    "asset_inventory": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "asset_id",
+          "phase",
+          "asset_kind",
+          "source_rel",
+          "target_rel",
+          "install_plan_item_present",
+          "file_kind",
+          "action",
+          "source_exists",
+          "install_allowed",
+          "requires_review",
+          "smoke_required_after_install",
+          "source_sha256"
+        ]
+      }
+    },
+    "install_plan_bindings": {
+      "type": "array"
+    },
+    "parity_review": {
+      "type": "object",
+      "required": [
+        "installed_parity_claimed",
+        "installed_parity_unclaimed",
+        "target_states_observed_from_dry_run_only"
+      ]
+    },
+    "install_sync_review_summary": {
+      "type": "object"
+    },
+    "reviewer_ack_kind": {
+      "enum": [
+        "none",
+        "review-only"
+      ]
+    },
+    "reviewer_ack_scope": {
+      "const": "review-only-no-apply"
+    },
+    "reviewer_ack_expires_at": {
+      "type": "string"
+    },
+    "stale_installed_state_claim": {
+      "const": false
+    },
+    "unsafe_apply_wording_detected": {
+      "const": false
+    },
+    "unsafe_diff_wording_detected": {
+      "const": false
+    },
+    "unsafe_write_claims_detected": {
+      "const": false
+    },
+    "no_apply_flags": {
+      "type": "object"
+    },
+    "would_run_install_sync_apply": {
+      "const": false
+    },
+    "would_write_data_sync": {
+      "const": false
+    },
+    "would_copy_files": {
+      "const": false
+    },
+    "would_chmod": {
+      "const": false
+    },
+    "would_run_live_smoke": {
+      "const": false
+    },
+    "would_execute_opencode": {
+      "const": false
+    },
+    "would_touch_tmux": {
+      "const": false
+    },
+    "would_call_tui": {
+      "const": false
+    },
+    "would_write_task_local": {
+      "const": false
+    },
+    "would_write_registry": {
+      "const": false
+    },
+    "would_write_state_team": {
+      "const": false
+    },
+    "claims_installed_parity": {
+      "const": false
+    },
+    "claims_runtime_execution_proven": {
+      "const": false
+    },
+    "safe_next_actions": {
+      "type": "array"
+    },
+    "forbidden_next_actions": {
+      "type": "array"
+    },
+    "blocked_reasons": {
+      "type": "array"
+    },
+    "warnings": {
+      "type": "array"
+    },
+    "validation": {
+      "type": "object"
+    },
+    "advisory": {
+      "type": "string"
+    }
+  }
+}

@@ -1,0 +1,811 @@
+#!/usr/bin/env /usr/bin/python3
+"""Codex app-server client entry for the visible-agent-orchestrator codex_tui backend.
+
+Run with /usr/bin/python3 (has websockets 15.x; the framework's default
+python may not). Everything here speaks the app-server JSON-RPC protocol over
+the daemon's unix socket via WebSocket (HTTP Upgrade), per the official
+protocol. Read-only subcommands never send write methods; submit-turn follows
+the stage-1 verified semantics (identity/idle pre-flight, thread/resume
+subscription, exactly ONE turn/start, absolute deadlines, structured events,
+no resend).
+
+Subcommands (all print one JSON object to stdout; exit codes below):
+  identity --socket S [--codex-home H] [--pane-pid P]
+      Read-only daemon/identity diagnostics: control socket resolution,
+      daemon process check, daemon initialize handshake, thread/list and
+      thread/loaded/list projections. Exit 0 on handshake, 3 rpc error.
+  thread-read --socket S --thread T
+      initialize->initialized->thread/read for T only. Exit 0 read ok,
+      3 rpc error, 2 connect/usage, 4 timeout.
+  submit-turn --socket S --thread T --input-file F --out-dir D
+      [--wait-seconds N] [--request-timeout R]
+      Resume subscription, or exact no-rollout fresh-thread direct start.
+      Missing subscription never implies completion. Exit 0
+      completed; 2 refused/usage; 3 rpc error or turn failed/interrupted;
+      4 timeout/unknown receipt; 5 disconnect unknown.
+  turn-status --socket S --thread T --turn ID
+      Read-only thread/turns/list query for the recorded turn. Exit 0 found
+      (result contains status), 3 rpc error, 4 not found.
+
+No keystrokes are sent to any pane; no approval is ever answered; only the
+given thread id is referenced; other threads' events are redacted.
+"""
+import argparse
+import asyncio
+import json
+import os
+import socket as socket_mod
+import sys
+import time
+
+try:
+    from websockets.asyncio.client import unix_connect
+    from websockets.exceptions import ConnectionClosed
+except ImportError:
+    sys.stderr.write("websockets unavailable: run with /usr/bin/python3\n")
+    sys.exit(2)
+
+CONNECT_TIMEOUT = 8.0
+DEFAULT_REQUEST_TIMEOUT = 20.0
+MAX_INPUT_BYTES = 65536
+EVIDENCE_FILES = ("turn-intent.json", "turn-receipt.json", "resume-state.json",
+                  "result-summary.json", "events.jsonl", "pre-state.json")
+
+
+class Unknown(Exception):
+    def __init__(self, phase, kind, detail=None):
+        self.phase, self.kind, self.detail = phase, kind, detail
+        super().__init__(f"{phase}/{kind}")
+
+
+def now_ms():
+    return int(time.time() * 1000)
+
+
+def resolve_control_socket(socket_arg, codex_home):
+    if socket_arg:
+        return socket_arg
+    home = codex_home or os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+    return os.path.join(home, "app-server-control", "app-server-control.sock")
+
+
+def daemon_identity(socket_path):
+    """Best-effort read-only daemon facts for diagnostics."""
+    info = {"control_socket": socket_path,
+            "socket_exists": os.path.exists(socket_path)}
+    try:
+        info["real_socket"] = os.path.realpath(socket_path)
+    except OSError:
+        info["real_socket"] = None
+    return info
+
+
+class Session:
+    def __init__(self, ws, events, target_thread):
+        self.ws = ws
+        self.events = events
+        self.target = target_thread
+        self.next_id = 1
+
+    async def rpc(self, method, params, timeout, phase):
+        rid = self.next_id
+        self.next_id += 1
+        await self.ws.send(json.dumps({"method": method, "id": rid,
+                                       "params": params}, ensure_ascii=False))
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise Unknown(phase, "timeout")
+            try:
+                raw = await asyncio.wait_for(self.ws.recv(), remaining)
+            except (asyncio.TimeoutError, TimeoutError):
+                raise Unknown(phase, "timeout")
+            except ConnectionClosed as exc:
+                self.events.append({"t": now_ms(), "dir": "in",
+                                    "kind": "transport", "error": repr(exc)})
+                raise Unknown(phase, "disconnect")
+            msg = json.loads(raw)
+            if msg.get("id") == rid and ("result" in msg or "error" in msg):
+                return msg
+            await self.record(msg, "in")
+
+    async def record(self, msg, direction):
+        method = msg.get("method")
+        has_id = "id" in msg
+        is_response = ("result" in msg) or ("error" in msg)
+        rec = {"t": now_ms(), "dir": direction,
+               "kind": ("response" if is_response and has_id else
+                        "server_request" if has_id and method else
+                        "notification" if method else "other"),
+               "method": method, "id": msg.get("id")}
+        params = msg.get("params")
+        if direction == "in" and isinstance(params, dict):
+            th = params.get("threadId")
+            if th is not None and self.target is not None and th != self.target:
+                rec["redacted_other_thread"] = str(th)
+            else:
+                rec["params"] = bounded_params(method, params)
+        elif direction == "in" and params is not None:
+            rec["params"] = str(params)[:500]
+        self.events.append(rec)
+        return rec
+
+    async def handshake(self, timeout):
+        resp = await self.rpc(
+            "initialize",
+            {"clientInfo": {"name": "omx-codex-tui-adapter",
+                            "version": "0.1.0",
+                            "title": "visible-agent-orchestrator codex worker"}},
+            timeout, "handshake")
+        if "error" in resp:
+            return {"error": resp["error"]}
+        await self.ws.send(json.dumps({"method": "initialized"}))
+        return {"result": resp.get("result", {})}
+
+
+def bounded_params(method, params):
+    if method in ("turn/completed", "turn/started"):
+        turn = params.get("turn") or {}
+        err = turn.get("error")
+        err_bounded = err
+        if err is not None:
+            s = json.dumps(err, ensure_ascii=False, default=str)
+            err_bounded = err if len(s) <= 800 else s[:800]
+        return {"threadId": params.get("threadId"),
+                "turn": {"id": turn.get("id"), "status": turn.get("status"),
+                         "error": err_bounded,
+                         "omitted_fields": sorted(
+                             set(turn) - {"id", "status", "error"})}}
+    s = json.dumps(params, ensure_ascii=False, default=str)
+    if len(s) <= 4000:
+        return params
+    return {"_display_excerpt": s[:4000]}
+
+
+def find_completed(events, target, turn_id):
+    for rec in events:
+        if rec.get("method") != "turn/completed":
+            continue
+        p = rec.get("params") or {}
+        if target is not None and p.get("threadId") != target:
+            continue
+        turn = p.get("turn") or {}
+        if turn_id is None or turn.get("id") == turn_id:
+            return turn
+    return None
+
+
+async def open_session(socket_path, events, target):
+    return await unix_connect(socket_path, uri="ws://localhost/",
+                              open_timeout=CONNECT_TIMEOUT)
+
+
+async def cmd_identity(args):
+    out = {"daemon": daemon_identity(args.socket)}
+    events = []
+    try:
+        async with await open_session(args.socket, events, None) as ws:
+            s = Session(ws, events, None)
+            hs = await s.handshake(CONNECT_TIMEOUT)
+            if "error" in hs:
+                out.update(status="error_response", detail=hs["error"])
+                print(json.dumps(out, ensure_ascii=False, default=str))
+                return 3
+            listing = await s.rpc("thread/list", {"limit": 20},
+                                  args.request_timeout, "read")
+            loaded = await s.rpc("thread/loaded/list", {},
+                                 args.request_timeout, "read")
+            out.update(status="ok", initialize=hs["result"],
+                       threads=[{"id": t.get("id"),
+                                 "title": (t.get("title") or t.get("name")
+                                           or "")[:48],
+                                 "cwd": t.get("cwd"),
+                                 "status": (t.get("status") or {}).get("type")
+                                 if isinstance(t.get("status"), dict)
+                                 else t.get("status")}
+                                for t in (listing.get("result", {})
+                                          .get("data") or [])[:20]],
+                       loaded_threads=(loaded.get("result", {})
+                                       .get("data") or []))
+            print(json.dumps(out, ensure_ascii=False, default=str))
+            return 0
+    except Unknown as u:
+        out.update(status=f"{u.kind}_unknown", phase=u.phase)
+        print(json.dumps(out, ensure_ascii=False, default=str))
+        return 4 if u.kind == "timeout" else 2
+    except (OSError, TimeoutError, ConnectionClosed) as exc:
+        out.update(status="connect_failed", detail=repr(exc))
+        print(json.dumps(out, ensure_ascii=False, default=str))
+        return 2
+
+
+async def cmd_thread_read(args):
+    events = []
+    out = {"thread": args.thread, "socket": args.socket}
+    try:
+        async with await open_session(args.socket, events, args.thread) as ws:
+            s = Session(ws, events, args.thread)
+            hs = await s.handshake(CONNECT_TIMEOUT)
+            if "error" in hs:
+                out.update(status="error_response", detail=hs["error"])
+                print(json.dumps(out, ensure_ascii=False, default=str))
+                return 3
+            resp = await s.rpc("thread/read", {"threadId": args.thread},
+                               args.request_timeout, "read_state")
+            if "error" in resp:
+                out.update(status="rpc_error", detail=resp["error"])
+                code = 3
+            else:
+                thread = (resp.get("result") or {}).get("thread") or {}
+                out.update(status="ok", thread_state={
+                    k: thread.get(k) for k in
+                    ("id", "status", "model", "reasoningEffort",
+                     "modelProvider", "cwd", "updatedAt")})
+                code = 0 if thread.get("id") == args.thread else 3
+                if code:
+                    out["status"] = "identity_mismatch"
+                    out["thread_id_returned"] = thread.get("id")
+            print(json.dumps(out, ensure_ascii=False, default=str))
+            return code
+    except Unknown as u:
+        out.update(status=f"{u.kind}_unknown", phase=u.phase)
+        print(json.dumps(out, ensure_ascii=False, default=str))
+        return 4 if u.kind == "timeout" else 2
+    except (OSError, TimeoutError, ConnectionClosed) as exc:
+        out.update(status="connect_failed", detail=repr(exc))
+        print(json.dumps(out, ensure_ascii=False, default=str))
+        return 2
+
+
+async def cmd_turn_status(args):
+    events = []
+    out = {"thread": args.thread, "turn": args.turn}
+    try:
+        async with await open_session(args.socket, events, args.thread) as ws:
+            s = Session(ws, events, args.thread)
+            hs = await s.handshake(CONNECT_TIMEOUT)
+            if "error" in hs:
+                out.update(status="error_response", detail=hs["error"])
+                print(json.dumps(out, ensure_ascii=False, default=str))
+                return 3
+            resp = await s.rpc(
+                "thread/turns/list",
+                {"threadId": args.thread, "limit": 50,
+                 "sortDirection": "desc", "itemsView": "notLoaded"},
+                args.request_timeout, "read")
+            if "error" in resp:
+                out.update(status="rpc_error", detail=resp["error"])
+                print(json.dumps(out, ensure_ascii=False, default=str))
+                return 3
+            turns = (resp.get("result") or {}).get("data") or []
+            for entry in turns:
+                turn = entry.get("turn") or entry
+                if str(turn.get("id")) == str(args.turn):
+                    out.update(status="ok", turn_state={
+                        k: turn.get(k) for k in
+                        ("id", "status", "completedAt", "durationMs",
+                         "error")})
+                    print(json.dumps(out, ensure_ascii=False, default=str))
+                    return 0
+            out.update(status="turn_not_found",
+                       recent_turn_ids=[str((e.get("turn") or e).get("id"))
+                                        for e in turns[:10]])
+            print(json.dumps(out, ensure_ascii=False, default=str))
+            return 4
+    except Unknown as u:
+        out.update(status=f"{u.kind}_unknown", phase=u.phase)
+        print(json.dumps(out, ensure_ascii=False, default=str))
+        return 4 if u.kind == "timeout" else 2
+    except (OSError, TimeoutError, ConnectionClosed) as exc:
+        out.update(status="connect_failed", detail=repr(exc))
+        print(json.dumps(out, ensure_ascii=False, default=str))
+        return 2
+
+
+async def cmd_recovery_stop(args):
+    async def read():
+        async with await unix_connect(args.socket, uri="ws://localhost/",
+                                      open_timeout=2.0, max_size=5_000_000) as ws:
+            class BoundedSocket:
+                received_bytes = 0
+
+                async def send(self, raw):
+                    await ws.send(raw)
+
+                async def recv(self):
+                    raw = await ws.recv()
+                    self.received_bytes += len(raw.encode("utf-8") if isinstance(raw, str) else raw)
+                    if self.received_bytes > 5_000_000:
+                        raise ValueError("native recovery observation byte budget exceeded")
+                    return raw
+
+            session = Session(BoundedSocket(), [], args.thread)
+            handshake = await session.handshake(2.0)
+            if "error" in handshake:
+                raise ValueError("native recovery handshake failed")
+            response = await session.rpc("thread/turns/list", {
+                "threadId": args.thread, "limit": 32, "sortDirection": "desc",
+                "itemsView": "notLoaded",
+            }, 2.0, "recovery_turn_tail")
+            payload = response.get("result")
+            turns = payload.get("data") if isinstance(payload, dict) else None
+            if "error" in response or not isinstance(turns, list) or not 0 < len(turns) <= 32:
+                raise ValueError("bounded native turn tail failed/insufficient")
+            normalized = []
+            for entry in turns:
+                turn = entry.get("turn", entry) if isinstance(entry, dict) else None
+                if (not isinstance(turn, dict) or not isinstance(turn.get("id"), str)
+                        or not turn["id"] or turn.get("status") not in {
+                            "completed", "interrupted", "failed", "inProgress"}):
+                    raise ValueError("bounded native turn shape unknown")
+                normalized.append({key: turn.get(key) for key in ("id", "status", "completedAt")})
+            ids = [turn["id"] for turn in normalized]
+            if args.turn not in ids or len(set(ids)) != len(ids):
+                raise ValueError("exact task turn absent/ambiguous in bounded native tail")
+            response = await session.rpc("thread/read", {"threadId": args.thread}, 2.0, "recovery_thread")
+            state = (response.get("result") or {}).get("thread") or {}
+            runtime = state.get("status")
+            status = runtime.get("type") if isinstance(runtime, dict) else runtime
+            if "error" in response or state.get("id") != args.thread or status != "idle":
+                raise ValueError("exact native thread unknown/non-idle")
+            return {"ok": True, "session_id": args.thread, "task_turn_id": args.turn,
+                    "turns": normalized[:ids.index(args.turn) + 1],
+                    "source": "codex_appserver_thread_turn_read"}
+
+    try:
+        result = await asyncio.wait_for(read(), timeout=6.0)
+    except (Unknown, OSError, TimeoutError, ConnectionClosed, ValueError, TypeError, AttributeError) as exc:
+        print(json.dumps({"ok": False, "error": str(exc)[:500]}))
+        return 4
+    print(json.dumps(result))
+    return 0
+
+
+async def cmd_interrupt_turn(args):
+    """Subscribe (resume) then turn/interrupt the EXACT recorded turn."""
+    events = []
+    out = {"thread": args.thread, "turn": args.turn,
+           "outcome": "error", "phase": "connect"}
+    try:
+        async with await open_session(args.socket, events, args.thread) as ws:
+            s = Session(ws, events, args.thread)
+            hs = await s.handshake(CONNECT_TIMEOUT)
+            if "error" in hs:
+                out.update(phase="handshake", outcome="error_response",
+                           detail=hs["error"])
+                print(json.dumps(out, ensure_ascii=False, default=str))
+                return 3
+            res = await s.rpc("thread/resume",
+                              {"threadId": args.thread, "excludeTurns": True},
+                              args.request_timeout, "resume")
+            if "error" in res:
+                out.update(phase="resume", outcome="rpc_error",
+                           detail=res["error"])
+                print(json.dumps(out, ensure_ascii=False, default=str))
+                return 3
+            resp = await s.rpc("turn/interrupt",
+                               {"threadId": args.thread,
+                                "turnId": args.turn},
+                               args.request_timeout, "interrupt")
+            out["phase"] = "interrupt"
+            if "error" in resp:
+                out.update(outcome="rpc_error", detail=resp["error"])
+                code = 3
+            else:
+                out.update(outcome="interrupt_sent",
+                           response=resp.get("result"))
+                code = 0
+            os.makedirs(args.out_dir, exist_ok=True)
+            with open(os.path.join(args.out_dir, "interrupt-receipt.json"),
+                      "w", encoding="utf-8") as handle:
+                json.dump({"requested_at": now_ms(),
+                           "threadId": args.thread, "turnId": args.turn,
+                           "response": resp}, handle, ensure_ascii=False,
+                          indent=1, default=str)
+            print(json.dumps(out, ensure_ascii=False, default=str))
+            return code
+    except Unknown as u:
+        out.update(phase=u.phase, outcome=f"{u.kind}_unknown", detail=u.detail)
+        print(json.dumps(out, ensure_ascii=False, default=str))
+        return 4 if u.kind == "timeout" else 2
+    except (OSError, TimeoutError, ConnectionClosed) as exc:
+        out.update(outcome="connect_failed", detail=repr(exc))
+        print(json.dumps(out, ensure_ascii=False, default=str))
+        return 2
+
+
+async def cmd_steer_turn(args):
+    """One expected-turn steer; acceptance never proves worker consumption."""
+    out = {"thread": args.thread, "turn_id": args.turn, "phase": "guard",
+           "delivery": "refused", "consumption": "unknown"}
+    os.makedirs(args.out_dir, exist_ok=True)
+    evidence = ("steer-intent.json", "steer-receipt.json", "steer-result.json")
+    if any(os.path.exists(os.path.join(args.out_dir, f)) for f in evidence):
+        print(json.dumps({**out, "outcome": "refused_existing_evidence_dir"}))
+        return 2
+    with open(args.input_file, encoding="utf-8", newline="") as handle:
+        text = handle.read()
+    if not text.strip() or len(text.encode("utf-8")) > MAX_INPUT_BYTES:
+        print(json.dumps({**out, "outcome": "refused_input"}))
+        return 2
+    events = []
+    attempted = False
+    code = 2
+    try:
+        async with await open_session(args.socket, events, args.thread) as ws:
+            s = Session(ws, events, args.thread)
+            out["phase"] = "handshake"
+            hs = await s.handshake(args.request_timeout)
+            if "error" in hs:
+                out.update(outcome="handshake_error", detail=hs["error"])
+                raise _Abort
+            out["phase"] = "read"
+            read = await s.rpc("thread/read", {"threadId": args.thread},
+                               args.request_timeout, "read")
+            thread = (read.get("result") or {}).get("thread") or {}
+            if "error" in read or thread.get("id") != args.thread:
+                out.update(outcome="refused_thread_identity")
+                raise _Abort
+            turns = await s.rpc("thread/turns/list", {
+                "threadId": args.thread, "limit": 1, "sortDirection": "desc",
+                "itemsView": "notLoaded"}, args.request_timeout, "read")
+            entries = (turns.get("result") or {}).get("data") or []
+            turn = (entries[0].get("turn") or entries[0]) if entries else {}
+            if ("error" in turns or turn.get("id") != args.turn
+                    or turn.get("status") != "inProgress"):
+                out.update(outcome="refused_not_current_active_turn")
+                raise _Abort
+            params = {"threadId": args.thread, "expectedTurnId": args.turn,
+                      "input": [{"type": "text", "text": text}]}
+            import hashlib
+            write_json(os.path.join(args.out_dir, "steer-intent.json"), {
+                "recorded_at": now_ms(), "threadId": args.thread,
+                "expectedTurnId": args.turn, "method": "turn/steer",
+                "input_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()})
+            out["phase"] = "steer"
+            attempted = True
+            out["delivery"] = "ambiguous"
+            response = await s.rpc("turn/steer", params, args.request_timeout, "steer")
+            write_json(os.path.join(args.out_dir, "steer-receipt.json"), {
+                "responded_at": now_ms(), "threadId": args.thread,
+                "expectedTurnId": args.turn, "response": response})
+            if "error" in response:
+                out.update(delivery="backend_rejected", outcome="rpc_error",
+                           detail=response["error"])
+                code = 3
+            elif (response.get("result") or {}).get("turnId") == args.turn:
+                out.update(delivery="sent", outcome="native_accepted")
+                code = 0
+            else:
+                out.update(outcome="unmatched_receipt_unknown")
+                code = 4
+    except _Abort:
+        pass
+    except (Unknown, OSError, TimeoutError, ConnectionClosed, ValueError) as exc:
+        out.update(delivery="ambiguous" if attempted else "refused",
+                   outcome="unknown_after_send" if attempted else "pre_send_failed",
+                   detail=str(exc))
+        code = 4 if attempted else 2
+    finally:
+        write_json(os.path.join(args.out_dir, "steer-result.json"), out)
+    print(json.dumps(out, ensure_ascii=False))
+    return code
+
+
+def write_json(path, obj):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(obj, handle, ensure_ascii=False, indent=1, default=str)
+    os.replace(tmp, path)
+
+
+async def cmd_submit_turn(args):
+    out_dir = args.out_dir
+    os.makedirs(out_dir, exist_ok=True)
+    existing = [f for f in EVIDENCE_FILES
+                if os.path.exists(os.path.join(out_dir, f))]
+    if existing:
+        print(json.dumps({"phase": "guard",
+                          "outcome": "refused_existing_evidence_dir",
+                          "existing": existing}))
+        return 2
+    text = open(args.input_file, encoding="utf-8").read()
+    data = text.encode()
+    if len(data) > MAX_INPUT_BYTES:
+        print(json.dumps({"phase": "pre_flight",
+                          "outcome": "refused_input_too_large",
+                          "input_bytes": len(data)}))
+        return 2
+    events = []
+    events_path = os.path.join(out_dir, "events.jsonl")
+    result = {"thread": args.thread, "socket": args.socket,
+              "tool_version": "codex-appserver-client/0.1.0"}
+    exit_code = 2
+    done = False
+    try:
+        async with await open_session(args.socket, events, args.thread) as ws:
+            s = Session(ws, events, args.thread)
+            hs = await s.handshake(CONNECT_TIMEOUT)
+            if "error" in hs:
+                result.update(phase="handshake", outcome="error_response",
+                              detail=hs["error"])
+                raise _Abort
+            result["phase"] = "read_state"
+            pre = await s.rpc("thread/read", {"threadId": args.thread},
+                              args.request_timeout, "read_state")
+            if "error" in pre:
+                result.update(phase="read_state", outcome="rpc_error",
+                              detail=pre["error"])
+                exit_code = 3
+                raise _Abort
+            thread_obj = (pre.get("result") or {}).get("thread") or {}
+            write_json(os.path.join(out_dir, "pre-state.json"),
+                       {"requested_at": now_ms(), "threadId": args.thread,
+                        "response": pre})
+            if thread_obj.get("id") != args.thread:
+                result.update(phase="pre_flight",
+                              outcome="refused_identity_mismatch",
+                              thread_id_returned=thread_obj.get("id"))
+                raise _Abort
+            status = (thread_obj.get("status") or {}).get("type") \
+                if isinstance(thread_obj.get("status"), dict) \
+                else thread_obj.get("status")
+            if status != "idle":
+                result.update(phase="pre_flight", outcome="refused_not_idle",
+                              thread_status=status)
+                raise _Abort
+            result["phase"] = "resume"
+            res = await s.rpc("thread/resume",
+                              {"threadId": args.thread, "excludeTurns": True},
+                              args.request_timeout, "resume")
+            fresh_thread = False
+            if "error" in res:
+                error = res["error"]
+                if not (isinstance(error, dict) and error.get("code") == -32600
+                        and error.get("message") ==
+                        f"no rollout found for thread id {args.thread}"):
+                    result.update(phase="resume", outcome="rpc_error", detail=error)
+                    exit_code = 3
+                    raise _Abort
+                result.update(resume_error=error,
+                              subscription="unavailable_no_rollout")
+                write_json(os.path.join(out_dir, "resume-state.json"), {
+                    "requested_at": now_ms(), "threadId": args.thread,
+                    "response": res, "subscription": "unavailable_no_rollout"})
+                result["phase"] = "fresh_read"
+                fresh = await s.rpc("thread/read", {"threadId": args.thread},
+                                    min(args.request_timeout, 10.0), "fresh_read")
+                if "error" in fresh:
+                    result.update(outcome="rpc_error", detail=fresh["error"])
+                    exit_code = 3
+                    raise _Abort
+                resume_thread = (fresh.get("result") or {}).get("thread") or {}
+                write_json(os.path.join(out_dir, "resume-state.json"), {
+                    "requested_at": now_ms(), "threadId": args.thread,
+                    "response": res, "subscription": "unavailable_no_rollout",
+                    "fresh_thread": {field: resume_thread.get(field) for field in
+                                     ("id", "status", "model", "reasoningEffort",
+                                      "modelProvider", "canAcceptDirectInput")}})
+                fresh_thread = True
+                resume_result = {}
+                for state in (thread_obj, resume_thread):
+                    state_status = state.get("status")
+                    if isinstance(state_status, dict):
+                        state_status = state_status.get("type")
+                    if (state.get("id") != args.thread or state_status != "idle"
+                            or state.get("turns") != []
+                            or state.get("canAcceptDirectInput") is not True):
+                        result.update(outcome="refused_fresh_thread_state")
+                        raise _Abort
+                    if any(not isinstance(state.get(field), str) or not state[field]
+                           for field in ("model", "reasoningEffort", "modelProvider")):
+                        result.update(outcome="fresh_selection_unverified")
+                        exit_code = 4
+                        raise _Abort
+            else:
+                resume_result = res.get("result") or {}
+                resume_thread = resume_result.get("thread") or {}
+            effective = {field: resume_result.get(field) for field in
+                         ("model", "reasoningEffort", "modelProvider")}
+            write_json(os.path.join(out_dir, "resume-state.json"),
+                       {"requested_at": now_ms(), "threadId": args.thread,
+                        **({"response": res, "subscription": "unavailable_no_rollout"}
+                           if fresh_thread else {}),
+                        "resume_effective": effective,
+                        "resume_thread": {k: resume_thread.get(k) for k in
+                                          ("id", "status", "model",
+                                           "reasoningEffort",
+                                           "modelProvider")}})
+            if resume_thread.get("id") != args.thread:
+                result.update(phase="resume",
+                              outcome="refused_resume_identity_mismatch")
+                raise _Abort
+            for field in ("model", "reasoningEffort", "modelProvider"):
+                known = {}
+                for origin, value in (("read", thread_obj.get(field)),
+                                       ("resume_effective",
+                                        effective.get(field)),
+                                       ("resume_thread",
+                                        resume_thread.get(field))):
+                    if value is not None and str(value) != "":
+                        known[origin] = value
+                distinct = {str(v) for v in known.values()}
+                if len(distinct) > 1:
+                    result.update(phase="resume",
+                                  outcome="refused_resume_state_mismatch",
+                                  mismatch={field: known})
+                    raise _Abort
+                if not known:
+                    result.setdefault("resume_selection_unverified",
+                                      []).append(field)
+            import hashlib
+            intent = {"recorded_at": now_ms(), "thread": args.thread,
+                      "socket": args.socket,
+                      "input_file": os.path.abspath(args.input_file),
+                      "input_bytes": len(data),
+                      "input_sha256": hashlib.sha256(data).hexdigest(),
+                      "request": {"method": "turn/start",
+                                  "threadId": args.thread,
+                                  "input_type": "text"}}
+            write_json(os.path.join(out_dir, "turn-intent.json"), intent)
+            result["phase"] = "submit"
+            resp = await s.rpc("turn/start",
+                               {"threadId": args.thread,
+                                "input": [{"type": "text", "text": text}]},
+                               args.request_timeout, "submit")
+            write_json(os.path.join(out_dir, "turn-receipt.json"),
+                       {"intent": intent, "responded_at": now_ms(),
+                        "response": resp})
+            turn_id = None
+            if "result" in resp:
+                turn_id = ((resp["result"].get("turn") or {}).get("id"))
+            else:
+                result.update(phase="submit", outcome="rpc_error",
+                              detail=resp.get("error"), turn_id=turn_id)
+                exit_code = 3
+                raise _Abort
+            result["phase"] = "await"
+            if turn_id is None:
+                result.update(outcome="unknown_receipt_no_turn_id",
+                              note="no native turn id; later completions "
+                                   "not accepted as success")
+                exit_code = 4
+                raise _Abort
+            deadline = time.monotonic() + args.wait_seconds
+            pending = []
+            while True:
+                early = find_completed(events, args.thread, turn_id)
+                if early is not None:
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    result.update(outcome="timeout_unknown", turn_id=turn_id,
+                                  pending_server_requests=pending)
+                    exit_code = 4
+                    raise _Abort
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), remaining)
+                except (asyncio.TimeoutError, TimeoutError):
+                    result.update(outcome="timeout_unknown", turn_id=turn_id,
+                                  pending_server_requests=pending)
+                    exit_code = 4
+                    raise _Abort
+                except ConnectionClosed as exc:
+                    events.append({"t": now_ms(), "dir": "in",
+                                   "kind": "transport", "error": repr(exc)})
+                    result.update(outcome="disconnect_unknown",
+                                  turn_id=turn_id,
+                                  pending_server_requests=pending)
+                    exit_code = 5
+                    raise _Abort
+                msg = json.loads(raw)
+                rec = await s.record(msg, "in")
+                if rec.get("kind") == "server_request":
+                    pending.append({"id": rec.get("id"),
+                                    "method": rec.get("method")})
+            turn = find_completed(events, args.thread, turn_id)
+            status = (turn or {}).get("status")
+            if status == "completed":
+                result.update(phase="execute", outcome="completed",
+                              turn_status=status, turn_id=turn_id)
+                exit_code = 0
+            elif status in ("failed", "interrupted"):
+                result.update(phase="execute",
+                              outcome=f"turn_{status}", turn_status=status,
+                              turn_id=turn_id,
+                              turn_error=(turn or {}).get("error"))
+                exit_code = 3
+            else:
+                result.update(phase="await",
+                              outcome="turn_end_unmatched_status",
+                              turn_status=status, turn_id=turn_id)
+                exit_code = 4
+            done = True
+    except Unknown as u:
+        result.update(phase=u.phase, outcome=f"{u.kind}_unknown",
+                      detail=u.detail)
+        exit_code = 4 if u.kind == "timeout" else 5
+    except (OSError,) as exc:
+        result.update(phase="connect", outcome="connect_failed",
+                      detail=repr(exc))
+        exit_code = 2
+    except (TimeoutError, ConnectionClosed) as exc:
+        result.update(phase=result.get("phase", "connect"),
+                      outcome="unknown", detail=repr(exc))
+        exit_code = 4
+    except _Abort:
+        pass
+    finally:
+        with open(events_path, "w", encoding="utf-8") as handle:
+            for rec in events:
+                handle.write(json.dumps(rec, ensure_ascii=False,
+                                        default=str) + "\n")
+        write_json(os.path.join(out_dir, "result-summary.json"), result)
+    print(json.dumps(result, ensure_ascii=False, default=str))
+    return exit_code
+
+
+class _Abort(Exception):
+    pass
+
+
+def main():
+    ap = argparse.ArgumentParser(description="codex app-server client entry")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("identity")
+    p.add_argument("--socket", default=None)
+    p.add_argument("--codex-home", default=None)
+    p.add_argument("--request-timeout", type=float,
+                   default=DEFAULT_REQUEST_TIMEOUT)
+    p.set_defaults(fn=cmd_identity)
+
+    for name in ("thread-read", "turn-status"):
+        p = sub.add_parser(name)
+        p.add_argument("--socket", required=True)
+        p.add_argument("--thread", required=True)
+        p.add_argument("--request-timeout", type=float,
+                       default=DEFAULT_REQUEST_TIMEOUT)
+        if name == "turn-status":
+            p.add_argument("--turn", required=True)
+        p.set_defaults(fn=(cmd_thread_read if name == "thread-read"
+                           else cmd_turn_status))
+
+    p = sub.add_parser("recovery-stop")
+    p.add_argument("--socket", required=True)
+    p.add_argument("--thread", required=True)
+    p.add_argument("--turn", required=True)
+    p.set_defaults(fn=cmd_recovery_stop)
+
+    for name, fn in (("interrupt-turn", cmd_interrupt_turn),
+                     ("steer-turn", cmd_steer_turn)):
+        p = sub.add_parser(name)
+        p.add_argument("--socket", required=True)
+        p.add_argument("--thread", required=True)
+        p.add_argument("--turn", required=True)
+        p.add_argument("--out-dir", required=True)
+        p.add_argument("--request-timeout", type=float,
+                       default=DEFAULT_REQUEST_TIMEOUT)
+        if name == "steer-turn":
+            p.add_argument("--input-file", required=True)
+        p.set_defaults(fn=fn)
+
+    p = sub.add_parser("submit-turn")
+    p.add_argument("--socket", required=True)
+    p.add_argument("--thread", required=True)
+    p.add_argument("--input-file", required=True)
+    p.add_argument("--out-dir", required=True)
+    p.add_argument("--wait-seconds", type=float, default=240.0)
+    p.add_argument("--request-timeout", type=float,
+                   default=DEFAULT_REQUEST_TIMEOUT)
+    p.set_defaults(fn=cmd_submit_turn)
+
+    args = ap.parse_args()
+    if getattr(args, "socket", None) is None:
+        args.socket = resolve_control_socket(None, getattr(args, "codex_home", None))
+    sys.exit(asyncio.run(args.fn(args)))
+
+
+if __name__ == "__main__":
+    main()

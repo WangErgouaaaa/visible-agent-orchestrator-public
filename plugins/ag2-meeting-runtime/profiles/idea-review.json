@@ -1,0 +1,11 @@
+{
+  "name": "idea-review",
+  "preset": "idea-review",
+  "max_rounds": 3,
+  "allow_dry_run_proposal": false,
+  "allowed_workers": [],
+  "audit_level": "standard",
+  "timeout_seconds": 60,
+  "max_cost_usd": 0.05,
+  "empty_response_retries": 1
+}

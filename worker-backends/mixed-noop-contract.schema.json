@@ -1,0 +1,290 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "properties": {
+    "allowed_write_roots": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "artifact_layout": {
+      "additionalProperties": true,
+      "properties": {
+        "aggregate_report_path": {
+          "type": "string"
+        },
+        "aggregate_summary_path": {
+          "type": "string"
+        },
+        "event_log_path": {
+          "type": "string"
+        },
+        "mixed_run_root": {
+          "type": "string"
+        },
+        "per_worker_task_dirs": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "shared_readonly_contract_dir": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "mixed_run_root",
+        "per_worker_task_dirs",
+        "shared_readonly_contract_dir",
+        "aggregate_report_path",
+        "aggregate_summary_path",
+        "event_log_path"
+      ],
+      "type": "object"
+    },
+    "blocked_reasons": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "business_repo_policy": {
+      "additionalProperties": true,
+      "properties": {
+        "business_ready_allowed": {
+          "const": false
+        },
+        "business_repo_writes_allowed": {
+          "const": false
+        }
+      },
+      "required": [
+        "business_ready_allowed",
+        "business_repo_writes_allowed"
+      ],
+      "type": "object"
+    },
+    "contract_id": {
+      "type": "string"
+    },
+    "contract_kind": {
+      "const": "mixed_noop_contract"
+    },
+    "created_at": {
+      "type": "string"
+    },
+    "execution_mode": {
+      "const": "no-live"
+    },
+    "expected_results": {
+      "type": "object"
+    },
+    "fanout": {
+      "type": "object"
+    },
+    "fanin": {
+      "type": "object"
+    },
+    "forbidden_next_actions": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "forbidden_paths": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "opencode_visible_registry": {
+      "type": "string"
+    },
+    "registered_worker_registry": {
+      "type": "string"
+    },
+    "roles": {
+      "type": "object"
+    },
+    "root": {
+      "type": "string"
+    },
+    "runtime_backend": {
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "task_matrix": {
+      "items": {
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "terminal_protocol": {
+      "additionalProperties": true,
+      "properties": {
+        "allowed_terminal_markers": {
+          "items": {
+            "enum": [
+              ".done",
+              ".fail",
+              ".blocked"
+            ]
+          },
+          "type": "array"
+        },
+        "report_must_be_nonempty": {
+          "const": true
+        },
+        "required_report": {
+          "const": "report.md"
+        },
+        "terminal_marker_count": {
+          "const": "exactly_one"
+        }
+      },
+      "required": [
+        "required_report",
+        "report_must_be_nonempty",
+        "terminal_marker_count",
+        "allowed_terminal_markers"
+      ],
+      "type": "object"
+    },
+    "workers": {
+      "items": {
+        "additionalProperties": true,
+        "properties": {
+          "allow_business_repo_writes": {
+            "const": false
+          },
+          "allow_mixed_worker": {
+            "type": "boolean"
+          },
+          "allowed_mixed_task_kinds": {
+            "items": {
+              "enum": [
+                "mixed_noop_sandbox",
+                "mixed_terminal_protocol_smoke"
+              ]
+            },
+            "type": "array"
+          },
+          "allowed_write_roots": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "backend_kind": {
+            "enum": [
+              "opencode_tui",
+              "claude_code",
+              "cursor_agent"
+            ]
+          },
+          "business_ready": {
+            "const": false
+          },
+          "mixed_ready": {
+            "type": "boolean"
+          },
+          "mixed_ready_scope": {
+            "type": "string"
+          },
+          "registry_source": {
+            "type": "string"
+          },
+          "required_outputs": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "required_terminal_markers": {
+            "items": {
+              "enum": [
+                ".done",
+                ".fail",
+                ".blocked"
+              ]
+            },
+            "type": "array"
+          },
+          "role": {
+            "type": "string"
+          },
+          "runtime_backend": {
+            "type": "string"
+          },
+          "worker_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "worker_id",
+          "backend_kind",
+          "registry_source",
+          "runtime_backend",
+          "role",
+          "mixed_ready",
+          "business_ready",
+          "allow_mixed_worker",
+          "allow_business_repo_writes",
+          "allowed_write_roots",
+          "forbidden_paths",
+          "required_terminal_markers",
+          "required_outputs",
+          "blocked_reasons",
+          "warnings"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "would_execute_live": {
+      "const": false
+    },
+    "would_write_registry": {
+      "const": false
+    }
+  },
+  "required": [
+    "schema_version",
+    "contract_id",
+    "created_at",
+    "contract_kind",
+    "execution_mode",
+    "root",
+    "runtime_backend",
+    "registered_worker_registry",
+    "opencode_visible_registry",
+    "workers",
+    "roles",
+    "task_matrix",
+    "fanout",
+    "fanin",
+    "artifact_layout",
+    "allowed_write_roots",
+    "forbidden_paths",
+    "business_repo_policy",
+    "terminal_protocol",
+    "lock_policy",
+    "settle_policy",
+    "health_policy",
+    "watcher_policy",
+    "board_policy",
+    "expected_results",
+    "would_execute_live",
+    "would_write_registry",
+    "blocked_reasons",
+    "warnings",
+    "safe_next_actions",
+    "forbidden_next_actions",
+    "evidence"
+  ],
+  "title": "Mixed no-op contract",
+  "type": "object"
+}

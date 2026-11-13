@@ -1,0 +1,1131 @@
+#!/usr/bin/env python3
+"""Persist and safely restore tmux pane to Codex session mappings."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+SHELL_COMMANDS = {"bash", "dash", "fish", "sh", "zsh"}
+HELPER_BASENAMES = {"codex-tmux-resume", "codex_tmux_resume"}
+PROMPT_REFRESH_TMUX_TIMEOUT_SECONDS = 1.0
+PROMPT_REFRESH_HOOK_TIMEOUT_SECONDS = 5
+MAINLINE_TITLE_LIMIT = 200
+MAINLINE_ANCHOR_LIMIT = 2048
+TMUX_PANE_FORMAT = (
+    "#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_id}\t"
+    "#{pane_current_path}\t#{pane_current_command}\t#{pane_pid}\t#{pid}"
+)
+TMUX_LIST_FORMAT = (
+    "#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_id}\t"
+    "#{pane_current_command}\t#{pane_pid}\t#{pane_current_path}\t#{pid}"
+)
+
+
+class ResumeStateError(RuntimeError):
+    """A fail-closed restore state that callers can handle explicitly."""
+
+    def __init__(self, state: str, detail: str) -> None:
+        super().__init__(f"state={state} {detail}")
+
+
+def now_utc() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def parse_utc_timestamp(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError(f"timestamp must include a timezone: {value}")
+    return parsed.astimezone(timezone.utc)
+
+
+def codex_home() -> Path:
+    return Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+
+
+def map_path() -> Path:
+    override = os.environ.get("CODEX_TMUX_MAP_PATH")
+    return (
+        Path(override)
+        if override
+        else codex_home() / "state" / "tmux-codex-sessions.json"
+    )
+
+
+def tmux_bin() -> str:
+    return os.environ.get("CODEX_TMUX_TMUX_BIN", "tmux")
+
+
+def run_tmux(
+    *args: str,
+    check: bool = True,
+    timeout: float | None = None,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [tmux_bin(), *args],
+        text=True,
+        capture_output=True,
+        check=check,
+        timeout=timeout,
+    )
+
+
+def validate_session_id(value: str) -> str:
+    try:
+        return str(uuid.UUID(value))
+    except ValueError as exc:
+        raise ValueError(f"invalid Codex session UUID: {value}") from exc
+
+
+def normalize_mainline_text(value: str, *, name: str, limit: int) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a string")
+    normalized = " ".join(value.split())
+    if not normalized:
+        raise ValueError(f"{name} must not be empty")
+    if len(normalized) > limit:
+        raise ValueError(f"{name} exceeds {limit} characters")
+    return normalized
+
+
+def validate_mainlines(value: object) -> dict[str, dict[str, str]]:
+    if not isinstance(value, dict):
+        raise ValueError("mainlines must be an object")
+    for session_id, card in value.items():
+        if session_id != validate_session_id(session_id):
+            raise ValueError(f"non-canonical Codex session UUID: {session_id}")
+        if not isinstance(card, dict) or set(card) != {
+            "title",
+            "anchor",
+            "updated_at",
+        }:
+            raise ValueError(f"invalid mainline card: {session_id}")
+        title = normalize_mainline_text(
+            card["title"],
+            name="title",
+            limit=MAINLINE_TITLE_LIMIT,
+        )
+        anchor = normalize_mainline_text(
+            card["anchor"],
+            name="anchor",
+            limit=MAINLINE_ANCHOR_LIMIT,
+        )
+        if (title, anchor) != (card["title"], card["anchor"]):
+            raise ValueError(f"mainline card is not normalized: {session_id}")
+        if not isinstance(card["updated_at"], str):
+            raise ValueError(f"invalid mainline timestamp: {session_id}")
+        parse_utc_timestamp(card["updated_at"])
+    return value
+
+
+def empty_state() -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "updated_at": None,
+        "panes": {},
+        "mainlines": {},
+    }
+
+
+def load_state(path: Path | None = None) -> dict[str, Any]:
+    path = path or map_path()
+    if not path.exists():
+        return empty_state()
+    state = json.loads(path.read_text(encoding="utf-8"))
+    if state.get("schema_version") != 1 or not isinstance(state.get("panes"), dict):
+        raise ValueError(f"unsupported mapping file: {path}")
+    state.setdefault("mainlines", {})
+    return state
+
+
+def mutate_state(
+    mutator: Any,
+    *,
+    nonblocking_lock: bool = False,
+) -> tuple[dict[str, Any], bool]:
+    path = map_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    with lock_path.open("a+", encoding="utf-8") as lock:
+        lock_flags = fcntl.LOCK_EX
+        if nonblocking_lock:
+            lock_flags |= fcntl.LOCK_NB
+        fcntl.flock(lock.fileno(), lock_flags)
+        state = load_state(path)
+        changed = bool(mutator(state))
+        if changed:
+            state["updated_at"] = now_utc()
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                delete=False,
+            ) as temp:
+                json.dump(state, temp, ensure_ascii=False, indent=2, sort_keys=True)
+                temp.write("\n")
+                temp_path = Path(temp.name)
+            temp_path.chmod(0o600)
+            os.replace(temp_path, path)
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    return state, changed
+
+
+def pane_key(entry: dict[str, str]) -> str:
+    return (
+        f"{entry['tmux_session']}:{entry['window_index']}."
+        f"{entry['pane_index']}"
+    )
+
+
+def same_tmux_pane(left: dict[str, str], right: dict[str, str]) -> bool:
+    return bool(
+        left.get("tmux_server_pid")
+        and left.get("tmux_server_pid") == right.get("tmux_server_pid")
+        and left.get("tmux_pane_id")
+        and left.get("tmux_pane_id") == right.get("tmux_pane_id")
+    )
+
+
+MAPPING_EVIDENCE_FIELDS = (
+    "codex_session_id",
+    "tmux_server_pid",
+    "tmux_pane_id",
+    "transcript_path",
+    "cwd",
+)
+
+
+def same_mapping_evidence(
+    left: dict[str, str],
+    right: dict[str, str],
+) -> bool:
+    return all(
+        left.get(field, "") == right.get(field, "")
+        for field in MAPPING_EVIDENCE_FIELDS
+    )
+
+
+def update_state(
+    entry: dict[str, str],
+    *,
+    skip_if_current: bool = False,
+    nonblocking_lock: bool = False,
+) -> bool:
+    key = pane_key(entry)
+
+    def update(state: dict[str, Any]) -> bool:
+        existing = state["panes"].get(key)
+        stable_matches = [
+            (existing_key, existing_entry)
+            for existing_key, existing_entry in state["panes"].items()
+            if same_mapping_evidence(existing_entry, entry)
+        ]
+        stale_keys = [
+            existing_key
+            for existing_key, existing_entry in state["panes"].items()
+            if existing_key != key
+            and (
+                existing_entry.get("codex_session_id")
+                == entry["codex_session_id"]
+                or same_tmux_pane(existing_entry, entry)
+            )
+        ]
+        if (
+            skip_if_current
+            and existing
+            and same_mapping_evidence(existing, entry)
+            and pane_key(existing) == key
+            and not stale_keys
+        ):
+            return False
+        updated_entry = entry
+        if skip_if_current and stable_matches:
+            def prior_timestamp(prior: dict[str, str]) -> datetime | None:
+                value = prior.get("updated_at")
+                if not isinstance(value, str) or not value:
+                    return None
+                try:
+                    return parse_utc_timestamp(value)
+                except ValueError:
+                    return None
+
+            def prior_rank(
+                item: tuple[str, dict[str, str]],
+            ) -> tuple[bool, bool, datetime, str]:
+                prior_key, prior = item
+                updated_at = prior_timestamp(prior)
+                return (
+                    prior.get("source") == "resume"
+                    and updated_at is not None,
+                    prior_key == key,
+                    updated_at or datetime.min.replace(tzinfo=timezone.utc),
+                    prior_key,
+                )
+
+            _, prior = max(stable_matches, key=prior_rank)
+            updated_entry = dict(entry)
+            prior_source = prior.get("source")
+            if (
+                isinstance(prior_source, str)
+                and prior_source
+                and prior_timestamp(prior) is not None
+            ):
+                updated_entry["source"] = prior_source
+                updated_entry["updated_at"] = prior["updated_at"]
+        for stale_key in stale_keys:
+            del state["panes"][stale_key]
+        state["panes"][key] = updated_entry
+        return True
+
+    return mutate_state(
+        update,
+        nonblocking_lock=nonblocking_lock,
+    )[1]
+
+
+def inspect_pane(
+    target: str,
+    *,
+    timeout: float | None = None,
+) -> dict[str, str]:
+    output = run_tmux(
+        "display-message",
+        "-p",
+        "-t",
+        target,
+        TMUX_PANE_FORMAT,
+        timeout=timeout,
+    ).stdout.rstrip("\n")
+    fields = output.split("\t")
+    if len(fields) != 8:
+        raise RuntimeError(f"unexpected tmux pane data for {target!r}: {output!r}")
+    session, window, pane, pane_id, cwd, command, pane_pid, server_pid = fields
+    return {
+        "tmux_session": session,
+        "window_index": window,
+        "pane_index": pane,
+        "tmux_pane_id": pane_id,
+        "tmux_server_pid": server_pid,
+        "cwd": cwd,
+        "pane_current_command": command,
+        "pane_pid": pane_pid,
+    }
+
+
+def record_mapping(
+    *,
+    target: str,
+    session_id: str,
+    cwd: str,
+    source: str,
+    transcript_path: str | None,
+    skip_if_current: bool = False,
+    tmux_timeout: float | None = None,
+    nonblocking_lock: bool = False,
+) -> dict[str, str]:
+    pane = inspect_pane(target, timeout=tmux_timeout)
+    session_id = validate_session_id(session_id)
+    entry = {
+        "tmux_session": pane["tmux_session"],
+        "window_index": pane["window_index"],
+        "pane_index": pane["pane_index"],
+        "tmux_pane_id": pane["tmux_pane_id"],
+        "tmux_server_pid": pane["tmux_server_pid"],
+        "codex_session_id": session_id,
+        "cwd": cwd or pane["cwd"],
+        "source": source,
+        "transcript_path": transcript_path or "",
+        "updated_at": now_utc(),
+    }
+    changed = update_state(
+        entry,
+        skip_if_current=skip_if_current,
+        nonblocking_lock=nonblocking_lock,
+    )
+    if changed:
+        resume_command = f"codex resume --no-daemon {session_id} --yolo"
+        for option, value in (
+            ("@codex_session_id", session_id),
+            ("@codex_resume_command", resume_command),
+        ):
+            run_tmux(
+                "set-option",
+                "-p",
+                "-t",
+                target,
+                option,
+                value,
+                check=False,
+                timeout=tmux_timeout,
+            )
+    return entry
+
+
+def hook_command(args: argparse.Namespace) -> int:
+    try:
+        payload = json.load(sys.stdin)
+        pane = os.environ.get("TMUX_PANE")
+        session_id = payload.get("session_id")
+        if not pane or not session_id:
+            return 0
+        transcript_path = payload.get("transcript_path")
+        if transcript_path is not None and not isinstance(
+            transcript_path,
+            str,
+        ):
+            return 0
+        if not (transcript_path or "").strip():
+            return 0
+        prompt_refresh = args.event == "prompt-refresh"
+        cwd = payload.get("cwd", "")
+        if not isinstance(cwd, str):
+            cwd = ""
+        session_source = payload.get("source", "startup")
+        if not isinstance(session_source, str):
+            session_source = "startup"
+        record_mapping(
+            target=pane,
+            session_id=session_id,
+            cwd=cwd,
+            source=(
+                "prompt-refresh"
+                if prompt_refresh
+                else session_source
+            ),
+            transcript_path=transcript_path,
+            skip_if_current=prompt_refresh,
+            tmux_timeout=(
+                PROMPT_REFRESH_TMUX_TIMEOUT_SECONDS
+                if prompt_refresh
+                else None
+            ),
+            nonblocking_lock=prompt_refresh,
+        )
+    except Exception as exc:
+        print(f"codex-tmux-resume hook warning: {exc}", file=sys.stderr)
+    return 0
+
+
+def record_command(args: argparse.Namespace) -> int:
+    entry = record_mapping(
+        target=args.target,
+        session_id=args.codex_session,
+        cwd=args.cwd or "",
+        source=args.source,
+        transcript_path=args.transcript_path,
+    )
+    print(f"state=recorded target={pane_key(entry)}")
+    return 0
+
+
+def live_panes() -> dict[str, dict[str, str]]:
+    output = run_tmux("list-panes", "-a", "-F", TMUX_LIST_FORMAT).stdout
+    panes: dict[str, dict[str, str]] = {}
+    for line in output.splitlines():
+        if not line:
+            continue
+        fields = line.split("\t")
+        if len(fields) != 8:
+            continue
+        session, window, pane, pane_id, command, pane_pid, cwd, server_pid = fields
+        key = f"{session}:{window}.{pane}"
+        panes[key] = {
+            "tmux_session": session,
+            "window_index": window,
+            "pane_index": pane,
+            "tmux_pane_id": pane_id,
+            "tmux_server_pid": server_pid,
+            "pane_current_command": command,
+            "pane_pid": pane_pid,
+            "cwd": cwd,
+        }
+    return panes
+
+
+def sync_live_mappings() -> int:
+    live = live_panes()
+    by_identity = {
+        (pane["tmux_server_pid"], pane["tmux_pane_id"]): (key, pane)
+        for key, pane in live.items()
+    }
+    moved = 0
+
+    def sync(state: dict[str, Any]) -> bool:
+        nonlocal moved
+        changed = False
+        synced: dict[str, dict[str, str]] = {}
+        for old_key, original in state["panes"].items():
+            entry = dict(original)
+            new_key = old_key
+            identity = (
+                entry.get("tmux_server_pid", ""),
+                entry.get("tmux_pane_id", ""),
+            )
+            match = by_identity.get(identity) if all(identity) else None
+            if match:
+                live_key, pane = match
+                if live_key != old_key:
+                    moved += 1
+                    changed = True
+                new_key = live_key
+                for field in (
+                    "tmux_session",
+                    "window_index",
+                    "pane_index",
+                    "tmux_pane_id",
+                    "tmux_server_pid",
+                    "cwd",
+                ):
+                    if entry.get(field) != pane[field]:
+                        entry[field] = pane[field]
+                        changed = True
+            synced[new_key] = entry
+        if changed:
+            state["panes"] = synced
+        return changed
+
+    mutate_state(sync)
+    return moved
+
+
+def sync_command(_args: argparse.Namespace) -> int:
+    print(f"state=synced moved={sync_live_mappings()}")
+    return 0
+
+
+def list_command(args: argparse.Namespace) -> int:
+    state = load_state()
+    live = live_panes()
+    rows = []
+    for key, entry in sorted(state["panes"].items()):
+        pane = live.get(key)
+        rows.append(
+            {
+                "target": key,
+                "codex_session_id": entry["codex_session_id"],
+                "tmux_server_pid": entry.get("tmux_server_pid", ""),
+                "source": entry.get("source", ""),
+                "live": pane is not None and same_tmux_pane(entry, pane),
+                "command": pane["pane_current_command"] if pane else "",
+                "cwd": pane["cwd"] if pane else entry.get("cwd", ""),
+            }
+        )
+    if args.json:
+        print(json.dumps(rows, ensure_ascii=False, indent=2))
+        return 0
+    for row in rows:
+        status = row["command"] if row["live"] else "mapping_stale"
+        print(
+            f"{row['target']} | {row['codex_session_id']} | {status} | "
+            f"{row['source']} | {row['cwd']}"
+        )
+    return 0
+
+
+def task_command(args: argparse.Namespace) -> int:
+    target = args.target or os.environ.get("TMUX_PANE")
+    if not target:
+        raise ValueError("task requires --target or TMUX_PANE")
+    title = normalize_mainline_text(
+        args.title,
+        name="title",
+        limit=MAINLINE_TITLE_LIMIT,
+    )
+    anchor = normalize_mainline_text(
+        args.anchor,
+        name="anchor",
+        limit=MAINLINE_ANCHOR_LIMIT,
+    )
+    pane = inspect_pane(target)
+    selected: dict[str, str] = {}
+
+    def update(state: dict[str, Any]) -> bool:
+        mainlines = validate_mainlines(state.get("mainlines", {}))
+        matches = [
+            entry
+            for entry in state["panes"].values()
+            if same_tmux_pane(entry, pane)
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                f"{target}: expected exactly one live Codex mapping"
+            )
+        session_id = validate_session_id(matches[0]["codex_session_id"])
+        selected["session_id"] = session_id
+        existing = mainlines.get(session_id)
+        if existing and (
+            existing["title"],
+            existing["anchor"],
+        ) == (title, anchor):
+            return False
+        mainlines[session_id] = {
+            "title": title,
+            "anchor": anchor,
+            "updated_at": now_utc(),
+        }
+        state["mainlines"] = mainlines
+        return True
+
+    state, changed = mutate_state(update)
+    session_id = selected["session_id"]
+    card = state["mainlines"][session_id]
+    print(
+        f"state=task-registered target={target} "
+        f"session_id={session_id} changed={str(changed).lower()} "
+        f"title={json.dumps(card['title'], ensure_ascii=False)}"
+    )
+    return 0
+
+
+def child_processes(pid: str) -> list[str]:
+    result = subprocess.run(
+        ["ps", "-o", "pid=,comm=", "--ppid", pid],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def shell_prompt_visible(target: str) -> bool:
+    output = run_tmux("capture-pane", "-p", "-t", target, "-S", "-5").stdout
+    lines = [line.rstrip() for line in output.splitlines() if line.strip()]
+    return bool(lines) and lines[-1].endswith(("$", "#", "%", "❯", "➜"))
+
+
+def selected_entries(
+    state: dict[str, Any], args: argparse.Namespace
+) -> list[tuple[str, dict[str, str]]]:
+    if args.all:
+        return sorted(state["panes"].items())
+    if not args.session:
+        raise ValueError("restore requires --session <tmux-session> or --all")
+    selected: list[tuple[str, dict[str, str]]] = []
+    for session in dict.fromkeys(args.session):
+        matches = [
+            (key, entry)
+            for key, entry in state["panes"].items()
+            if entry.get("tmux_session") == session
+        ]
+        if not matches:
+            raise ValueError(f"no saved mapping for tmux session: {session}")
+        selected.extend(sorted(matches))
+    return selected
+
+
+def preflight_restore(
+    selected: list[tuple[str, dict[str, str]]],
+    live: dict[str, dict[str, str]],
+) -> list[tuple[str, dict[str, str], dict[str, str], str]]:
+    planned = []
+    stale = []
+    unsafe = []
+    for key, entry in selected:
+        pane = live.get(key)
+        if not pane:
+            stale.append(f"{key}: mapped pane is not present")
+            continue
+        if not same_tmux_pane(entry, pane):
+            stale.append(f"{key}: tmux server or pane identity changed")
+            continue
+        command = pane["pane_current_command"]
+        children = child_processes(pane["pane_pid"])
+        if command not in SHELL_COMMANDS or children:
+            detail = command if not children else f"{command}, children={children}"
+            unsafe.append(f"{key}: not an empty shell ({detail})")
+            continue
+        if not shell_prompt_visible(key):
+            unsafe.append(f"{key}: shell prompt is not visibly empty")
+            continue
+        session_id = validate_session_id(entry["codex_session_id"])
+        planned.append(
+            (key, entry, pane, f"codex resume --no-daemon {session_id} --yolo")
+        )
+    if stale:
+        raise ResumeStateError("mapping_stale", "; ".join(stale))
+    if unsafe:
+        raise ResumeStateError("unsafe_target", "; ".join(unsafe))
+    return planned
+
+
+def live_pane_by_identity(
+    *, tmux_server_pid: str, tmux_pane_id: str
+) -> tuple[str, dict[str, str]] | None:
+    matches = [
+        (key, pane)
+        for key, pane in live_panes().items()
+        if (
+            pane.get("tmux_server_pid"),
+            pane.get("tmux_pane_id"),
+        )
+        == (tmux_server_pid, tmux_pane_id)
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def wait_for_codex(
+    *, tmux_server_pid: str, tmux_pane_id: str, timeout: float
+) -> str | None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        match = live_pane_by_identity(
+            tmux_server_pid=tmux_server_pid,
+            tmux_pane_id=tmux_pane_id,
+        )
+        if match and match[1]["pane_current_command"] not in SHELL_COMMANDS:
+            return match[0]
+        time.sleep(min(0.1, max(timeout, 0.01)))
+    return None
+
+
+def startup_gate_error(tmux_pane_id: str) -> str | None:
+    output = run_tmux(
+        "capture-pane", "-p", "-t", tmux_pane_id, "-S", "-120"
+    ).stdout
+    if "Hooks need review" in output:
+        return "Codex is waiting for hook trust review"
+    return None
+
+
+def resume_evidence_present(
+    entry: dict[str, str] | None,
+    *,
+    session_id: str,
+    previous_updated_at: str,
+) -> bool:
+    if not (
+        entry
+        and entry.get("codex_session_id") == session_id
+        and entry.get("source") == "resume"
+        and entry.get("updated_at")
+    ):
+        return False
+    try:
+        return parse_utc_timestamp(
+            entry["updated_at"]
+        ) > parse_utc_timestamp(previous_updated_at)
+    except ValueError:
+        return False
+
+
+def wait_for_resume_evidence(
+    *,
+    session_id: str,
+    previous_updated_at: str,
+    tmux_server_pid: str,
+    tmux_pane_id: str,
+    timeout: float,
+) -> str | None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        matches = [
+            (key, entry)
+            for key, entry in load_state()["panes"].items()
+            if (
+                entry.get("tmux_server_pid"),
+                entry.get("tmux_pane_id"),
+            )
+            == (tmux_server_pid, tmux_pane_id)
+        ]
+        live_match = live_pane_by_identity(
+            tmux_server_pid=tmux_server_pid,
+            tmux_pane_id=tmux_pane_id,
+        )
+        if (
+            len(matches) == 1
+            and live_match
+            and resume_evidence_present(
+                matches[0][1],
+                session_id=session_id,
+                previous_updated_at=previous_updated_at,
+            )
+        ):
+            return live_match[0]
+        time.sleep(min(0.1, max(timeout, 0.01)))
+    return None
+
+
+def resume_verify_command(
+    *,
+    target: str,
+    session_id: str,
+    previous_updated_at: str,
+    tmux_server_pid: str,
+    tmux_pane_id: str,
+) -> str:
+    return shlex.join(
+        [
+            str(Path(sys.argv[0])),
+            "verify",
+            "--target",
+            target,
+            "--codex-session",
+            session_id,
+            "--after",
+            previous_updated_at,
+            "--tmux-server-pid",
+            tmux_server_pid,
+            "--tmux-pane-id",
+            tmux_pane_id,
+        ]
+    )
+
+
+def verify_command(args: argparse.Namespace) -> int:
+    identity = (args.tmux_server_pid, args.tmux_pane_id)
+    state_matches = [
+        (key, entry)
+        for key, entry in load_state()["panes"].items()
+        if (
+            entry.get("tmux_server_pid"),
+            entry.get("tmux_pane_id"),
+        )
+        == identity
+    ]
+    live_matches = [
+        (key, pane)
+        for key, pane in live_panes().items()
+        if (
+            pane.get("tmux_server_pid"),
+            pane.get("tmux_pane_id"),
+        )
+        == identity
+    ]
+    if len(state_matches) != 1 or len(live_matches) != 1:
+        raise ResumeStateError(
+            "mapping_stale",
+            f"{args.target}: stable tmux pane identity is not uniquely live",
+        )
+    _saved_target, entry = state_matches[0]
+    live_target, _pane = live_matches[0]
+    session_id = validate_session_id(args.codex_session)
+    if not resume_evidence_present(
+        entry,
+        session_id=session_id,
+        previous_updated_at=args.after,
+    ):
+        raise ResumeStateError(
+            "waiting_for_resume_turn",
+            f"{args.target}: fresh matching SessionStart resume evidence "
+            "not observed",
+        )
+    print(f"state=resumed target={live_target}")
+    return 0
+
+
+def restore_command(args: argparse.Namespace) -> int:
+    sync_live_mappings()
+    state = load_state()
+    selected = selected_entries(state, args)
+    planned = preflight_restore(selected, live_panes())
+    for key, _entry, _pane, command in planned:
+        print(f"state=planned target={key} command={command}")
+    if not args.apply:
+        return 0
+    submitted = []
+    for key, entry, _pane, command in planned:
+        previous_updated_at = entry.get("updated_at", "")
+        run_tmux("send-keys", "-t", key, "-l", command)
+        run_tmux("send-keys", "-t", key, "Enter")
+        print(f"state=submitted target={key}")
+        verification_command = resume_verify_command(
+            target=key,
+            session_id=entry["codex_session_id"],
+            previous_updated_at=previous_updated_at,
+            tmux_server_pid=entry["tmux_server_pid"],
+            tmux_pane_id=entry["tmux_pane_id"],
+        )
+        print(f"verify_command={verification_command}")
+        submitted.append(
+            (key, entry, previous_updated_at, verification_command)
+        )
+
+    failures = []
+    for key, entry, previous_updated_at, verification_command in submitted:
+        current_target = wait_for_codex(
+            tmux_server_pid=entry["tmux_server_pid"],
+            tmux_pane_id=entry["tmux_pane_id"],
+            timeout=args.start_timeout,
+        )
+        if not current_target:
+            failures.append(
+                (
+                    "submitted",
+                    f"target={key}: Codex process did not start within "
+                    f"{args.start_timeout:g}s",
+                )
+            )
+            continue
+        gate_error = startup_gate_error(entry["tmux_pane_id"])
+        if gate_error:
+            failures.append(
+                ("waiting_for_hook_review", f"{current_target}: {gate_error}")
+            )
+            continue
+        resumed_target = wait_for_resume_evidence(
+            session_id=entry["codex_session_id"],
+            previous_updated_at=previous_updated_at,
+            tmux_server_pid=entry["tmux_server_pid"],
+            tmux_pane_id=entry["tmux_pane_id"],
+            timeout=args.start_timeout,
+        )
+        if not resumed_target:
+            failures.append(
+                (
+                    "waiting_for_resume_turn",
+                    f"{current_target}: first post-resume turn has not produced "
+                    "fresh matching SessionStart evidence; run "
+                    f"{verification_command}",
+                )
+            )
+            continue
+        print(f"state=resumed target={resumed_target}")
+    if failures:
+        state = failures[0][0]
+        if len(failures) == 1:
+            detail = failures[0][1]
+        else:
+            detail = "; ".join(
+                f"state={failure_state} {failure_detail}"
+                for failure_state, failure_detail in failures
+            )
+        raise ResumeStateError(state, detail)
+    return 0
+
+
+def hook_entry(command_path: str) -> dict[str, Any]:
+    return {
+        "matcher": "startup|resume",
+        "hooks": [
+            {
+                "type": "command",
+                "command": f"{command_path} hook",
+                "statusMessage": "Recording tmux Codex session mapping",
+            }
+        ],
+    }
+
+
+def prompt_hook_entry(command_path: str) -> dict[str, Any]:
+    return {
+        "hooks": [
+            {
+                "type": "command",
+                "command": (
+                    f"{command_path} hook --event prompt-refresh"
+                ),
+                "statusMessage": "Refreshing tmux Codex session mapping",
+                "timeout": PROMPT_REFRESH_HOOK_TIMEOUT_SECONDS,
+            }
+        ],
+    }
+
+
+def helper_owned_hook(hook: Any, desired_command: str) -> bool:
+    if not isinstance(hook, dict):
+        return False
+    command = hook.get("command")
+    if not isinstance(command, str):
+        return False
+    if command == desired_command:
+        return True
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return False
+    return (
+        len(parts) >= 2
+        and parts[1] == "hook"
+        and Path(parts[0]).name in HELPER_BASENAMES
+        and (
+            len(parts) == 2
+            or parts[2:] == ["--event", "prompt-refresh"]
+        )
+    )
+
+
+def reconcile_hook_groups(
+    groups: Any,
+    desired: dict[str, Any],
+) -> list[Any]:
+    if not isinstance(groups, list):
+        raise ValueError("Hook event configuration must be a list")
+    desired_command = desired["hooks"][0]["command"]
+    reconciled = [desired]
+    for group in groups:
+        if group == desired:
+            continue
+        if not isinstance(group, dict):
+            reconciled.append(group)
+            continue
+        group_hooks = group.get("hooks")
+        if not isinstance(group_hooks, list):
+            reconciled.append(group)
+            continue
+        kept_hooks = [
+            hook
+            for hook in group_hooks
+            if not helper_owned_hook(hook, desired_command)
+        ]
+        if kept_hooks:
+            kept_group = dict(group)
+            kept_group["hooks"] = kept_hooks
+            reconciled.append(kept_group)
+        elif kept_hooks == group_hooks:
+            reconciled.append(group)
+    return reconciled
+
+
+def install_hook_command(args: argparse.Namespace) -> int:
+    hooks_path = Path(args.hooks_file).expanduser()
+    command_path = str(Path(args.command_path).expanduser())
+    config = (
+        json.loads(hooks_path.read_text(encoding="utf-8"))
+        if hooks_path.exists()
+        else {"hooks": {}}
+    )
+    hooks = config.setdefault("hooks", {})
+    desired_by_event = {
+        "SessionStart": hook_entry(command_path),
+        "UserPromptSubmit": prompt_hook_entry(command_path),
+    }
+    reconciled_by_event = {
+        event: reconcile_hook_groups(hooks.get(event, []), desired)
+        for event, desired in desired_by_event.items()
+    }
+    if all(
+        hooks.get(event, []) == reconciled
+        for event, reconciled in reconciled_by_event.items()
+    ):
+        print(f"state=installed hooks_file={hooks_path} changed=false")
+        return 0
+    print(f"state=planned hooks_file={hooks_path} command={command_path} hook")
+    if not args.apply:
+        return 0
+    if hooks_path.exists():
+        backup = hooks_path.with_name(
+            f"{hooks_path.name}.bak.{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        )
+        shutil.copy2(hooks_path, backup)
+    for event, reconciled in reconciled_by_event.items():
+        hooks[event] = reconciled
+    hooks_path.parent.mkdir(parents=True, exist_ok=True)
+    hooks_path.write_text(
+        json.dumps(config, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    print(f"state=installed hooks_file={hooks_path} changed=true")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Persist and safely restore tmux pane to Codex mappings."
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    hook = subparsers.add_parser("hook", help=argparse.SUPPRESS)
+    hook.add_argument(
+        "--event",
+        choices=("session-start", "prompt-refresh"),
+        default="session-start",
+    )
+
+    record = subparsers.add_parser("record")
+    record.add_argument("--target", required=True)
+    record.add_argument("--codex-session", required=True)
+    record.add_argument("--cwd")
+    record.add_argument("--source", default="recovered-evidence")
+    record.add_argument("--transcript-path")
+
+    list_parser = subparsers.add_parser(
+        "list",
+        help="Read saved mappings and live status without changing mapping state.",
+        description=(
+            "Read saved mappings and live status without changing mapping state. "
+            "Use sync to update saved targets after pane or window moves."
+        ),
+    )
+    list_parser.add_argument("--json", action="store_true")
+    subparsers.add_parser(
+        "sync",
+        help="Update saved mappings using matching tmux server and pane identities.",
+    )
+
+    task = subparsers.add_parser("task")
+    task.add_argument("--target")
+    task.add_argument("--title", required=True)
+    task.add_argument("--anchor", required=True)
+
+    restore = subparsers.add_parser("restore")
+    selection = restore.add_mutually_exclusive_group(required=True)
+    selection.add_argument("--session", action="append")
+    selection.add_argument("--all", action="store_true")
+    restore.add_argument("--apply", action="store_true")
+    restore.add_argument("--start-timeout", type=float, default=45.0)
+
+    verify = subparsers.add_parser("verify")
+    verify.add_argument("--target", required=True)
+    verify.add_argument("--codex-session", required=True)
+    verify.add_argument("--after", required=True)
+    verify.add_argument("--tmux-server-pid", required=True)
+    verify.add_argument("--tmux-pane-id", required=True)
+
+    install_hook = subparsers.add_parser("install-hook")
+    install_hook.add_argument(
+        "--hooks-file", default=str(codex_home() / "hooks.json")
+    )
+    install_hook.add_argument("--command-path", required=True)
+    install_hook.add_argument("--apply", action="store_true")
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    try:
+        if args.command == "hook":
+            return hook_command(args)
+        if args.command == "record":
+            return record_command(args)
+        if args.command == "list":
+            return list_command(args)
+        if args.command == "sync":
+            return sync_command(args)
+        if args.command == "task":
+            return task_command(args)
+        if args.command == "restore":
+            return restore_command(args)
+        if args.command == "verify":
+            return verify_command(args)
+        if args.command == "install-hook":
+            return install_hook_command(args)
+    except (
+        json.JSONDecodeError,
+        OSError,
+        RuntimeError,
+        subprocess.CalledProcessError,
+        ValueError,
+    ) as exc:
+        print(f"codex-tmux-resume: {exc}", file=sys.stderr)
+        return 1
+    parser.error(f"unsupported command: {args.command}")
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

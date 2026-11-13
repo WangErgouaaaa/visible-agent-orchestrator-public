@@ -1,0 +1,180 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://visible-agent-orchestrator.local/schemas/user-authorization-record.schema.json",
+  "title": "Visible Agent User Authorization Record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "authorization_id",
+    "authorization_scope",
+    "backend_kind",
+    "worker_id",
+    "workspace_root",
+    "user_owned_pane",
+    "allow_user_owned_pane",
+    "allowed_read_roots",
+    "allowed_write_roots",
+    "allow_business_repo_writes",
+    "allowed_task_kinds",
+    "allow_live_submit",
+    "allow_registration",
+    "allow_single_worker_smoke",
+    "allow_mixed_worker",
+    "expires_at",
+    "explicit_user_confirmation_text"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "authorization_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "created_by": {
+      "type": "string"
+    },
+    "authorization_scope": {
+      "type": "string",
+      "minLength": 1
+    },
+    "backend_kind": {
+      "type": "string",
+      "enum": ["claude_code", "cursor_agent", "opencode_tui"]
+    },
+    "worker_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "worker_label": {
+      "type": "string"
+    },
+    "workspace_root": {
+      "type": "string",
+      "pattern": "^/"
+    },
+    "runtime_backend": {
+      "type": "string"
+    },
+    "runtime_binding_kind": {
+      "type": "string"
+    },
+    "pane_id": {
+      "type": "string"
+    },
+    "process_id": {
+      "type": "string"
+    },
+    "port": {
+      "type": "string"
+    },
+    "user_owned_pane": {
+      "type": "boolean"
+    },
+    "allow_user_owned_pane": {
+      "type": "boolean",
+      "default": false
+    },
+    "allowed_read_roots": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "allowed_write_roots": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "forbidden_paths": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "allow_business_repo_writes": {
+      "type": "boolean",
+      "default": false
+    },
+    "business_repo_path": {
+      "type": "string"
+    },
+    "expected_business_index_files": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "task_profile": {
+      "type": "string"
+    },
+    "allowed_task_kinds": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "allow_live_submit": {
+      "type": "boolean",
+      "default": false
+    },
+    "allow_registration": {
+      "type": "boolean",
+      "default": false
+    },
+    "allow_single_worker_smoke": {
+      "type": "boolean",
+      "default": false
+    },
+    "allow_mixed_worker": {
+      "type": "boolean",
+      "default": false
+    },
+    "expires_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "revocation_id": {
+      "type": "string"
+    },
+    "operator_notes": {
+      "type": "string"
+    },
+    "risk_acknowledgements": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "required_preflight_checks": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "required_evidence_paths": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "signed_by_user_text": {
+      "type": "string"
+    },
+    "explicit_user_confirmation_text": {
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {"user_owned_pane": {"const": true}},
+        "required": ["user_owned_pane"]
+      },
+      "then": {
+        "properties": {"allow_user_owned_pane": {"const": true}}
+      }
+    },
+    {
+      "if": {
+        "properties": {"authorization_scope": {"pattern": "mixed"}},
+        "required": ["authorization_scope"]
+      },
+      "then": {
+        "properties": {"allow_mixed_worker": {"const": true}}
+      }
+    }
+  ]
+}

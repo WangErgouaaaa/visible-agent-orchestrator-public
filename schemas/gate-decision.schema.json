@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "properties": {
+    "advisory_only": {
+      "const": true
+    },
+    "artifact_kind": {
+      "const": "gate_decision"
+    },
+    "decision": {
+      "enum": [
+        "approve",
+        "block",
+        "rerun_coder",
+        "human_review_required"
+      ]
+    },
+    "decision_id": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "evaluated_lanes": {
+      "type": "array"
+    },
+    "gate_inputs_summary": {
+      "type": "object"
+    },
+    "run_id": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "task_id": {
+      "minLength": 1,
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "artifact_kind",
+    "advisory_only",
+    "decision_id",
+    "run_id",
+    "task_id",
+    "evaluated_lanes",
+    "gate_inputs_summary",
+    "decision"
+  ],
+  "type": "object"
+}

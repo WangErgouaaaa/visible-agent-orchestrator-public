@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/omx/opencode-mixed-readiness-evidence-smoke.schema.json",
+  "title": "OpenCodeMixedReadinessEvidenceSmokePlan",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "plan_id",
+    "created_at",
+    "plan_kind",
+    "backend_kind",
+    "worker_id",
+    "execution_mode",
+    "root",
+    "opencode_visible_registry",
+    "registered_worker_registry",
+    "evidence_root",
+    "smoke_matrix",
+    "worker_scoped_lock_contract",
+    "worker_scoped_settle_contract",
+    "allowed_write_roots",
+    "forbidden_paths",
+    "terminal_protocol",
+    "expected_evidence",
+    "result_validation",
+    "would_execute_live",
+    "would_write_registry",
+    "blocked_reasons",
+    "warnings",
+    "safe_next_actions",
+    "forbidden_next_actions",
+    "evidence"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "plan_id": { "type": "string", "minLength": 1 },
+    "created_at": { "type": "string", "minLength": 1 },
+    "plan_kind": { "const": "opencode-mixed-readiness-evidence-smoke-plan" },
+    "backend_kind": { "const": "opencode_tui" },
+    "worker_id": { "type": "string", "minLength": 1 },
+    "execution_mode": { "const": "no-live" },
+    "root": { "type": "string" },
+    "opencode_visible_registry": { "type": "string" },
+    "registered_worker_registry": { "type": "string" },
+    "evidence_root": { "type": "string" },
+    "smoke_matrix": {
+      "type": "object",
+      "required": ["done_smoke", "blocked_smoke", "fail_smoke"],
+      "properties": {
+        "done_smoke": { "$ref": "#/$defs/smoke" },
+        "blocked_smoke": { "$ref": "#/$defs/smoke" },
+        "fail_smoke": { "$ref": "#/$defs/smoke" }
+      }
+    },
+    "worker_scoped_lock_contract": { "type": "object" },
+    "worker_scoped_settle_contract": { "type": "object" },
+    "allowed_write_roots": { "type": "array", "items": { "type": "string" } },
+    "forbidden_paths": { "type": "array", "items": { "type": "string" } },
+    "terminal_protocol": { "type": "object" },
+    "expected_evidence": { "type": "object" },
+    "result_validation": { "type": "object" },
+    "would_execute_live": { "const": false },
+    "would_write_registry": { "const": false },
+    "blocked_reasons": { "type": "array", "items": { "type": "string" } },
+    "warnings": { "type": "array", "items": { "type": "string" } },
+    "safe_next_actions": { "type": "array", "items": { "type": "string" } },
+    "forbidden_next_actions": { "type": "array", "items": { "type": "string" } },
+    "evidence": { "type": "array" }
+  },
+  "$defs": {
+    "smoke": {
+      "type": "object",
+      "required": ["expected_marker", "required_report_md_nonempty", "terminal_marker_count"],
+      "properties": {
+        "expected_marker": { "enum": [".done", ".blocked", ".fail"] },
+        "required_report_md_nonempty": { "const": true },
+        "terminal_marker_count": { "const": "exactly_one" },
+        "task_dir": { "type": "string" },
+        "report_path": { "type": "string" }
+      }
+    }
+  }
+}

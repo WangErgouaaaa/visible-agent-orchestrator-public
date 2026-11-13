@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "backends": {
+    "claude_code": {
+      "backend_kind": "claude_code",
+      "live_enabled": false,
+      "supports_live_submit_required": true,
+      "enabled_by": "",
+      "enabled_at": "",
+      "user_authorization_record": "",
+      "allowed_workspace_roots": [],
+      "allowed_runtime_substrates": ["tmux-reference"],
+      "allowed_worker_ids": [],
+      "allow_user_owned_pane": false,
+      "require_preflight_ok": true,
+      "require_no_active_locks": true,
+      "require_business_index_unchanged": true,
+      "require_single_worker_only": true,
+      "allow_mixed_worker": false,
+      "notes": ["Claude Code remains fixture-only and disabled by default."]
+    },
+    "cursor_agent": {
+      "backend_kind": "cursor_agent",
+      "live_enabled": false,
+      "supports_live_submit_required": true,
+      "enabled_by": "",
+      "enabled_at": "",
+      "user_authorization_record": "",
+      "allowed_workspace_roots": [],
+      "allowed_runtime_substrates": ["tmux-reference"],
+      "allowed_worker_ids": [],
+      "allow_user_owned_pane": false,
+      "require_preflight_ok": true,
+      "require_no_active_locks": true,
+      "require_business_index_unchanged": true,
+      "require_single_worker_only": true,
+      "allow_mixed_worker": false,
+      "notes": ["Cursor Agent remains fixture-only and disabled by default."]
+    },
+    "opencode_tui": {
+      "backend_kind": "opencode_tui",
+      "live_enabled": true,
+      "supports_live_submit_required": true,
+      "enabled_by": "existing-visible-dispatch-wrapper",
+      "enabled_at": "",
+      "user_authorization_record": "existing-visible-dispatch-wrapper",
+      "allowed_workspace_roots": [],
+      "allowed_runtime_substrates": ["tmux-reference"],
+      "allowed_worker_ids": [],
+      "allow_user_owned_pane": false,
+      "require_preflight_ok": true,
+      "require_no_active_locks": true,
+      "require_business_index_unchanged": true,
+      "require_single_worker_only": true,
+      "allow_mixed_worker": false,
+      "notes": ["OpenCode remains wrapper-only through omx_visible_dispatch; direct submit is forbidden."]
+    }
+  }
+}

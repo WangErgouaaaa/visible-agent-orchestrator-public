@@ -1,0 +1,907 @@
+#!/usr/bin/env python3
+"""Read-only/advisory orchestrator loop for visible OpenCode workers."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+
+_THIS_FILE = Path(__file__).resolve()
+_CANDIDATE_IMPORT_ROOTS = []
+
+_env_lib = os.environ.get("OMX_VISIBLE_AGENT_ORCHESTRATOR_LIB")
+if _env_lib:
+    _CANDIDATE_IMPORT_ROOTS.append(Path(_env_lib).expanduser().resolve())
+
+_CANDIDATE_IMPORT_ROOTS.append((_THIS_FILE.parent.parent / "src").resolve())
+_CANDIDATE_IMPORT_ROOTS.append((_THIS_FILE.parent.parent / "lib").resolve())
+
+for _path in _CANDIDATE_IMPORT_ROOTS:
+    if _path.exists() and str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
+
+from visible_agent_orchestrator.blackboard_contract import build_evidence_blackboard  # noqa: E402
+from visible_agent_orchestrator.collaboration_profile import (  # noqa: E402
+    load_collaboration_profile,
+    profile_edge,
+)
+from visible_agent_orchestrator.orchestrator_loop import (  # noqa: E402
+    build_approval_action_plan,
+    build_actuation_plan,
+    build_loop_contract,
+    build_recovery_plan,
+    observe_once,
+    run_low_risk_auto_actions,
+    run_local_followup_executor,
+    write_advisory_plan,
+    write_request_execution_gate,
+    write_optional_lane_control_request,
+    write_request_consumer_plan,
+    write_replan_chain,
+    write_replan_followup,
+    write_replan_plan,
+    write_replan_request,
+    write_replan_transition,
+    write_runtime_handoff_plan,
+)
+from visible_agent_orchestrator.supervision_policy import (  # noqa: E402
+    load_authorization_grant,
+    load_run_manifest,
+    load_supervision_policy,
+)
+from visible_agent_orchestrator.supervision_dispatch import (  # noqa: E402
+    dispatch_isolated_write_handoff,
+    dispatch_readonly_handoff,
+    lookup_isolated_write_handoff_receipt,
+    lookup_readonly_handoff_receipt,
+    preflight_readonly_worker,
+)
+from visible_agent_orchestrator.supervision_runtime import (  # noqa: E402
+    build_artifact_snapshot,
+    run_supervisor,
+)
+from visible_agent_orchestrator.pull_scheduler import (  # noqa: E402
+    build_pull_dry_run_plan,
+    build_pull_live_executor_plan,
+    build_pull_live_plan,
+    build_pull_live_rollback_plan,
+)
+from visible_agent_orchestrator.runtime_paths import runtime_root  # noqa: E402
+
+
+def _read_json_object(path: str) -> dict:
+    if not path:
+        return {}
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"expected object JSON: {path}")
+    return data
+
+
+def _read_json_rows(path: str) -> list[dict]:
+    if not path:
+        return []
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if isinstance(data, dict):
+        if "locks" in data:
+            rows = data.get("locks")
+        else:
+            rows = data.get("workers", [])
+    else:
+        rows = data
+    if not isinstance(rows, list):
+        raise ValueError(f"expected row list JSON: {path}")
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _read_snapshot_sequence(path: str) -> list[dict]:
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if isinstance(payload, dict):
+        snapshots = payload.get("snapshots")
+        if isinstance(snapshots, list):
+            payload = snapshots
+        else:
+            payload = [payload]
+    if not isinstance(payload, list) or not payload or not all(isinstance(item, dict) for item in payload):
+        raise ValueError(f"expected one snapshot object or a non-empty snapshot list: {path}")
+    return [dict(item) for item in payload]
+
+
+def _emit(payload: dict, *, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
+        return
+    if payload.get("answer_kind"):
+        print(f"{payload.get('answer_kind')}:")
+        print(f"  status: {payload.get('status')}")
+        print(f"  primary_action: {payload.get('primary_action')}")
+        print(f"  primary_reason: {payload.get('primary_reason')}")
+        print(f"  actuation_enabled: {str(bool(payload.get('actuation_enabled'))).lower()}")
+        print(f"  actionable: {str(bool(payload.get('actionable'))).lower()}")
+        print(f"  would_execute: {str(bool(payload.get('would_execute'))).lower()}")
+        safe_next_actions = payload.get("safe_next_actions")
+        if isinstance(safe_next_actions, list):
+            for item in safe_next_actions:
+                print(f"  safe_next_action: {item}")
+        forbidden_next_actions = payload.get("forbidden_next_actions")
+        if isinstance(forbidden_next_actions, list):
+            for item in forbidden_next_actions:
+                print(f"  forbidden_next_action: {item}")
+        return
+    if payload.get("blackboard_kind"):
+        print(f"{payload.get('blackboard_kind')}:")
+        print(f"  mode: {payload.get('mode')}")
+        print(f"  actuation_enabled: {str(bool(payload.get('actuation_enabled'))).lower()}")
+        domains = payload.get("evidence_domains")
+        if isinstance(domains, dict):
+            for domain_id, row in sorted(domains.items()):
+                status = row.get("status") if isinstance(row, dict) else ""
+                print(f"  domain: {domain_id} status={status}")
+        return
+    if payload.get("scheduler_kind"):
+        print(f"{payload.get('scheduler_kind')}:")
+        print(f"  mode: {payload.get('mode')}")
+        print(f"  actuation_enabled: {str(bool(payload.get('actuation_enabled'))).lower()}")
+        if "would_dispatch" in payload:
+            print(f"  would_dispatch: {str(bool(payload.get('would_dispatch'))).lower()}")
+        if "executed" in payload:
+            print(f"  executed: {str(bool(payload.get('executed'))).lower()}")
+        decisions = payload.get("decisions")
+        if isinstance(decisions, list):
+            for row in decisions:
+                if isinstance(row, dict):
+                    action = row.get("action") or ""
+                    domain = row.get("evidence_domain") or row.get("subagent_id") or ""
+                    would_execute = str(bool(row.get("would_execute"))).lower()
+                    print(f"  decision: {action} {domain} would_execute={would_execute}".rstrip())
+        actions = payload.get("actions")
+        if isinstance(actions, list):
+            for row in actions:
+                if isinstance(row, dict):
+                    action = row.get("action") or ""
+                    domain = row.get("evidence_domain") or row.get("subagent_id") or ""
+                    would_execute_live = str(bool(row.get("would_execute_live"))).lower()
+                    executed = str(bool(row.get("executed"))).lower()
+                    print(
+                        f"  action: {action} {domain} "
+                        f"would_execute_live={would_execute_live} executed={executed}".rstrip()
+                    )
+        return
+    if payload.get("executor_kind"):
+        print(f"{payload.get('executor_kind')}:")
+        print(f"  mode: {payload.get('mode')}")
+        print(f"  actuation_enabled: {str(bool(payload.get('actuation_enabled'))).lower()}")
+        print(f"  execution_allowed: {str(bool(payload.get('execution_allowed'))).lower()}")
+        print(f"  executed: {str(bool(payload.get('executed'))).lower()}")
+        return
+    if payload.get("supervisor_kind"):
+        decision = payload.get("last_decision") if isinstance(payload.get("last_decision"), dict) else {}
+        print(f"{payload.get('supervisor_kind')}:")
+        print(f"  run_id: {payload.get('run_id')}")
+        print(f"  mode: {payload.get('mode')}")
+        print(f"  cycles: {payload.get('cycles')}")
+        print(f"  disposition: {decision.get('disposition') or '-'}")
+        print(f"  reason: {decision.get('reason') or '-'}")
+        print(f"  actuation_enabled: {str(bool(payload.get('actuation_enabled'))).lower()}")
+        return
+    if payload.get("rollback_kind"):
+        print(f"{payload.get('rollback_kind')}:")
+        print(f"  mode: {payload.get('mode')}")
+        print(f"  recommended_mode: {payload.get('recommended_mode')}")
+        print(f"  executed: {str(bool(payload.get('executed'))).lower()}")
+        return
+    print(f"{payload.get('loop_kind')}:")
+    print(f"  actuation_enabled: {str(bool(payload.get('actuation_enabled'))).lower()}")
+    summary = payload.get("summary")
+    if isinstance(summary, dict):
+        for key in sorted(summary):
+            print(f"  {key}: {summary[key]}")
+    recommendations = payload.get("recommendations")
+    if isinstance(recommendations, list):
+        for row in recommendations:
+            if isinstance(row, dict):
+                print(f"  recommendation: {row.get('recommendation')} {row.get('worker_id') or ''}".rstrip())
+
+
+def command_contract(args: argparse.Namespace) -> int:
+    _emit(build_loop_contract(), as_json=bool(args.json))
+    return 0
+
+
+def command_observe(args: argparse.Namespace) -> int:
+    board = _read_json_object(args.board_json) if args.board_json else None
+    locks = _read_json_rows(args.locks_json) if args.locks_json else None
+    run_metrics = _read_json_object(args.run_metrics_json) if args.run_metrics_json else None
+    decision_control = _read_json_object(args.decision_control_json) if args.decision_control_json else None
+    payload = observe_once(
+        Path(args.root),
+        board_payload=board,
+        lock_rows=locks,
+        run_metrics_data=run_metrics,
+            decision_control_data=decision_control,
+            locks_command=args.locks_command,
+    )
+    _emit(payload, as_json=bool(args.json))
+    return 0
+
+
+def command_blackboard(args: argparse.Namespace) -> int:
+    board = _read_json_object(args.board_json) if args.board_json else None
+    if board is None:
+        observation = observe_once(
+            Path(args.root),
+            board_payload=None,
+            lock_rows=[],
+            locks_command="",
+        )
+        payload = observation.get("blackboard") if isinstance(observation.get("blackboard"), dict) else {}
+    else:
+        payload = build_evidence_blackboard(board)
+    _emit(payload, as_json=bool(args.json))
+    return 0
+
+
+def command_pull_dry_run(args: argparse.Namespace) -> int:
+    board = _read_json_object(args.board_json) if args.board_json else None
+    if board is None:
+        observation = observe_once(
+            Path(args.root),
+            board_payload=None,
+            lock_rows=[],
+            locks_command="",
+        )
+        blackboard = observation.get("blackboard") if isinstance(observation.get("blackboard"), dict) else {}
+        payload = build_pull_dry_run_plan(blackboard)
+    else:
+        projection = board.get("opencode_subagent_projection") if isinstance(board.get("opencode_subagent_projection"), dict) else {}
+        blackboard = build_evidence_blackboard(board, projection)
+        payload = build_pull_dry_run_plan(blackboard, subagent_projection=projection)
+    if bool(args.answer_only):
+        payload = payload.get("answer") if isinstance(payload.get("answer"), dict) else {}
+    _emit(payload, as_json=bool(args.json))
+    return 0
+
+
+def command_pull_live_plan(args: argparse.Namespace) -> int:
+    board = _read_json_object(args.board_json) if args.board_json else None
+    if board is None:
+        observation = observe_once(
+            Path(args.root),
+            board_payload=None,
+            lock_rows=[],
+            locks_command="",
+        )
+        blackboard = observation.get("blackboard") if isinstance(observation.get("blackboard"), dict) else {}
+        payload = build_pull_live_plan(blackboard, allow_live=bool(args.allow_live))
+    else:
+        projection = board.get("opencode_subagent_projection") if isinstance(board.get("opencode_subagent_projection"), dict) else {}
+        blackboard = build_evidence_blackboard(board, projection)
+        payload = build_pull_live_plan(
+            blackboard,
+            subagent_projection=projection,
+            allow_live=bool(args.allow_live),
+        )
+    _emit(payload, as_json=bool(args.json))
+    return 0
+
+
+def command_pull_executor_plan(args: argparse.Namespace) -> int:
+    action = _read_json_object(args.action_json)
+    worker_preflight = _read_json_object(args.worker_preflight_json) if args.worker_preflight_json else None
+    locks = _read_json_rows(args.locks_json) if args.locks_json else None
+    payload = build_pull_live_executor_plan(
+        action,
+        target_root=str(Path(args.target_root).resolve()),
+        worker_preflight=worker_preflight,
+        locks=locks,
+        allow_real=bool(args.allow_real),
+    )
+    _emit(payload, as_json=bool(args.json))
+    return 0
+
+
+def command_pull_rollback_plan(args: argparse.Namespace) -> int:
+    executor_plan = _read_json_object(args.executor_plan_json)
+    payload = build_pull_live_rollback_plan(executor_plan, reason=args.reason)
+    _emit(payload, as_json=bool(args.json))
+    return 0
+
+
+def command_advise(args: argparse.Namespace) -> int:
+    board = _read_json_object(args.board_json) if args.board_json else None
+    locks = _read_json_rows(args.locks_json) if args.locks_json else None
+    decision_control = _read_json_object(args.decision_control_json) if args.decision_control_json else None
+    output = Path(args.output)
+    payload = {}
+    for index in range(max(1, int(args.watch_count))):
+        observation = observe_once(
+            Path(args.root),
+            board_payload=board,
+            lock_rows=locks,
+        decision_control_data=decision_control,
+        locks_command=args.locks_command,
+        )
+        payload = write_advisory_plan(observation, output)
+        if index + 1 < int(args.watch_count):
+            time.sleep(float(args.interval))
+    if bool(args.stdout_observation):
+        payload = {
+            "schema_version": 1,
+            "loop_kind": "orchestrator_loop_advisor_handoff",
+            "actuation_enabled": False,
+            "plan": payload,
+            "observation": observation,
+        }
+    _emit(payload, as_json=bool(args.json))
+    return 0
+
+
+def command_replan_plan(args: argparse.Namespace) -> int:
+    board = _read_json_object(args.board_json) if args.board_json else None
+    locks = _read_json_rows(args.locks_json) if args.locks_json else None
+    decision_control = _read_json_object(args.decision_control_json) if args.decision_control_json else None
+    observation = observe_once(
+        Path(args.root),
+        board_payload=board,
+        lock_rows=locks,
+            decision_control_data=decision_control,
+            locks_command=args.locks_command,
+    )
+    payload = write_replan_plan(observation, Path(args.output))
+    _emit(payload, as_json=bool(args.json))
+    return 0
+
+
+def command_replan_transition(args: argparse.Namespace) -> int:
+    replan_artifact = _read_json_object(args.replan_json)
+    payload = write_replan_transition(
+        replan_artifact,
+        attempted_action=args.attempted_action,
+        outcome=args.outcome,
+        output=Path(args.output),
+    )
+    _emit(payload, as_json=bool(args.json))
+    return 0
+
+
+def command_replan_followup(args: argparse.Namespace) -> int:
+    transition_artifact = _read_json_object(args.transition_json)
+    payload = write_replan_followup(transition_artifact, Path(args.output))
+    _emit(payload, as_json=bool(args.json))
+    return 0
+
+
+def command_replan_request(args: argparse.Namespace) -> int:
+    followup_artifact = _read_json_object(args.followup_json)
+    decision_control_artifact = _read_json_object(args.decision_control_json) if args.decision_control_json else None
+    payload = write_replan_request(
+        followup_artifact,
+        decision_control_artifact=decision_control_artifact,
+        lane_contracts_path=args.lane_contracts,
+        output=Path(args.output),
+    )
+    _emit(payload, as_json=bool(args.json))
+    return 0
+
+
+def command_optional_lane_control_request(args: argparse.Namespace) -> int:
+    subagent_artifact = _read_json_object(args.subagent_json)
+    payload = write_optional_lane_control_request(
+        subagent_artifact,
+        action=args.action,
+        reason=args.reason,
+        output=Path(args.output),
+    )
+    _emit(payload, as_json=bool(args.json))
+    return 0
+
+
+def command_request_consumer_plan(args: argparse.Namespace) -> int:
+    request_artifact = _read_json_object(args.request_json)
+    payload = write_request_consumer_plan(request_artifact, Path(args.output))
+    _emit(payload, as_json=bool(args.json))
+    return 0
+
+
+def command_request_execution_gate(args: argparse.Namespace) -> int:
+    consumer_plan = _read_json_object(args.consumer_plan_json)
+    payload = write_request_execution_gate(consumer_plan, Path(args.output))
+    _emit(payload, as_json=bool(args.json))
+    return 0
+
+
+def command_local_followup_executor(args: argparse.Namespace) -> int:
+    gate_artifact = _read_json_object(args.gate_json)
+    payload = run_local_followup_executor(gate_artifact, Path(args.output_dir))
+    _emit(payload, as_json=bool(args.json))
+    return 0
+
+
+def command_runtime_handoff_plan(args: argparse.Namespace) -> int:
+    consumer_plan = _read_json_object(args.consumer_plan_json)
+    payload = write_runtime_handoff_plan(consumer_plan, Path(args.output))
+    _emit(payload, as_json=bool(args.json))
+    return 0
+
+
+def command_replan_chain(args: argparse.Namespace) -> int:
+    workers = [str(item).strip() for item in list(args.worker or []) if str(item).strip()]
+    request = {
+        "lane_contracts_path": args.lane_contracts,
+        "workers": workers,
+        "strict_closeout_contract": bool(args.strict_closeout_contract),
+        "direct_tools_available": bool(args.direct_tools_available),
+        "unresolved_go_no_go": bool(args.unresolved_go_no_go),
+        "evidence_bundle_size": args.evidence_bundle_size,
+        "topology_kind": args.topology_kind,
+    }
+    payload = write_replan_chain(
+        request,
+        output_dir=Path(args.output_dir),
+        transition_outcome=args.transition_outcome,
+    )
+    _emit(payload, as_json=bool(args.json))
+    return 0
+
+
+def command_actuation_plan(args: argparse.Namespace) -> int:
+    target = _read_json_object(args.target_json) if args.target_json else {}
+    evidence = _read_json_object(args.evidence_json) if args.evidence_json else {}
+    payload = build_actuation_plan(action=args.action, target=target, evidence=evidence, dry_run=True)
+    _emit(payload, as_json=bool(args.json))
+    return 0
+
+
+def command_approval_actions(args: argparse.Namespace) -> int:
+    board = _read_json_object(args.board_json) if args.board_json else None
+    locks = _read_json_rows(args.locks_json) if args.locks_json else None
+    observation = observe_once(
+        Path(args.root),
+        board_payload=board,
+        lock_rows=locks,
+        locks_command=args.locks_command,
+    )
+    payload = build_approval_action_plan(observation)
+    _emit(payload, as_json=bool(args.json))
+    return 0
+
+
+def command_auto_actions(args: argparse.Namespace) -> int:
+    board = _read_json_object(args.board_json) if args.board_json else None
+    locks = _read_json_rows(args.locks_json) if args.locks_json else None
+    observation = observe_once(
+        Path(args.root),
+        board_payload=board,
+        lock_rows=locks,
+        locks_command=args.locks_command,
+    )
+    payload = run_low_risk_auto_actions(observation, Path(args.output_dir))
+    _emit(payload, as_json=bool(args.json))
+    return 0
+
+
+def command_recovery_plan(args: argparse.Namespace) -> int:
+    target = _read_json_object(args.target_json) if args.target_json else {}
+    evidence = _read_json_object(args.evidence_json) if args.evidence_json else {}
+    payload = build_recovery_plan(scenario=args.scenario, target=target, evidence=evidence)
+    _emit(payload, as_json=bool(args.json))
+    return 0
+
+
+def command_supervise(args: argparse.Namespace) -> int:
+    if args.allow_isolated_write and not args.allow_actuation:
+        raise ValueError("--allow-isolated-write requires --allow-actuation")
+    profile = load_collaboration_profile(args.profile)
+    manifest = load_run_manifest(args.manifest, profile=profile)
+    policy = load_supervision_policy(
+        args.supervision_policy,
+        profile=profile,
+        manifest=manifest,
+    )
+    grant = (
+        load_authorization_grant(
+            args.authorization,
+            manifest=manifest,
+            policy=policy,
+        )
+        if args.authorization
+        else None
+    )
+    grant_reader = None
+    if args.authorization:
+        def grant_reader() -> dict:
+            try:
+                return load_authorization_grant(
+                    args.authorization,
+                    manifest=manifest,
+                    policy=policy,
+                )
+            except Exception:
+                return {"state": "revoked"}
+    actuation_ready = (
+        args.allow_actuation
+        and grant is not None
+        and policy["mode"] == "preauthorized_followups"
+    )
+
+    def prepare_snapshot(snapshot: dict) -> dict:
+        if not actuation_ready:
+            return snapshot
+        return _attach_fresh_target_bindings(
+            snapshot,
+            profile=profile,
+            manifest=manifest,
+            policy=policy,
+            root=Path(args.root),
+        )
+
+    snapshot_reader = None
+    if args.snapshot_json:
+        snapshots = [
+            prepare_snapshot(snapshot)
+            for snapshot in _read_snapshot_sequence(args.snapshot_json)
+        ]
+        interval_seconds = 0.0
+    else:
+        snapshots = None
+        snapshot_reader = lambda: prepare_snapshot(
+            build_artifact_snapshot(Path(args.root), manifest=manifest)
+        )
+        interval_seconds = float(args.interval_seconds)
+
+    worker_dispatcher = None
+    receipt_lookup = None
+    allowed_worker_effect_classes = {"read_only_worker"}
+    if args.allow_isolated_write:
+        allowed_worker_effect_classes.add("write_isolated")
+    if actuation_ready:
+        def worker_dispatcher(handoff: dict) -> dict:
+            if handoff.get("effect_class") == "write_isolated":
+                return dispatch_isolated_write_handoff(
+                    Path(args.root),
+                    handoff,
+                    dispatch_path=_THIS_FILE.parent / "omx_visible_dispatch",
+                )
+            return dispatch_readonly_handoff(
+                Path(args.root),
+                handoff,
+                dispatch_path=_THIS_FILE.parent / "omx_visible_dispatch",
+            )
+
+        def receipt_lookup(handoff: dict) -> dict | None:
+            if handoff.get("effect_class") == "write_isolated":
+                return lookup_isolated_write_handoff_receipt(
+                    Path(args.root),
+                    handoff,
+                )
+            return lookup_readonly_handoff_receipt(
+                Path(args.root),
+                handoff,
+            )
+    payload = run_supervisor(
+        Path(args.root),
+        profile=profile,
+        manifest=manifest,
+        policy=policy,
+        grant=grant,
+        snapshots=snapshots,
+        output_dir=args.output_dir,
+        max_cycles=args.max_cycles,
+        resume=bool(args.resume),
+        supervisor_instance_id=args.supervisor_instance_id,
+        allow_actuation=bool(args.allow_actuation),
+        worker_dispatcher=worker_dispatcher,
+        receipt_lookup=receipt_lookup,
+        allowed_worker_effect_classes=allowed_worker_effect_classes,
+        snapshot_reader=snapshot_reader,
+        grant_reader=grant_reader,
+        interval_seconds=interval_seconds,
+    )
+    _emit(payload, as_json=bool(args.json))
+    return 0
+
+
+def _attach_fresh_target_bindings(
+    snapshot: dict,
+    *,
+    profile: dict,
+    manifest: dict,
+    policy: dict,
+    root: Path,
+) -> dict:
+    bindings = (
+        dict(snapshot.get("target_bindings"))
+        if isinstance(snapshot.get("target_bindings"), dict)
+        else {}
+    )
+    targets = manifest.get("targets") if isinstance(manifest.get("targets"), dict) else {}
+    for edge_id in policy.get("candidate_edges", []):
+        edge = profile_edge(profile, str(edge_id))
+        if edge.get("effect_class") not in {
+            "read_only_worker",
+            "write_isolated",
+        }:
+            continue
+        target_node = str(edge.get("target_node") or "")
+        target = targets.get(target_node)
+        if not isinstance(target, dict):
+            raise ValueError(
+                f"preauthorized worker edge {edge_id} has no manifest target"
+            )
+        worker_id = str(target.get("worker_id") or "")
+        binding = preflight_readonly_worker(
+            root,
+            worker_id,
+            dispatch_path=_THIS_FILE.parent / "omx_visible_dispatch",
+        )
+        bindings[target_node] = {
+            "worker_id": worker_id,
+            **binding,
+            "lock_state": "unlocked",
+            "fresh_idle": True,
+        }
+    return {**snapshot, "target_bindings": bindings}
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    contract = sub.add_parser("contract", help="print OL-0 safety and output contract")
+    contract.add_argument("--json", action="store_true")
+    contract.set_defaults(func=command_contract)
+
+    observe = sub.add_parser("observe", help="run one OL-1 read-only observation")
+    observe.add_argument("--root", default=str(runtime_root()))
+    observe.add_argument("--locks-command", default="")
+    observe.add_argument("--board-json", default="", help="fixture/offline board status JSON")
+    observe.add_argument("--locks-json", default="", help="fixture/offline lock rows JSON")
+    observe.add_argument(
+        "--run-metrics-json",
+        default="",
+        help="optional offline LangGraph run_metrics.json or state.json evidence",
+    )
+    observe.add_argument("--decision-control-json", default="", help="precomputed decision-control plan JSON")
+    observe.add_argument("--json", action="store_true")
+    observe.set_defaults(func=command_observe)
+
+    blackboard = sub.add_parser("blackboard", help="print canonical advisory evidence blackboard only")
+    blackboard.add_argument("--root", default=str(runtime_root()))
+    blackboard.add_argument("--board-json", default="", help="fixture/offline board status JSON")
+    blackboard.add_argument("--json", action="store_true")
+    blackboard.set_defaults(func=command_blackboard)
+
+    pull_dry_run = sub.add_parser("pull-dry-run", help="compute Phase 10a pull scheduler recommendations without actuation")
+    pull_dry_run.add_argument("--root", default=str(runtime_root()))
+    pull_dry_run.add_argument("--board-json", default="", help="fixture/offline board status JSON")
+    pull_dry_run.add_argument("--answer-only", action="store_true", help="emit only the Phase29 advisory answer object")
+    pull_dry_run.add_argument("--json", action="store_true")
+    pull_dry_run.set_defaults(func=command_pull_dry_run)
+
+    pull_live_plan = sub.add_parser("pull-live-plan", help="build a gated Phase 10b pull_live plan without executing it")
+    pull_live_plan.add_argument("--root", default=str(runtime_root()))
+    pull_live_plan.add_argument("--board-json", default="", help="fixture/offline board status JSON")
+    pull_live_plan.add_argument("--allow-live", action="store_true", help="explicitly opt in to pull_live planning")
+    pull_live_plan.add_argument("--json", action="store_true")
+    pull_live_plan.set_defaults(func=command_pull_live_plan)
+
+    pull_executor = sub.add_parser("pull-executor-plan", help="build a Phase 15 no-live executor plan for one pull_live action")
+    pull_executor.add_argument("--target-root", default=str(runtime_root()))
+    pull_executor.add_argument("--action-json", required=True, help="single pull_live action envelope JSON")
+    pull_executor.add_argument("--worker-preflight-json", default="", help="fresh worker binding preflight JSON")
+    pull_executor.add_argument("--locks-json", default="", help="fresh lock rows JSON")
+    pull_executor.add_argument("--allow-real", action="store_true", help="explicitly unlock real-execution readiness checks")
+    pull_executor.add_argument("--json", action="store_true")
+    pull_executor.set_defaults(func=command_pull_executor_plan)
+
+    pull_rollback = sub.add_parser("pull-rollback-plan", help="build a Phase 15b no-live rollback rehearsal plan")
+    pull_rollback.add_argument("--executor-plan-json", required=True)
+    pull_rollback.add_argument("--reason", required=True)
+    pull_rollback.add_argument("--json", action="store_true")
+    pull_rollback.set_defaults(func=command_pull_rollback_plan)
+
+    advise = sub.add_parser("advise", help="write OL-2 advisory plan artifact only")
+    advise.add_argument("--root", default=str(runtime_root()))
+    advise.add_argument("--output", required=True)
+    advise.add_argument("--watch-count", type=int, default=1)
+    advise.add_argument("--interval", type=float, default=5.0)
+    advise.add_argument("--locks-command", default="")
+    advise.add_argument("--board-json", default="")
+    advise.add_argument("--locks-json", default="")
+    advise.add_argument("--decision-control-json", default="", help="precomputed decision-control plan JSON")
+    advise.add_argument("--stdout-observation", action="store_true", help="include the final observation beside the advisory plan in stdout JSON")
+    advise.add_argument("--json", action="store_true")
+    advise.set_defaults(func=command_advise)
+
+    replan = sub.add_parser("replan-plan", help="write standalone internal replan artifact only")
+    replan.add_argument("--root", default=str(runtime_root()))
+    replan.add_argument("--output", required=True)
+    replan.add_argument("--locks-command", default="")
+    replan.add_argument("--board-json", default="")
+    replan.add_argument("--locks-json", default="")
+    replan.add_argument("--decision-control-json", default="", help="precomputed decision-control plan JSON")
+    replan.add_argument("--json", action="store_true")
+    replan.set_defaults(func=command_replan_plan)
+
+    replan_transition = sub.add_parser("replan-transition", help="evaluate one advisory replan transition and write artifact")
+    replan_transition.add_argument("--replan-json", required=True)
+    replan_transition.add_argument("--attempted-action", required=True)
+    replan_transition.add_argument("--outcome", required=True, choices=["success", "failure"])
+    replan_transition.add_argument("--output", required=True)
+    replan_transition.add_argument("--json", action="store_true")
+    replan_transition.set_defaults(func=command_replan_transition)
+
+    replan_followup = sub.add_parser("replan-followup", help="write standalone followup artifact from a replan transition")
+    replan_followup.add_argument("--transition-json", required=True)
+    replan_followup.add_argument("--output", required=True)
+    replan_followup.add_argument("--json", action="store_true")
+    replan_followup.set_defaults(func=command_replan_followup)
+
+    replan_request = sub.add_parser("replan-request", help="write a machine-consumable followup request artifact")
+    replan_request.add_argument("--followup-json", required=True)
+    replan_request.add_argument("--decision-control-json", default="")
+    replan_request.add_argument("--lane-contracts", default="")
+    replan_request.add_argument("--output", required=True)
+    replan_request.add_argument("--json", action="store_true")
+    replan_request.set_defaults(func=command_replan_request)
+
+    optional_lane_control = sub.add_parser(
+        "optional-lane-control-request",
+        help="write a no-live runtime-dependent optional-lane control request artifact",
+    )
+    optional_lane_control.add_argument("--subagent-json", required=True)
+    optional_lane_control.add_argument(
+        "--action",
+        required=True,
+        choices=["cancel_late_optional_lane", "ignore_late_optional_lane"],
+    )
+    optional_lane_control.add_argument("--reason", required=True)
+    optional_lane_control.add_argument("--output", required=True)
+    optional_lane_control.add_argument("--json", action="store_true")
+    optional_lane_control.set_defaults(func=command_optional_lane_control_request)
+
+    request_consumer = sub.add_parser(
+        "request-consumer-plan",
+        help="write a no-live consumer plan over an existing request artifact",
+    )
+    request_consumer.add_argument("--request-json", required=True)
+    request_consumer.add_argument("--output", required=True)
+    request_consumer.add_argument("--json", action="store_true")
+    request_consumer.set_defaults(func=command_request_consumer_plan)
+
+    request_execution_gate = sub.add_parser(
+        "request-execution-gate",
+        help="write a no-live execution-gate artifact for an existing consumer plan",
+    )
+    request_execution_gate.add_argument("--consumer-plan-json", required=True)
+    request_execution_gate.add_argument("--output", required=True)
+    request_execution_gate.add_argument("--json", action="store_true")
+    request_execution_gate.set_defaults(func=command_request_execution_gate)
+
+    local_followup_executor = sub.add_parser(
+        "local-followup-executor",
+        help="run the immutable local no-live followup executor over an execution-gate artifact",
+    )
+    local_followup_executor.add_argument("--gate-json", required=True)
+    local_followup_executor.add_argument("--output-dir", required=True)
+    local_followup_executor.add_argument("--json", action="store_true")
+    local_followup_executor.set_defaults(func=command_local_followup_executor)
+
+    runtime_handoff = sub.add_parser(
+        "runtime-handoff-plan",
+        help="write a schema-level no-live runtime handoff stub for an existing consumer plan",
+    )
+    runtime_handoff.add_argument("--consumer-plan-json", required=True)
+    runtime_handoff.add_argument("--output", required=True)
+    runtime_handoff.add_argument("--json", action="store_true")
+    runtime_handoff.set_defaults(func=command_runtime_handoff_plan)
+
+    replan_chain = sub.add_parser("replan-chain", help="compose decision-control through followup in one no-live chain")
+    replan_chain.add_argument("--lane-contracts", required=True)
+    replan_chain.add_argument("--worker", action="append", default=[])
+    replan_chain.add_argument("--strict-closeout-contract", action="store_true")
+    replan_chain.add_argument("--direct-tools-available", action="store_true")
+    replan_chain.add_argument("--unresolved-go-no-go", action="store_true")
+    replan_chain.add_argument("--evidence-bundle-size", default="unknown")
+    replan_chain.add_argument("--topology-kind", default="unknown")
+    replan_chain.add_argument("--transition-outcome", required=True, choices=["success", "failure"])
+    replan_chain.add_argument("--output-dir", required=True)
+    replan_chain.add_argument("--json", action="store_true")
+    replan_chain.set_defaults(func=command_replan_chain)
+
+    actuation = sub.add_parser("actuation-plan", help="build an OL-3 dry-run action envelope")
+    actuation.add_argument("--action", required=True)
+    actuation.add_argument("--target-json", default="")
+    actuation.add_argument("--evidence-json", default="")
+    actuation.add_argument("--json", action="store_true")
+    actuation.set_defaults(func=command_actuation_plan)
+
+    approval = sub.add_parser("approval-actions", help="build Phase 67 approval-required action suggestions")
+    approval.add_argument("--root", default=str(runtime_root()))
+    approval.add_argument("--locks-command", default="")
+    approval.add_argument("--board-json", default="")
+    approval.add_argument("--locks-json", default="")
+    approval.add_argument("--json", action="store_true")
+    approval.set_defaults(func=command_approval_actions)
+
+    auto = sub.add_parser("auto-actions", help="run Phase 68 low-risk artifact-only actions")
+    auto.add_argument("--root", default=str(runtime_root()))
+    auto.add_argument("--output-dir", required=True)
+    auto.add_argument("--locks-command", default="")
+    auto.add_argument("--board-json", default="")
+    auto.add_argument("--locks-json", default="")
+    auto.add_argument("--json", action="store_true")
+    auto.set_defaults(func=command_auto_actions)
+
+    recovery = sub.add_parser("recovery-plan", help="build an OL-4 dry-run recovery envelope")
+    recovery.add_argument("--scenario", required=True)
+    recovery.add_argument("--target-json", default="")
+    recovery.add_argument("--evidence-json", default="")
+    recovery.add_argument("--json", action="store_true")
+    recovery.set_defaults(func=command_recovery_plan)
+
+    supervise = sub.add_parser(
+        "supervise",
+        help="run a bounded supervisor over a validated profile, manifest, policy, and evidence snapshot",
+    )
+    supervise.add_argument("--root", default=str(runtime_root()))
+    supervise.add_argument("--profile", required=True)
+    supervise.add_argument("--manifest", required=True)
+    supervise.add_argument("--supervision-policy", required=True)
+    supervise.add_argument("--authorization", default="")
+    supervise.add_argument(
+        "--snapshot-json",
+        default="",
+        help=(
+            "optional offline evidence snapshot object or time-sequenced snapshot list; "
+            "when omitted, read declared lane task artifacts"
+        ),
+    )
+    supervise.add_argument("--output-dir", required=True)
+    supervise.add_argument("--max-cycles", type=int, default=None)
+    supervise.add_argument(
+        "--interval-seconds",
+        type=float,
+        default=5.0,
+        help="artifact-observation interval when --snapshot-json is omitted",
+    )
+    supervise.add_argument("--resume", action="store_true")
+    supervise.add_argument("--supervisor-instance-id", default="supervisor-local")
+    supervise.add_argument(
+        "--allow-actuation",
+        action="store_true",
+        help=(
+            "allow a preauthorized worker edge after fresh sanctioned "
+            "control-plane preflight"
+        ),
+    )
+    supervise.add_argument(
+        "--allow-isolated-write",
+        action="store_true",
+        help=(
+            "also permit one preauthorized write_isolated edge; requires "
+            "--allow-actuation"
+        ),
+    )
+    supervise.add_argument("--json", action="store_true")
+    supervise.set_defaults(func=command_supervise)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return int(args.func(args))
+    except Exception as exc:
+        print(f"orchestrator_loop_error: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

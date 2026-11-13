@@ -1,0 +1,928 @@
+#!/usr/bin/python3
+"""Minimal LangGraph control plane over omx_visible_dispatch."""
+
+from __future__ import annotations
+
+import argparse
+import errno
+import json
+import os
+import re
+import stat
+import sys
+import uuid
+from contextlib import contextmanager
+from pathlib import Path
+
+_THIS_FILE = Path(__file__).resolve()
+for _p in ((_THIS_FILE.parent.parent / "src").resolve(), (_THIS_FILE.parent.parent / "lib").resolve()):
+    if _p.exists() and str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
+
+from visible_agent_orchestrator.langgraph_control_plane import (
+    _next_operator_action,
+    checkpoint_db_path,
+    inspect_control_plane,
+    invoke_control_plane,
+    make_json_safe,
+    resume_control_plane,
+    write_artifacts,
+)
+from visible_agent_orchestrator.runtime_paths import runtime_root
+from visible_agent_orchestrator.control_plane_contract import CONTRACT_VERSION
+from visible_agent_orchestrator.lane_contracts import LaneContractError, load_lane_contract_bundle
+from visible_agent_orchestrator.run_metrics import RunMetricsError, load_execution_budget
+from visible_agent_orchestrator.session_actions import (
+    REHYDRATION_PACKET_TYPES,
+    SESSION_ROTATION_REASONS,
+    SessionActionError,
+    resolve_session_actions,
+)
+from visible_agent_orchestrator.worker_pool_lease import (
+    WorkerPoolLeaseConflict,
+    acquire_worker_pool_lease,
+    release_worker_pool_lease,
+)
+from visible_agent_orchestrator.companion_skill_admission import AdmissionError, invoke_cli_handler
+
+DEFAULT_VISIBLE_TIMEOUT_SECONDS = 300
+DEFAULT_INNER_MODE_TIMEOUT_SECONDS = 900
+THREAD_ID_PATTERN = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z"
+)
+
+
+def root_path(value: str | None) -> Path:
+    return runtime_root(value)
+
+
+def thread_dir(root: Path, thread_id: str) -> Path:
+    value = str(thread_id or "")
+    if not THREAD_ID_PATTERN.fullmatch(value):
+        raise SystemExit(f"thread id is invalid: {value or '-'}")
+    return (
+        root
+        / ".omx"
+        / "framework"
+        / "team"
+        / "langgraph-control-plane"
+        / value
+    )
+
+
+def request_path(root: Path, thread_id: str) -> Path:
+    return thread_dir(root, thread_id) / "request.json"
+
+
+def read_json(path: Path) -> dict[str, object]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def open_control_directory_fd(
+    root: Path,
+    *,
+    create: bool,
+) -> int:
+    flags = os.O_RDONLY | os.O_DIRECTORY
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise SystemExit("no-follow directory access is unavailable")
+    flags |= os.O_NOFOLLOW
+    descriptor = os.open(root, flags)
+    try:
+        for component in (
+            ".omx",
+            "framework",
+            "team",
+            "langgraph-control-plane",
+        ):
+            try:
+                child = os.open(
+                    component,
+                    flags,
+                    dir_fd=descriptor,
+                )
+            except FileNotFoundError:
+                if not create:
+                    raise SystemExit(
+                        "request evidence is missing: "
+                        f"{checkpoint_db_path(root).parent}"
+                    )
+                try:
+                    os.mkdir(component, 0o700, dir_fd=descriptor)
+                except FileExistsError:
+                    pass
+                try:
+                    child = os.open(
+                        component,
+                        flags,
+                        dir_fd=descriptor,
+                    )
+                except OSError as exc:
+                    raise SystemExit(
+                        "request evidence directory must not "
+                        "contain symlinks"
+                    ) from exc
+            except OSError as exc:
+                raise SystemExit(
+                    "request evidence directory must not "
+                    "contain symlinks"
+                ) from exc
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def open_thread_directory_fd(
+    root: Path,
+    thread_id: str,
+    *,
+    create: bool,
+) -> int:
+    value = thread_dir(root, thread_id).name
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    descriptor = open_control_directory_fd(root, create=create)
+    try:
+        try:
+            child = os.open(value, flags, dir_fd=descriptor)
+        except FileNotFoundError:
+            if not create:
+                raise SystemExit(
+                    "request evidence is missing: "
+                    f"{request_path(root, thread_id)}"
+                )
+            try:
+                os.mkdir(value, 0o700, dir_fd=descriptor)
+            except FileExistsError:
+                pass
+            try:
+                child = os.open(value, flags, dir_fd=descriptor)
+            except OSError as exc:
+                raise SystemExit(
+                    "request evidence directory must not "
+                    "contain symlinks"
+                ) from exc
+        except OSError as exc:
+            raise SystemExit(
+                "request evidence directory must not "
+                "contain symlinks"
+            ) from exc
+    finally:
+        os.close(descriptor)
+    return child
+
+
+def read_request_from_fd(
+    directory_fd: int,
+    display_path: Path,
+) -> dict[str, object]:
+    flags = os.O_RDONLY | os.O_NOFOLLOW
+    try:
+        descriptor = os.open(
+            "request.json",
+            flags,
+            dir_fd=directory_fd,
+        )
+    except FileNotFoundError as exc:
+        raise SystemExit(
+            f"request evidence is missing: {display_path}"
+        ) from exc
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise SystemExit(
+                "request evidence must not be a symlink: "
+                f"{display_path}"
+            ) from exc
+        raise SystemExit(
+            f"request evidence is invalid: {display_path}"
+        ) from exc
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise SystemExit(
+                f"request evidence is invalid: {display_path}"
+            )
+        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+            descriptor = -1
+            payload = json.load(handle)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise SystemExit(
+            f"request evidence is invalid: {display_path}"
+        ) from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if not isinstance(payload, dict):
+        raise SystemExit(
+            f"request evidence is invalid: {display_path}"
+        )
+    workers = payload.get("workers")
+    if not isinstance(workers, list) or not workers:
+        raise SystemExit(
+            "request evidence is invalid: workers are required"
+        )
+    return payload
+
+
+def read_resume_request(
+    root: Path,
+    thread_id: str,
+) -> dict[str, object]:
+    directory_fd = open_thread_directory_fd(
+        root,
+        thread_id,
+        create=False,
+    )
+    try:
+        return read_request_from_fd(
+            directory_fd,
+            request_path(root, thread_id),
+        )
+    finally:
+        os.close(directory_fd)
+
+
+def persist_request_evidence(
+    root: Path,
+    thread_id: str,
+    payload: dict[str, object],
+) -> tuple[Path, bool]:
+    path = request_path(root, thread_id)
+    normalized = make_json_safe(payload)
+    serialized = (
+        json.dumps(
+            normalized,
+            indent=2,
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+        + "\n"
+    )
+    directory_fd = open_thread_directory_fd(
+        root,
+        thread_id,
+        create=True,
+    )
+    temporary = f".request.{uuid.uuid4().hex}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    try:
+        try:
+            existing = read_request_from_fd(directory_fd, path)
+        except SystemExit as exc:
+            if "request evidence is missing:" not in str(exc):
+                raise
+        else:
+            if existing != normalized:
+                raise SystemExit(
+                    "request evidence already exists with a "
+                    "different contract"
+                )
+            return path, False
+
+        descriptor = os.open(
+            temporary,
+            flags,
+            0o600,
+            dir_fd=directory_fd,
+        )
+        created = False
+        try:
+            with os.fdopen(
+                descriptor,
+                "w",
+                encoding="utf-8",
+            ) as handle:
+                handle.write(serialized)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.link(
+                temporary,
+                "request.json",
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+            created = True
+        except FileExistsError:
+            if read_request_from_fd(directory_fd, path) != normalized:
+                raise SystemExit(
+                    "request evidence already exists with a "
+                    "different contract"
+                )
+        finally:
+            try:
+                os.unlink(temporary, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+    return path, created
+
+
+@contextmanager
+def secured_checkpoint_path(
+    root: Path,
+    thread_id: str,
+    *,
+    create: bool,
+):
+    thread_dir(root, thread_id)
+    control_fd = open_control_directory_fd(
+        root,
+        create=False,
+    )
+    checkpoint_fd = -1
+    try:
+        file_flags = os.O_RDWR | os.O_NOFOLLOW
+        if create:
+            file_flags |= os.O_CREAT
+        try:
+            checkpoint_fd = os.open(
+                "control-plane.sqlite",
+                file_flags,
+                0o600,
+                dir_fd=control_fd,
+            )
+        except FileNotFoundError as exc:
+            raise SystemExit(
+                "checkpoint database is missing: "
+                f"{checkpoint_db_path(root)}"
+            ) from exc
+        except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                raise SystemExit(
+                    "checkpoint database must not be a symlink: "
+                    f"{checkpoint_db_path(root)}"
+                ) from exc
+            raise SystemExit(
+                "checkpoint database is invalid: "
+                f"{checkpoint_db_path(root)}"
+            ) from exc
+        if not stat.S_ISREG(os.fstat(checkpoint_fd).st_mode):
+            raise SystemExit(
+                "checkpoint database is invalid: "
+                f"{checkpoint_db_path(root)}"
+            )
+        yield Path(f"/proc/self/fd/{checkpoint_fd}")
+    finally:
+        if checkpoint_fd >= 0:
+            os.close(checkpoint_fd)
+        os.close(control_fd)
+
+
+def validate_resume_checkpoint(
+    *,
+    root: Path,
+    thread_id: str,
+    request: dict[str, object],
+    checkpoint_path: Path,
+) -> None:
+    try:
+        inspected = inspect_control_plane(
+            root=root,
+            thread_id=thread_id,
+            checkpoint_path=checkpoint_path,
+        )
+    except Exception as exc:
+        raise SystemExit(
+            "authoritative checkpoint evidence is unavailable"
+        ) from exc
+    snapshot = inspected.get("snapshot")
+    values = (
+        snapshot.get("values")
+        if isinstance(snapshot, dict)
+        else None
+    )
+    if not isinstance(values, dict):
+        raise SystemExit(
+            "authoritative checkpoint evidence is invalid"
+        )
+    mismatches = [
+        field
+        for field in (
+            "backend",
+            "workers",
+            "allow_real",
+            "dry_run",
+            "session_actions",
+            "session_action_reason",
+            "rotation_reason",
+            "rehydration_packet_type",
+        )
+        if values.get(field) != request.get(field)
+    ]
+    if mismatches:
+        raise SystemExit(
+            "checkpoint state does not match request evidence: "
+            + ", ".join(mismatches)
+        )
+
+
+def write_json(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def _next_operator_action_for_payload(payload: dict[str, object]) -> str:
+    return _next_operator_action(payload)
+
+
+def _proof_summary(proof: object) -> dict[str, object]:
+    if not isinstance(proof, dict) or not proof:
+        return {}
+    before = proof.get("before") if isinstance(proof.get("before"), dict) else {}
+    after = proof.get("after") if isinstance(proof.get("after"), dict) else {}
+    return {
+        "target_repo": str(proof.get("target_repo") or ""),
+        "ok": bool(proof.get("ok")),
+        "status_short_unchanged": bool(proof.get("status_short_unchanged")),
+        "cached_name_only_unchanged": bool(proof.get("cached_name_only_unchanged")),
+        "worktree_name_only_unchanged": bool(proof.get("worktree_name_only_unchanged")),
+        "before_status_short_count": len(before.get("status_short", []) if isinstance(before.get("status_short"), list) else []),
+        "after_status_short_count": len(after.get("status_short", []) if isinstance(after.get("status_short"), list) else []),
+        "before_cached_name_only_count": len(before.get("cached_name_only", []) if isinstance(before.get("cached_name_only"), list) else []),
+        "after_cached_name_only_count": len(after.get("cached_name_only", []) if isinstance(after.get("cached_name_only"), list) else []),
+        "before_worktree_name_only_count": len(before.get("worktree_name_only", []) if isinstance(before.get("worktree_name_only"), list) else []),
+        "after_worktree_name_only_count": len(after.get("worktree_name_only", []) if isinstance(after.get("worktree_name_only"), list) else []),
+    }
+
+
+def _worker_result_rows(payload: dict[str, object]) -> list[dict[str, object]]:
+    rows: dict[str, dict[str, object]] = {}
+    for worker_id in payload.get("workers", []) if isinstance(payload.get("workers"), list) else []:
+        worker = str(worker_id or "")
+        if worker:
+            rows[worker] = {"worker_id": worker}
+    for item in payload.get("submissions", []) if isinstance(payload.get("submissions"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        worker = str(item.get("worker_id") or "")
+        if not worker:
+            continue
+        rows.setdefault(worker, {"worker_id": worker})
+        rows[worker]["submission_state"] = item.get("state") or item.get("contract_action") or ""
+        rows[worker]["run_id"] = item.get("run_id") or rows[worker].get("run_id") or ""
+        rows[worker]["task_id"] = item.get("task_id") or rows[worker].get("task_id") or ""
+    for item in payload.get("results", []) if isinstance(payload.get("results"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        worker = str(item.get("worker_id") or "")
+        if not worker:
+            continue
+        rows.setdefault(worker, {"worker_id": worker})
+        rows[worker]["result_state"] = item.get("state") or ""
+        rows[worker]["run_id"] = item.get("run_id") or rows[worker].get("run_id") or ""
+        rows[worker]["task_id"] = item.get("task_id") or rows[worker].get("task_id") or ""
+    return list(rows.values())
+
+
+def compact_run_json_payload(payload: dict[str, object]) -> dict[str, object]:
+    compact: dict[str, object] = {
+        "thread_id": payload.get("thread_id") or "",
+        "final_state": payload.get("final_state") or "",
+        "contract_version": payload.get("contract_version") or CONTRACT_VERSION,
+        "backend": payload.get("backend") or "",
+        "workers": payload.get("workers", []) if isinstance(payload.get("workers"), list) else [],
+        "worker_results": _worker_result_rows(payload),
+        "summary": payload.get("summary", {}) if isinstance(payload.get("summary"), dict) else {},
+        "next_operator_action": _next_operator_action_for_payload(payload),
+        "errors": payload.get("errors", []) if isinstance(payload.get("errors"), list) else [],
+        "warnings": payload.get("warnings", []) if isinstance(payload.get("warnings"), list) else [],
+        "submissions_count": len(payload.get("submissions", []) if isinstance(payload.get("submissions"), list) else []),
+        "results_count": len(payload.get("results", []) if isinstance(payload.get("results"), list) else []),
+        "artifacts": payload.get("artifacts", {}) if isinstance(payload.get("artifacts"), dict) else {},
+    }
+    leader_decision = payload.get("leader_decision", {}) if isinstance(payload.get("leader_decision"), dict) else {}
+    if leader_decision:
+        compact["leader_decision_selected_action"] = leader_decision.get("selected_action") or ""
+        compact["leader_decision_reason"] = leader_decision.get("reason") or ""
+    proof_summary = _proof_summary(payload.get("business_no_write_proof"))
+    if proof_summary:
+        compact["business_no_write_proof_summary"] = proof_summary
+    if payload.get("__interrupt__"):
+        compact["__interrupt__"] = payload.get("__interrupt__")
+    return compact
+
+
+def parse_workers(values: list[str]) -> list[str]:
+    workers: list[str] = []
+    for item in values:
+        for raw in str(item).split(","):
+            worker = raw.strip()
+            if worker and worker not in workers:
+                workers.append(worker)
+    return workers
+
+
+def command_run(args: argparse.Namespace) -> int:
+    if not str(args.body).strip():
+        raise SystemExit(
+            "empty_task_body: --body must contain the non-empty task contract body"
+        )
+    root = root_path(args.root)
+    workers = parse_workers(args.worker)
+    if not workers:
+        raise SystemExit("at least one --worker is required")
+    try:
+        session_actions = resolve_session_actions(
+            getattr(args, "session_action", []),
+            workers,
+            reason=str(getattr(args, "session_action_reason", "") or ""),
+            rotation_reason=str(getattr(args, "rotation_reason", "") or ""),
+            rehydration_packet_type=str(
+                getattr(args, "rehydration_packet_type", "") or ""
+            ),
+            required=bool(args.allow_real) and not bool(args.dry_run),
+        )
+    except SessionActionError as exc:
+        raise SystemExit(str(exc)) from exc
+    try:
+        execution_budget = load_execution_budget(getattr(args, "execution_budget", ""))
+    except RunMetricsError as exc:
+        raise SystemExit(str(exc)) from exc
+    lane_contracts = str(getattr(args, "lane_contracts", "") or "")
+    try:
+        lane_bundle = load_lane_contract_bundle(lane_contracts, workers=workers)
+    except LaneContractError as exc:
+        raise SystemExit(str(exc)) from exc
+    lane_assignments = lane_bundle.get("assignments", []) if isinstance(lane_bundle, dict) else []
+    planner_coverage = lane_bundle.get("planner_coverage", {}) if isinstance(lane_bundle, dict) else {}
+    lane_assignment_source = str(getattr(args, "lane_assignment_source", "") or "").strip()
+    if lane_assignments and not lane_assignment_source:
+        lane_assignment_source = "explicit_file"
+    effective_timeout = int(args.timeout)
+    if str(args.inner_mode or "") and effective_timeout == DEFAULT_VISIBLE_TIMEOUT_SECONDS:
+        effective_timeout = DEFAULT_INNER_MODE_TIMEOUT_SECONDS
+    thread_id = args.thread_id or f"lgcp-{uuid.uuid4().hex[:12]}"
+    state = {
+        "root": str(root),
+        "backend": args.backend,
+        "contract_version": CONTRACT_VERSION,
+        "workers": workers,
+        "title": args.title,
+        "body": args.body,
+        "inner_mode": str(args.inner_mode or ""),
+        "artifact_root": str(args.artifact_root or ""),
+        "allow_real": bool(args.allow_real),
+        "wait_timeout": effective_timeout,
+        "dry_run": bool(args.dry_run),
+        "model": str(getattr(args, "model", "") or ""),
+        "nominal_context_tokens": int(getattr(args, "nominal_context_tokens", 0) or 0),
+        "effective_context_tokens": int(getattr(args, "effective_context_tokens", 0) or 0),
+        "require_confirmation": bool(args.require_confirmation),
+        "lane_contracts": lane_contracts,
+        "lane_assignment_source": lane_assignment_source,
+        "session_actions": session_actions,
+        "session_action_reason": str(
+            getattr(args, "session_action_reason", "") or ""
+        ),
+        "rotation_reason": str(getattr(args, "rotation_reason", "") or ""),
+        "rehydration_packet_type": str(
+            getattr(args, "rehydration_packet_type", "") or ""
+        ),
+    }
+    if lane_assignments:
+        state["lane_assignments"] = lane_assignments
+    if planner_coverage:
+        state["planner_coverage"] = planner_coverage
+    if execution_budget:
+        state["execution_budget"] = execution_budget
+    if args.approved:
+        state["approved"] = True
+    _, request_created = persist_request_evidence(
+        root,
+        thread_id,
+        state,
+    )
+    if not request_created:
+        raise SystemExit(
+            "thread id is already claimed; use inspect/resume "
+            "or choose a new thread id only after verifying the "
+            f"original claim is inactive: {thread_id}"
+        )
+    lease_payload: dict[str, object] = {}
+    result: dict[str, object] = {}
+    with secured_checkpoint_path(
+        root,
+        thread_id,
+        create=True,
+    ) as checkpoint_path:
+        try:
+            if bool(args.allow_real) and not bool(args.dry_run) and len(workers) > 1:
+                lease_payload = acquire_worker_pool_lease(root, workers, title=args.title, thread_id=thread_id)
+            result = invoke_control_plane(state, thread_id=thread_id, checkpoint_path=checkpoint_path)
+        except WorkerPoolLeaseConflict as exc:
+            payload = {
+                "thread_id": thread_id,
+                "final_state": "worker_pool_busy",
+                "contract_version": CONTRACT_VERSION,
+                "backend": args.backend,
+                "workers": workers,
+                "errors": ["worker pool lease conflict"],
+                "conflicting_leases": exc.conflicts,
+            }
+            if args.json:
+                print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
+            else:
+                print(f"thread_id: {thread_id}")
+                print("final_state: worker_pool_busy")
+                print(f"backend: {args.backend}")
+                print(f"workers: {', '.join(workers)}")
+                print("errors:")
+                print("  - worker pool lease conflict")
+                for item in exc.conflicts:
+                    print(
+                        "  - "
+                        f"lease_id={item.get('lease_id')} thread_id={item.get('thread_id') or '-'} "
+                        f"overlap_workers={', '.join(item.get('overlap_workers', [])) or '-'}"
+                    )
+            return 4
+    try:
+        artifacts = write_artifacts(root, result["thread_id"], result)
+        payload = make_json_safe({**result, "artifacts": artifacts})
+        if args.json:
+            json_payload = payload if bool(getattr(args, "verbose_json", False)) else compact_run_json_payload(payload)
+            print(json.dumps(json_payload, indent=2, sort_keys=True, ensure_ascii=False))
+        else:
+            print(f"thread_id: {payload['thread_id']}")
+            print(f"final_state: {payload.get('final_state') or '-'}")
+            print(f"contract_version: {payload.get('contract_version') or CONTRACT_VERSION}")
+            print(f"backend: {payload.get('backend') or args.backend}")
+            print(f"workers: {', '.join(workers)}")
+            print(f"artifacts.state_json: {artifacts['state_json']}")
+            print(f"artifacts.summary_md: {artifacts['summary_md']}")
+            print(f"summary: {json.dumps(payload.get('summary', {}), ensure_ascii=False)}")
+            if payload.get("errors"):
+                print("errors:")
+                for item in payload.get("errors", []):
+                    print(f"  - {item}")
+            if payload.get("warnings"):
+                print("warnings:")
+                for item in payload.get("warnings", []):
+                    print(f"  - {item}")
+            if payload.get("__interrupt__"):
+                print("interrupts:")
+                for item in payload["__interrupt__"]:
+                    print(f"  - {item}")
+        if payload.get("__interrupt__"):
+            return 3
+        final_state = str(payload.get("final_state") or "")
+        return 0 if final_state in {"completed", "dry_run", "rejected"} else 1
+    finally:
+        if lease_payload:
+            release_worker_pool_lease(root, str(lease_payload.get("lease_id") or ""), reason=str(result.get("final_state") or "completed"))
+
+
+def command_inspect(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    request = read_resume_request(root, args.thread_id)
+    with secured_checkpoint_path(
+        root,
+        args.thread_id,
+        create=False,
+    ) as checkpoint_path:
+        payload = inspect_control_plane(
+            root=root,
+            thread_id=args.thread_id,
+            checkpoint_path=checkpoint_path,
+        )
+    payload["checkpoint_path"] = str(checkpoint_db_path(root))
+    payload = make_json_safe({**payload, "request": request})
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
+    else:
+        print(f"thread_id: {payload.get('thread_id')}")
+        print(f"checkpoint_path: {payload.get('checkpoint_path')}")
+        snapshot = payload.get("snapshot", {})
+        values = snapshot.get("values", {})
+        print(f"contract_version: {values.get('contract_version') or request.get('contract_version') or CONTRACT_VERSION}")
+        print(f"next: {snapshot.get('next', [])}")
+        print(f"interrupt_count: {len(snapshot.get('interrupts', [])) if isinstance(snapshot.get('interrupts', []), list) else 0}")
+        print(f"values: {json.dumps(values, ensure_ascii=False)}")
+    return 0
+
+
+def _resume_payload(args: argparse.Namespace):
+    if getattr(args, "resume_json", ""):
+        return json.loads(args.resume_json)
+    return bool(getattr(args, "approved", False))
+
+
+def command_resume(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    request = read_resume_request(root, args.thread_id)
+    workers = [str(item) for item in request.get("workers", []) if str(item)]
+    stored = request.get("session_actions")
+    if not isinstance(stored, dict):
+        raise SystemExit("session action is required")
+    action_values = [
+        f"{worker}={stored.get(worker) or ''}"
+        for worker in workers
+    ]
+    try:
+        resolved = resolve_session_actions(
+            action_values if any(stored.values()) else [],
+            workers,
+            reason=str(
+                request.get("session_action_reason") or ""
+            ),
+            rotation_reason=str(
+                request.get("rotation_reason") or ""
+            ),
+            rehydration_packet_type=str(
+                request.get("rehydration_packet_type") or ""
+            ),
+            required=bool(request.get("allow_real"))
+            and not bool(request.get("dry_run")),
+        )
+    except SessionActionError as exc:
+        raise SystemExit(str(exc)) from exc
+    if resolved != stored:
+        raise SystemExit(
+            "session action request evidence does not match workers"
+        )
+    lease_payload: dict[str, object] = {}
+    result: dict[str, object] = {}
+    with secured_checkpoint_path(
+        root,
+        args.thread_id,
+        create=False,
+    ) as checkpoint_path:
+        validate_resume_checkpoint(
+            root=root,
+            thread_id=args.thread_id,
+            request=request,
+            checkpoint_path=checkpoint_path,
+        )
+        try:
+            if bool(request.get("allow_real")) and not bool(request.get("dry_run")) and len(workers) > 1:
+                lease_payload = acquire_worker_pool_lease(
+                    root,
+                    workers,
+                    title=str(request.get("title") or args.thread_id),
+                    thread_id=args.thread_id,
+                )
+            result = resume_control_plane(
+                root=root,
+                thread_id=args.thread_id,
+                resume_value=_resume_payload(args),
+                checkpoint_path=checkpoint_path,
+            )
+        except WorkerPoolLeaseConflict as exc:
+            payload = {
+                "thread_id": args.thread_id,
+                "final_state": "worker_pool_busy",
+                "contract_version": request.get("contract_version") or CONTRACT_VERSION,
+                "backend": request.get("backend") or "tmux-reference",
+                "workers": workers,
+                "errors": ["worker pool lease conflict"],
+                "conflicting_leases": exc.conflicts,
+            }
+            if args.json:
+                print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
+            else:
+                print(f"thread_id: {args.thread_id}")
+                print("final_state: worker_pool_busy")
+            return 4
+    try:
+        merged = make_json_safe({**request, **result})
+        artifacts = write_artifacts(root, args.thread_id, merged)
+        payload = {**merged, "artifacts": artifacts}
+        if args.json:
+            print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
+        else:
+            print(f"thread_id: {payload.get('thread_id')}")
+            print(f"final_state: {payload.get('final_state') or '-'}")
+            print(f"contract_version: {payload.get('contract_version') or CONTRACT_VERSION}")
+            print(f"artifacts.state_json: {artifacts['state_json']}")
+            print(f"artifacts.summary_md: {artifacts['summary_md']}")
+            if payload.get("__interrupt__"):
+                print(f"interrupts: {len(payload['__interrupt__'])}")
+        if payload.get("__interrupt__"):
+            return 3
+        final_state = str(payload.get("final_state") or "")
+        return 0 if final_state in {"completed", "dry_run", "rejected"} else 1
+    finally:
+        if lease_payload:
+            release_worker_pool_lease(root, str(lease_payload.get("lease_id") or ""), reason=str(result.get("final_state") or "completed"))
+
+
+def command_approve(args: argparse.Namespace) -> int:
+    setattr(args, "approved", True)
+    setattr(args, "resume_json", "")
+    return command_resume(args)
+
+
+def command_reject(args: argparse.Namespace) -> int:
+    setattr(args, "approved", False)
+    setattr(args, "resume_json", "")
+    return command_resume(args)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="omx_langgraph_control_plane",
+        description=(
+            "Minimal LangGraph control plane over the existing omx_visible_dispatch CLI, "
+            "including optional explicit lane contracts for multiworker fan-out."
+        ),
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    run = sub.add_parser("run", help="execute the minimal control-plane graph")
+    run.add_argument("--root", default=".")
+    run.add_argument("--backend", default="tmux-reference")
+    run.add_argument("--worker", action="append", required=True, help="repeatable worker id or comma-separated worker ids")
+    run.add_argument("--title", required=True)
+    run.add_argument("--body", required=True)
+    run.add_argument("--inner-mode", choices=["4x3", "4x7"], default="")
+    run.add_argument("--artifact-root", default="")
+    run.add_argument(
+        "--lane-contracts",
+        default="",
+        help="optional JSON file with explicit per-worker lane_id/lane_focus/avoid_overlap assignments",
+    )
+    run.add_argument(
+        "--execution-budget",
+        default="",
+        help="optional validated JSON budget for advisory post-run followup limits",
+    )
+    run.add_argument("--lane-assignment-source", default="", help=argparse.SUPPRESS)
+    run.add_argument("--timeout", type=int, default=DEFAULT_VISIBLE_TIMEOUT_SECONDS)
+    run.add_argument("--model", default="", help="optional model name for effective context budget hints")
+    run.add_argument("--nominal-context-tokens", type=int, default=0, help="model advertised context window in tokens")
+    run.add_argument("--effective-context-tokens", type=int, default=0, help="provider/runtime effective context window in tokens")
+    run.add_argument("--allow-real", action="store_true")
+    run.add_argument("--dry-run", action="store_true")
+    run.add_argument("--require-confirmation", action="store_true")
+    run.add_argument("--approved", action="store_true")
+    run.add_argument("--thread-id")
+    run.add_argument("--json", action="store_true")
+    run.add_argument("--verbose-json", action="store_true", help="print full run state instead of compact triage JSON")
+    run.add_argument(
+        "--session-action",
+        action="append",
+        default=[],
+        help="repeatable worker=action mapping",
+    )
+    run.add_argument("--session-action-reason", default="")
+    run.add_argument(
+        "--rotation-reason",
+        default="",
+        choices=["", *sorted(SESSION_ROTATION_REASONS)],
+    )
+    run.add_argument(
+        "--rehydration-packet-type",
+        default="",
+        choices=["", *sorted(REHYDRATION_PACKET_TYPES)],
+    )
+    run.set_defaults(func=command_run)
+
+    inspect_cmd = sub.add_parser("inspect", help="inspect persisted control-plane state for a thread")
+    inspect_cmd.add_argument("--root", default=".")
+    inspect_cmd.add_argument("--thread-id", required=True)
+    inspect_cmd.add_argument("--json", action="store_true")
+    inspect_cmd.set_defaults(func=command_inspect)
+
+    resume_cmd = sub.add_parser("resume", help="resume an interrupted control-plane thread")
+    resume_cmd.add_argument("--root", default=".")
+    resume_cmd.add_argument("--thread-id", required=True)
+    resume_cmd.add_argument("--resume-json", default="")
+    resume_cmd.add_argument("--approved", action="store_true")
+    resume_cmd.add_argument("--json", action="store_true")
+    resume_cmd.set_defaults(func=command_resume)
+
+    approve_cmd = sub.add_parser("approve", help="approve and resume an interrupted control-plane thread")
+    approve_cmd.add_argument("--root", default=".")
+    approve_cmd.add_argument("--thread-id", required=True)
+    approve_cmd.add_argument("--json", action="store_true")
+    approve_cmd.set_defaults(func=command_approve)
+
+    reject_cmd = sub.add_parser("reject", help="reject and close an interrupted control-plane thread")
+    reject_cmd.add_argument("--root", default=".")
+    reject_cmd.add_argument("--thread-id", required=True)
+    reject_cmd.add_argument("--json", action="store_true")
+    reject_cmd.set_defaults(func=command_reject)
+    for command_parser in sub.choices.values():
+        command_parser.set_defaults(root=None)
+    return parser
+
+
+def main(argv: list[str] | None = None, *, _admission_root: Path | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return invoke_cli_handler("omx_langgraph_control_plane", args, args.func, admission_root=_admission_root)
+    except AdmissionError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,2228 @@
+#!/usr/bin/env python3
+"""Read-only watcher for framework visible-runs state.
+
+The watcher scans .omx/framework/team/visible-runs, reads task markers and
+owner locks, and writes only its own observation artifacts under _watcher.
+It never calls tmux, OpenCode, or mutating task APIs.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import shlex
+import signal
+import subprocess
+import sys
+import time
+from collections import Counter
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterator
+
+_THIS_FILE = Path(__file__).resolve()
+for _p in (
+    _THIS_FILE.parent.resolve(),
+    (_THIS_FILE.parent.parent / "src").resolve(),
+    (_THIS_FILE.parent.parent / "lib").resolve(),
+):
+    if _p.exists() and str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
+
+from visible_agent_orchestrator.runtime.backends import available_backends, default_backend_name
+from visible_agent_orchestrator.runtime.errors import RuntimeAdapterError
+from visible_agent_orchestrator.runtime.status import build_all_workers_status_summary, build_worker_status_summary
+from visible_agent_orchestrator.runtime_paths import runtime_root
+from visible_agent_orchestrator.terminal_acceptance import terminal_acceptance_status
+import omx_visible_task_state as visible_task_state
+
+
+TERMINAL_MARKERS = ("done", "fail", "blocked")
+FLOW_MARKERS = ("submitted", "received", "started", "heartbeat")
+EXCLUDED_RUN_DIRS = {"_locks", "_watcher", "_fixtures"}
+TERMINAL_STATUSES = {"completed", "failed", "blocked"}
+INVALID_STATUSES = {
+    "invalid_terminal_no_report",
+    "invalid_conflicting_terminal_markers",
+    "invalid_terminal_acceptance_fence",
+}
+CONTEXT_OVERFLOW_STATUS = "blocked_context_overflow"
+CONTEXT_COMPACTION_STATUS = "blocked_context_compaction_review"
+VERBAL_TERMINAL_STATUS = "verbal_terminal_without_protocol_signal"
+CONTEXT_OVERFLOW_PHRASES = (
+    "your input exceeds the context window",
+    "context window of this model",
+    "context_length_exceeded",
+)
+CONTEXT_COMPACTION_PHRASES = (
+    "session.compacted",
+    "session compacted",
+    "context.compacted",
+    "context compaction completed",
+    "manual /compact",
+    "manual /compat",
+)
+CONTEXT_OVERFLOW_NEXT_SAFE_ACTION = "manual_operator_review_no_blind_resend"
+CONTEXT_COMPACTION_NEXT_SAFE_ACTION = "manual_operator_verify_terminal_truth_no_blind_resend"
+STALE_RUNNING_SECONDS = 10 * 60
+DELIVERY_UNCERTAIN_SECONDS = 60
+RECEIVED_NOT_STARTED_SECONDS = 5 * 60
+LOG_MAX_BYTES = 2 * 1024 * 1024
+DAEMON_ERROR_LIMIT = 5
+
+
+class WatcherError(Exception):
+    """Expected operator-facing failure."""
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def root_path(value: str | None) -> Path:
+    return runtime_root(value)
+
+
+def framework_root(root: Path) -> Path:
+    return root / ".omx" / "framework" / "team"
+
+
+def visible_runs_root(root: Path) -> Path:
+    return framework_root(root) / "visible-runs"
+
+
+def watcher_root(root: Path) -> Path:
+    return visible_runs_root(root) / "_watcher"
+
+
+def locks_root(root: Path) -> Path:
+    return visible_runs_root(root) / "_locks"
+
+
+def fixtures_root(root: Path) -> Path:
+    return visible_runs_root(root) / "_fixtures"
+
+
+def fixture_policy_path(root: Path) -> Path:
+    return fixtures_root(root) / "fixture_policy.json"
+
+
+def team_root(root: Path) -> Path:
+    return root / ".omx" / "state" / "team"
+
+
+def rel(path: Path, root: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(root.resolve()))
+    except Exception:
+        return str(path)
+
+
+def read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def read_json(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def quarantine_summary(tdir: Path) -> dict[str, str]:
+    return visible_task_state.quarantine_for_task(
+        tdir,
+        tdir.parent.parent.name,
+        tdir.name,
+    )
+
+
+def has_context_overflow_text(text: str) -> bool:
+    lowered = text.lower()
+    return any(phrase in lowered for phrase in CONTEXT_OVERFLOW_PHRASES)
+
+
+def has_context_compaction_text(text: str) -> bool:
+    lowered = text.lower()
+    return any(phrase in lowered for phrase in CONTEXT_COMPACTION_PHRASES)
+
+
+def as_list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else []
+
+
+def load_fixture_policy(root: Path) -> dict[str, Any]:
+    policy = read_json(fixture_policy_path(root))
+    policy.setdefault("fixture_run_patterns", [])
+    policy.setdefault("fixture_task_patterns", [])
+    policy.setdefault("explicit_fixtures", [])
+    return policy
+
+
+def contains_pattern(value: str, patterns: list[Any]) -> str:
+    lowered = value.lower()
+    for item in patterns:
+        pattern = str(item).lower()
+        if pattern and pattern in lowered:
+            return str(item)
+    return ""
+
+
+def fixture_info(root: Path, run_dir: Path, task_dir: Path, policy: dict[str, Any]) -> dict[str, Any]:
+    run_name = run_dir.name
+    task_name = task_dir.name
+    reasons: list[str] = []
+    run_meta = read_json(run_dir / ".fixture.json")
+    task_meta = read_json(task_dir / ".fixture.json")
+
+    if run_meta.get("fixture"):
+        reasons.append(str(run_meta.get("reason") or "run metadata marks fixture"))
+    if task_meta.get("fixture"):
+        reasons.append(str(task_meta.get("reason") or "task metadata marks fixture"))
+
+    for item in as_list(policy.get("explicit_fixtures")):
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("run") or "") == run_name and str(item.get("task") or "") == task_name:
+            reasons.append(str(item.get("reason") or "explicit fixture policy match"))
+
+    run_pattern = contains_pattern(run_name, as_list(policy.get("fixture_run_patterns")))
+    if run_pattern:
+        reasons.append(f"fixture_run_patterns match: {run_pattern}")
+
+    task_pattern = contains_pattern(task_name, as_list(policy.get("fixture_task_patterns")))
+    if task_pattern:
+        reasons.append(f"fixture_task_patterns match: {task_pattern}")
+
+    fixture = bool(reasons)
+    suppress_alerts = bool(
+        fixture and (
+            run_meta.get("suppress_alerts", True)
+            and task_meta.get("suppress_alerts", True)
+        )
+    )
+    suppress_delivery = bool(
+        fixture and (
+            run_meta.get("suppress_delivery_uncertain_warning", True)
+            and task_meta.get("suppress_delivery_uncertain_warning", True)
+        )
+    )
+    return {
+        "fixture": fixture,
+        "fixture_reasons": sorted(set(reasons)),
+        "suppress_alerts": suppress_alerts,
+        "suppress_delivery_uncertain_warning": suppress_delivery,
+    }
+
+
+def write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    try:
+        tmp.write_text(content, encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+
+
+def write_json(path: Path, data: dict[str, Any]) -> None:
+    write_text(path, json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
+
+
+def append_jsonl(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(data, sort_keys=True, ensure_ascii=False) + "\n")
+
+
+@contextmanager
+def _watcher_write_lock(root: Path) -> Iterator[None]:
+    out = watcher_root(root)
+    out.mkdir(parents=True, exist_ok=True)
+    with (out / ".write.lock").open("a", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError:
+        return ""
+    return digest.hexdigest()
+
+
+def _semantic_sha256(value: Any) -> str:
+    digest = hashlib.sha256()
+
+    def feed(tag: bytes, payload: bytes = b"") -> None:
+        digest.update(tag)
+        digest.update(len(payload).to_bytes(8, "big"))
+        digest.update(payload)
+
+    def visit(
+        item: Any,
+        *,
+        root: bool = False,
+        alert_item: bool = False,
+        alert_items: bool = False,
+        task_item: bool = False,
+        task_items: bool = False,
+    ) -> None:
+        if item is None:
+            feed(b"N")
+        elif isinstance(item, bool):
+            feed(b"B", b"1" if item else b"0")
+        elif isinstance(item, int):
+            feed(b"I", str(item).encode("ascii"))
+        elif isinstance(item, float):
+            feed(b"F", json.dumps(item).encode("ascii"))
+        elif isinstance(item, str):
+            feed(b"S", item.encode("utf-8"))
+        elif isinstance(item, list):
+            feed(b"L", len(item).to_bytes(8, "big"))
+            for child in item:
+                visit(
+                    child,
+                    alert_item=alert_items,
+                    task_item=task_items,
+                )
+        elif isinstance(item, dict):
+            keys = [
+                key
+                for key in sorted(item)
+                if key not in {"age_seconds", "updated_age_seconds"}
+                and not (root and key == "generated_at")
+                and not (alert_item and key == "ts")
+                and not (task_item and key == "updated_at")
+            ]
+            feed(b"D", len(keys).to_bytes(8, "big"))
+            for key in keys:
+                feed(b"K", key.encode("utf-8"))
+                child = item[key]
+                visit(
+                    child,
+                    alert_items=key in {"alerts", "suppressed_alerts"}
+                    and isinstance(child, list),
+                    task_items=key == "tasks"
+                    and isinstance(child, list),
+                )
+        else:
+            raise TypeError(f"unsupported watcher value for fingerprint: {type(item).__name__}")
+
+    visit(value, root=True)
+    return digest.hexdigest()
+
+
+def file_nonempty(path: Path) -> bool:
+    try:
+        return path.is_file() and path.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def file_size(path: Path) -> int:
+    try:
+        return path.stat().st_size if path.is_file() else 0
+    except OSError:
+        return 0
+
+
+def file_mtime(path: Path) -> float | None:
+    try:
+        return path.stat().st_mtime if path.exists() else None
+    except OSError:
+        return None
+
+
+def iso_from_ts(value: float | None) -> str:
+    if value is None:
+        return ""
+    return datetime.fromtimestamp(value, timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def age_seconds(value: float | None, now_ts: float) -> int | None:
+    if value is None:
+        return None
+    return max(0, int(now_ts - value))
+
+
+def marker_path(tdir: Path, name: str) -> Path:
+    return tdir / f".{name}"
+
+
+def marker_exists(tdir: Path, name: str) -> bool:
+    return marker_path(tdir, name).is_file()
+
+
+def newest_mtime(paths: list[Path]) -> float | None:
+    mtimes = [mtime for mtime in (file_mtime(path) for path in paths) if mtime is not None]
+    return max(mtimes) if mtimes else None
+
+
+def safe_summary(data: dict[str, Any]) -> dict[str, Any]:
+    if not data:
+        return {}
+    keep = {
+        "mode",
+        "attempted_at",
+        "submitted_at",
+        "worker",
+        "port",
+        "pane_id",
+        "binding_confidence",
+        "received",
+        "received_written_by_adapter",
+        "state_note",
+        "returncode",
+        "error",
+    }
+    summary = {key: data.get(key) for key in keep if key in data}
+    responses = data.get("responses")
+    if isinstance(responses, dict):
+        summary["responses"] = {
+            endpoint: {
+                "status": item.get("status"),
+                "ok": item.get("ok"),
+                "error": item.get("error", ""),
+            }
+            for endpoint, item in responses.items()
+            if isinstance(item, dict)
+        }
+    return summary
+
+
+def protocol_summary(data: dict[str, Any]) -> dict[str, Any]:
+    if not data:
+        return {}
+    keep = {
+        "status",
+        "last_signal",
+        "last_worker",
+        "last_ts",
+        "finish_refused_missing_report",
+        "requested_terminal_state",
+        "effective_terminal_state",
+        "error_code",
+        "evidence_budget",
+        "terminal_state",
+        "updated_at",
+    }
+    summary = {key: data.get(key) for key in keep if key in data}
+    warnings = data.get("warnings")
+    errors = data.get("errors")
+    if isinstance(warnings, list) and warnings:
+        summary["warnings"] = warnings[:5]
+    if isinstance(errors, list) and errors:
+        summary["errors"] = errors[:5]
+    if has_context_overflow_text(json.dumps(data, ensure_ascii=False)):
+        summary.update({
+            "context_overflow_detected": True,
+            "context_overflow_status": CONTEXT_OVERFLOW_STATUS,
+            "context_overflow_next_safe_action": CONTEXT_OVERFLOW_NEXT_SAFE_ACTION,
+        })
+    if has_context_compaction_text(json.dumps(data, ensure_ascii=False)):
+        summary.update({
+            "context_compaction_detected": True,
+            "context_compaction_status": CONTEXT_COMPACTION_STATUS,
+            "context_compaction_next_safe_action": CONTEXT_COMPACTION_NEXT_SAFE_ACTION,
+        })
+    return summary
+
+
+def provider_error_context_overflow_summary(path: Path, root: Path | None = None) -> dict[str, Any]:
+    data = read_json(path)
+    if not (
+        data.get("schema_version") == 1
+        and data.get("source") == "opencode_session_message_api"
+        and data.get("task_bound") is True
+        and data.get("detected") is True
+        and data.get("kind") == "context_window_overflow"
+    ):
+        return {}
+    return {
+        "context_overflow_detected": True,
+        "context_overflow_status": CONTEXT_OVERFLOW_STATUS,
+        "context_overflow_next_safe_action": CONTEXT_OVERFLOW_NEXT_SAFE_ACTION,
+        "context_overflow_evidence_path": rel(path, root) if root else str(path),
+    }
+
+
+def verbal_terminal_summary(tdir: Path, root: Path | None = None) -> dict[str, Any]:
+    path = tdir / visible_task_state.TERMINAL_SENTINEL_OBSERVATION_FILES[0]
+    evidence = visible_task_state.verbal_terminal_evidence(path, root or tdir, tdir.name)
+    if not evidence.get("verbal_terminal_sentinel_detected"):
+        return {}
+    return {
+        **evidence,
+        "verbal_terminal_sentinel_evidence_path": rel(path, root) if root else str(path),
+    }
+
+
+def read_owner_backend(tdir: Path) -> tuple[str, str]:
+    owner = read_text(tdir / "owner").strip()
+    backend = read_text(tdir / "backend").strip()
+    task_json = read_json(tdir / "task.json")
+    owner = owner or str(task_json.get("owner") or task_json.get("worker") or "")
+    backend = backend or str(task_json.get("backend") or "")
+    dispatch = read_json(tdir / "dispatch.json")
+    owner = owner or str(dispatch.get("worker") or "")
+    backend = backend or str(dispatch.get("backend") or "")
+    return owner, backend
+
+
+def runtime_snapshot_summary(tdir: Path, root: Path | None = None) -> dict[str, Any]:
+    path = tdir / "runtime_snapshot.json"
+    data = read_json(path)
+    if not data:
+        return {}
+    summary = {
+        "path": rel(path, root) if root else str(path),
+        "captured_at": data.get("captured_at", ""),
+        "runtime_backend": data.get("runtime_backend", ""),
+        "worker_id": data.get("worker_id", ""),
+        "ok": bool(data.get("ok", False)),
+        "status": data.get("status", ""),
+        "backend_type": data.get("backend_type", ""),
+    }
+    return {key: value for key, value in summary.items() if value != ""}
+
+
+def base_task_state(tdir: Path, now_ts: float, root: Path | None = None) -> dict[str, Any]:
+    terminal = [name for name in TERMINAL_MARKERS if marker_exists(tdir, name)]
+    flow = [name for name in FLOW_MARKERS if marker_exists(tdir, name)]
+    markers = {
+        name: {
+            "path": str(marker_path(tdir, name)),
+            "mtime": iso_from_ts(file_mtime(marker_path(tdir, name))),
+            "age_seconds": age_seconds(file_mtime(marker_path(tdir, name)), now_ts),
+        }
+        for name in TERMINAL_MARKERS + FLOW_MARKERS
+        if marker_exists(tdir, name)
+    }
+    report = tdir / "report.md"
+    report_exists = report.is_file()
+    report_bytes = file_size(report)
+    report_nonempty = report_bytes > 0
+    terminal_acceptance = terminal_acceptance_status(tdir)
+    owner, backend = read_owner_backend(tdir)
+    delivery = read_json(tdir / "delivery.json")
+    delivery_error = read_json(tdir / "delivery_error.json") or read_json(tdir / "submit_error.json")
+    protocol = protocol_summary(read_json(tdir / "protocol_status.json"))
+    protocol.update(provider_error_context_overflow_summary(tdir / "provider_error_observation.json", root))
+    provider_error = visible_task_state.provider_error_evidence(
+        tdir / "provider_error_observation.json",
+        root,
+    )
+    protocol.update(provider_error)
+    verbal_terminal = verbal_terminal_summary(tdir, root)
+    quarantine = quarantine_summary(tdir)
+    quarantine_valid = bool(quarantine)
+    context_overflow_detected = bool(protocol.get("context_overflow_detected"))
+    context_compaction_detected = bool(protocol.get("context_compaction_detected"))
+    verbal_terminal_detected = bool(verbal_terminal.get("verbal_terminal_sentinel_detected"))
+    provider_error_blocked = bool(
+        provider_error.get("provider_error_detected")
+        and not provider_error.get("provider_error_retryable")
+        and provider_error.get("provider_error_kind")
+        != "context_window_overflow"
+        and marker_exists(tdir, "submitted")
+    )
+    latest = newest_mtime([path for path in tdir.iterdir() if path.is_file()]) if tdir.is_dir() else None
+    alerts: list[dict[str, Any]] = []
+
+    status = "prepared"
+    reason = "task.md or prompt.txt exists"
+
+    if len(terminal) > 1:
+        status = "invalid_conflicting_terminal_markers"
+        reason = "multiple terminal markers exist"
+    elif terminal:
+        term = terminal[0]
+        if not report_nonempty:
+            status = "invalid_terminal_no_report"
+            reason = f".{term} exists without non-empty report.md"
+        elif not terminal_acceptance["accepted"]:
+            status = "invalid_terminal_acceptance_fence"
+            reason = str(terminal_acceptance["reason"])
+        elif term == "done":
+            status = "completed"
+            reason = "report.md plus .done"
+        elif term == "fail":
+            status = "failed"
+            reason = "report.md plus .fail"
+        else:
+            status = "blocked"
+            reason = "report.md plus .blocked"
+    elif quarantine_valid:
+        status = "quarantined_nonterminal"
+        reason = (
+            quarantine["quarantine_reason"]
+            or "reviewed nonterminal task quarantine"
+        )
+    elif provider_error_blocked:
+        status = "blocked_provider_error"
+        reason = (
+            "non-retryable provider error detected after submission"
+        )
+        next_action = str(
+            provider_error.get("provider_error_next_safe_action") or ""
+        )
+        alerts.append({
+            "type": "blocked_provider_error",
+            "message": (
+                "non-retryable provider error detected; "
+                f"next safe action: {next_action}"
+            ),
+            "safe_handling": (
+                "do_not_resend_do_not_press_enter_"
+                "do_not_settle_active_lock"
+            ),
+        })
+    elif context_compaction_detected:
+        status = CONTEXT_COMPACTION_STATUS
+        reason = "OpenCode context compaction evidence detected without terminal truth"
+        alerts.append({
+            "type": CONTEXT_COMPACTION_STATUS,
+            "message": "OpenCode context compaction evidence detected; verify terminal truth before recovery",
+            "safe_handling": "do_not_resend_do_not_press_enter_do_not_settle_active_lock",
+        })
+    elif context_overflow_detected:
+        status = CONTEXT_OVERFLOW_STATUS
+        reason = "OpenCode context window overflow detected after submission"
+        alerts.append({
+            "type": CONTEXT_OVERFLOW_STATUS,
+            "message": "OpenCode context window overflow detected; manual operator review required",
+            "safe_handling": "do_not_resend_do_not_press_enter_do_not_settle_active_lock",
+        })
+    elif verbal_terminal_detected:
+        status = VERBAL_TERMINAL_STATUS
+        reason = "visible OMX_TASK_CLOSED line detected without report.md plus terminal marker"
+        alerts.append({
+            "type": VERBAL_TERMINAL_STATUS,
+            "message": "visible OMX_TASK_CLOSED line is not protocol truth; report.md plus exactly one terminal marker is still required",
+            "safe_handling": "do_not_resend_do_not_press_enter_do_not_settle_active_lock",
+        })
+    elif delivery_error and not marker_exists(tdir, "submitted"):
+        status = "submit_failed"
+        reason = "delivery_error.json or submit_error.json exists without .submitted"
+    elif marker_exists(tdir, "submitted") and not marker_exists(tdir, "received"):
+        status = "delivery_uncertain"
+        reason = ".submitted exists without .received"
+        submitted_age = markers.get("submitted", {}).get("age_seconds")
+        if isinstance(submitted_age, int) and submitted_age > DELIVERY_UNCERTAIN_SECONDS:
+            alerts.append({
+                "type": "delivery_uncertain_alert",
+                "message": ".submitted is older than 60 seconds and .received is absent",
+                "age_seconds": submitted_age,
+            })
+    elif marker_exists(tdir, "received") and not marker_exists(tdir, "started"):
+        status = "received"
+        reason = ".received exists without .started"
+        received_age = markers.get("received", {}).get("age_seconds")
+        if isinstance(received_age, int) and received_age > RECEIVED_NOT_STARTED_SECONDS:
+            alerts.append({
+                "type": "received_not_started_alert",
+                "message": ".received is older than 5 minutes and .started is absent",
+                "age_seconds": received_age,
+            })
+    elif marker_exists(tdir, "started") or marker_exists(tdir, "heartbeat"):
+        status = "running"
+        reason = ".started or .heartbeat exists without terminal marker"
+        heartbeat_mtime = file_mtime(marker_path(tdir, "heartbeat"))
+        started_mtime = file_mtime(marker_path(tdir, "started"))
+        stale_basis = heartbeat_mtime if heartbeat_mtime is not None else started_mtime
+        stale_age = age_seconds(stale_basis, now_ts)
+        if isinstance(stale_age, int) and stale_age > STALE_RUNNING_SECONDS:
+            status = "stale_running"
+            reason = "running task has no fresh heartbeat within 10 minutes"
+            alerts.append({
+                "type": "stale_running",
+                "message": "running task has no fresh heartbeat within 10 minutes",
+                "age_seconds": stale_age,
+            })
+    elif not (tdir / "task.md").is_file() and not (tdir / "prompt.txt").is_file():
+        status = "prepared"
+        reason = "task directory exists without lifecycle marker"
+
+    return {
+        "run": tdir.parent.parent.name,
+        "task": tdir.name,
+        "path": str(tdir),
+        "status": status,
+        "lifecycle_status": status,
+        "reason": reason,
+        "owner": owner,
+        "backend": backend,
+        "terminal_markers": terminal,
+        "flow_markers": flow,
+        "markers": markers,
+        "report_exists": report_exists,
+        "report_nonempty": report_nonempty,
+        "report_bytes": report_bytes,
+        "report_mtime": iso_from_ts(file_mtime(report)),
+        "updated_at": iso_from_ts(latest),
+        "updated_age_seconds": age_seconds(latest, now_ts),
+        "delivery": safe_summary(delivery),
+        "delivery_error": safe_summary(delivery_error),
+        "protocol": protocol,
+        **provider_error,
+        "context_overflow_detected": context_overflow_detected,
+        "context_overflow_status": str(protocol.get("context_overflow_status") or ""),
+        "context_overflow_evidence_path": str(protocol.get("context_overflow_evidence_path") or ""),
+        "context_overflow_next_safe_action": str(protocol.get("context_overflow_next_safe_action") or ""),
+        "context_compaction_detected": context_compaction_detected,
+        "context_compaction_status": str(protocol.get("context_compaction_status") or ""),
+        "context_compaction_next_safe_action": str(protocol.get("context_compaction_next_safe_action") or ""),
+        **verbal_terminal,
+        "quarantine_state": quarantine.get("quarantine_state", ""),
+        "quarantine_reason": quarantine.get("quarantine_reason", ""),
+        "quarantined_at": quarantine.get("quarantined_at", ""),
+        "quarantine_worker_id": quarantine.get("quarantine_worker_id", ""),
+        "quarantine_archived_lock": quarantine.get(
+            "quarantine_archived_lock",
+            "",
+        ),
+        "runtime_snapshot": runtime_snapshot_summary(tdir, root),
+        "alerts": alerts,
+    }
+
+
+def load_active_locks(root: Path) -> list[dict[str, Any]]:
+    base = locks_root(root)
+    if not base.is_dir():
+        return []
+    locks: list[dict[str, Any]] = []
+    for path in sorted(base.glob("*.lock.json")):
+        data = read_json(path)
+        data["path"] = str(path)
+        data["path_relative"] = rel(path, root)
+        locks.append(data)
+    return locks
+
+
+def task_terminal(status: str) -> bool:
+    return status in TERMINAL_STATUSES
+
+
+def apply_lock_state(tasks: list[dict[str, Any]], locks: list[dict[str, Any]], root: Path) -> list[dict[str, Any]]:
+    by_key = {(task.get("run"), task.get("task")): task for task in tasks}
+    for lock in locks:
+        key = (str(lock.get("run", "")), str(lock.get("task", "")))
+        task = by_key.get(key)
+        if not task:
+            lock["state"] = "orphan_lock"
+            lock["alert"] = "lock does not point at a recognizable visible task"
+            continue
+        lock_status = "active_lock"
+        current = str(task.get("status", "prepared"))
+        if task_terminal(current):
+            lock_status = "stale_terminal_lock"
+            task["status"] = lock_status
+            task["reason"] = "active lock still exists for a terminal task"
+            task.setdefault("alerts", []).append({
+                "type": "stale_terminal_lock",
+                "message": "lock exists after task reached terminal state",
+                "lock_path": lock.get("path_relative", rel(Path(str(lock.get("path", ""))), root)),
+            })
+        elif current == "quarantined_nonterminal":
+            lock_status = "quarantined_lock_conflict"
+            task["status"] = lock_status
+            task["reason"] = (
+                "quarantined task still has an active owner lock"
+            )
+            task.setdefault("alerts", []).append({
+                "type": lock_status,
+                "message": (
+                    "quarantined task still has an active owner lock"
+                ),
+                "lock_path": lock.get("path_relative", ""),
+            })
+        elif current not in INVALID_STATUSES:
+            task["status"] = "active_lock"
+            task["reason"] = f"active owner lock exists; lifecycle_status={current}"
+        task["lock"] = {
+            "state": lock_status,
+            "path": lock.get("path_relative", ""),
+            "worker_id": lock.get("worker_id", ""),
+            "created_at": lock.get("created_at", ""),
+            "status": lock.get("status", ""),
+        }
+        lock["state"] = lock_status
+    return tasks
+
+
+def scan_visible_runs(
+    root: Path,
+    include_fixtures: bool = False,
+    runs_limit: int | None = None,
+) -> dict[str, Any]:
+    base = visible_runs_root(root)
+    policy = load_fixture_policy(root)
+    now_ts = time.time()
+    generated_at = utc_now()
+    if not base.exists():
+        raise WatcherError(f"visible-runs directory not found: {rel(base, root)}")
+    if not base.is_dir():
+        raise WatcherError(f"visible-runs path is not a directory: {rel(base, root)}")
+    if runs_limit is not None and runs_limit < 1:
+        raise WatcherError("runs_limit must be a positive integer")
+
+    run_dirs = sorted(
+        path for path in base.iterdir() if path.is_dir() and path.name not in EXCLUDED_RUN_DIRS
+    )
+    runs_available = len(run_dirs)
+    if runs_limit is not None:
+        run_dirs = run_dirs[-runs_limit:]
+
+    tasks: list[dict[str, Any]] = []
+    runs: list[dict[str, Any]] = []
+    for run_dir in run_dirs:
+        tasks_dir = run_dir / "tasks"
+        run_tasks = []
+        if tasks_dir.is_dir():
+            for tdir in sorted(path for path in tasks_dir.iterdir() if path.is_dir()):
+                task = base_task_state(tdir, now_ts, root=root)
+                task["path_relative"] = rel(Path(task["path"]), root)
+                fixture = fixture_info(root, run_dir, tdir, policy)
+                task.update(fixture)
+                if task.get("fixture"):
+                    suppressed_alerts = []
+                    kept_alerts = []
+                    for alert in task.get("alerts", []):
+                        if task.get("suppress_alerts") and alert.get("type") == "delivery_uncertain_alert" and not include_fixtures:
+                            suppressed_alerts.append({**alert, "fixture": True, "suppressed": True})
+                        else:
+                            kept_alerts.append({**alert, "fixture": True} if task.get("fixture") else alert)
+                    task["alerts"] = kept_alerts
+                    task["suppressed_alerts"] = suppressed_alerts
+                    task["suppressed"] = bool(suppressed_alerts)
+                else:
+                    task["suppressed_alerts"] = []
+                    task["suppressed"] = False
+                tasks.append(task)
+                run_tasks.append(task)
+        if run_tasks or tasks_dir.exists():
+            runs.append({
+                "run": run_dir.name,
+                "path": rel(run_dir, root),
+                "task_count": len(run_tasks),
+                "summary": dict(sorted(Counter(task["status"] for task in run_tasks).items())),
+            })
+
+    locks = load_active_locks(root)
+    locks_out_of_scope = 0
+    if runs_limit is not None:
+        scanned_run_names = {run_dir.name for run_dir in run_dirs}
+        judged_locks: list[dict[str, Any]] = []
+        for lock in locks:
+            if str(lock.get("run") or "") in scanned_run_names:
+                judged_locks.append(lock)
+            else:
+                lock["state"] = "out_of_scan_scope"
+                lock["alert"] = (
+                    "lock target run is outside this scan's run coverage; "
+                    "lock/task relation not checked in this scan"
+                )
+                locks_out_of_scope += 1
+    else:
+        judged_locks = locks
+    tasks = apply_lock_state(tasks, judged_locks, root)
+    summary = Counter(task["status"] for task in tasks)
+    fixture_tasks = [task for task in tasks if task.get("fixture")]
+    suppressed_alerts: list[dict[str, Any]] = []
+    for task in fixture_tasks:
+        for alert in task.get("suppressed_alerts", []):
+            suppressed_alerts.append({
+                "ts": generated_at,
+                "run": task.get("run", ""),
+                "task": task.get("task", ""),
+                "status": task.get("status", ""),
+                **alert,
+            })
+
+    alerts: list[dict[str, Any]] = []
+    for task in tasks:
+        for alert in task.get("alerts", []):
+            alert_doc = {
+                "ts": generated_at,
+                "run": task.get("run", ""),
+                "task": task.get("task", ""),
+                "status": task.get("status", ""),
+                "fixture": bool(task.get("fixture")),
+                **alert,
+            }
+            alerts.append(alert_doc)
+    for lock in locks:
+        if lock.get("state") == "orphan_lock":
+            alerts.append({
+                "ts": generated_at,
+                "type": "orphan_lock",
+                "message": lock.get("alert", "lock does not point at a recognizable visible task"),
+                "worker_id": lock.get("worker_id", ""),
+                "run": lock.get("run", ""),
+                "task": lock.get("task", ""),
+                "path": lock.get("path_relative", ""),
+            })
+
+    board = {
+        "schema_version": 1,
+        "generated_at": generated_at,
+        "root": str(root),
+        "visible_runs_root": str(base),
+        "watcher_root": str(watcher_root(root)),
+        "runs": runs,
+        "tasks": sorted(tasks, key=lambda item: (item.get("run", ""), item.get("task", ""))),
+        "locks": locks,
+        "summary": dict(sorted(summary.items())),
+        "suppressed_fixtures": len(fixture_tasks),
+        "fixture_alerts_suppressed": len(suppressed_alerts),
+        "active_alerts": len(alerts),
+        "suppressed_alerts": suppressed_alerts,
+        "include_fixtures": include_fixtures,
+        "alerts": alerts,
+        "alert_count": len(alerts),
+    }
+    if runs_limit is not None:
+        board["scan_scope"] = {
+            "mode": "recent-runs",
+            "runs_limit": runs_limit,
+            "runs_available": runs_available,
+            "runs_scanned": len(run_dirs),
+            "locks_out_of_scope": locks_out_of_scope,
+        }
+    return board
+
+
+def board_task_path(task: dict[str, Any], root: Path) -> Path:
+    raw = str(task.get("path") or task.get("path_relative") or "")
+    if not raw:
+        return root
+    path = Path(raw)
+    return path if path.is_absolute() else root / path
+
+
+def apply_fixture_filter_to_board(board: dict[str, Any], root: Path, include_fixtures: bool = False) -> dict[str, Any]:
+    if not board:
+        return board
+    policy = load_fixture_policy(root)
+    generated_at = str(board.get("generated_at") or utc_now())
+    tasks = board.get("tasks", [])
+    if not isinstance(tasks, list):
+        return board
+    active_alerts: list[dict[str, Any]] = []
+    suppressed_alerts: list[dict[str, Any]] = []
+    fixture_count = 0
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        tdir = board_task_path(task, root)
+        run_dir = tdir.parent.parent if tdir.parent.name == "tasks" else tdir.parent
+        info = fixture_info(root, run_dir, tdir, policy)
+        task.update(info)
+        if task.get("fixture"):
+            fixture_count += 1
+        original_alerts = task.get("alerts", [])
+        if not isinstance(original_alerts, list):
+            original_alerts = []
+        kept: list[dict[str, Any]] = []
+        suppressed: list[dict[str, Any]] = []
+        for alert in original_alerts:
+            alert_doc = alert if isinstance(alert, dict) else {"message": str(alert)}
+            if (
+                task.get("fixture")
+                and task.get("suppress_alerts")
+                and alert_doc.get("type") == "delivery_uncertain_alert"
+                and not include_fixtures
+            ):
+                suppressed.append({**alert_doc, "fixture": True, "suppressed": True})
+            else:
+                kept.append({**alert_doc, "fixture": True} if task.get("fixture") else alert_doc)
+        task["alerts"] = kept
+        task["suppressed_alerts"] = suppressed
+        task["suppressed"] = bool(suppressed)
+        for alert in kept:
+            active_alerts.append({
+                "ts": generated_at,
+                "run": task.get("run", ""),
+                "task": task.get("task", ""),
+                "status": task.get("status", ""),
+                "fixture": bool(task.get("fixture")),
+                **alert,
+            })
+        for alert in suppressed:
+            suppressed_alerts.append({
+                "ts": generated_at,
+                "run": task.get("run", ""),
+                "task": task.get("task", ""),
+                "status": task.get("status", ""),
+                **alert,
+            })
+    for alert in board.get("alerts", []):
+        if not isinstance(alert, dict):
+            continue
+        if alert.get("run") and alert.get("task"):
+            continue
+        active_alerts.append(alert)
+    board["alerts"] = active_alerts
+    board["alert_count"] = len(active_alerts)
+    board["active_alerts"] = len(active_alerts)
+    board["suppressed_fixtures"] = fixture_count
+    board["fixture_alerts_suppressed"] = len(suppressed_alerts)
+    board["suppressed_alerts"] = suppressed_alerts
+    board["include_fixtures"] = include_fixtures
+    return board
+
+
+def truncate(text: str, width: int) -> str:
+    if len(text) <= width:
+        return text
+    return text[: max(0, width - 1)] + "~"
+
+
+def render_status(board: dict[str, Any], root: Path) -> str:
+    lines = [
+        f"generated_at: {board.get('generated_at', '')}",
+        f"visible_runs_root: {rel(Path(str(board.get('visible_runs_root', ''))), root)}",
+        f"watcher_root: {rel(Path(str(board.get('watcher_root', ''))), root)}",
+        "",
+        "Summary:",
+    ]
+    if board.get("summary"):
+        for status, count in board["summary"].items():
+            lines.append(f"  {status}: {count}")
+    else:
+        lines.append("  tasks: 0")
+    lines.append(f"  suppressed_fixtures: {board.get('suppressed_fixtures', 0)}")
+    lines.append(f"  active_alerts: {board.get('active_alerts', board.get('alert_count', 0))}")
+    lines.append(f"  fixture_alerts_suppressed: {board.get('fixture_alerts_suppressed', 0)}")
+
+    locks = board.get("locks", [])
+    lines.append("")
+    lines.append("Locks:")
+    if locks:
+        for lock in locks:
+            lines.append(
+                f"  {lock.get('worker_id', '-')} state={lock.get('state', '-')} "
+                f"run={lock.get('run', '-')} task={lock.get('task', '-')} path={lock.get('path_relative', '-')}"
+            )
+    else:
+        lines.append("  none")
+
+    lines.append("")
+    lines.append("Tasks:")
+    tasks = board.get("tasks", [])
+    if not tasks:
+        lines.append("  none")
+    else:
+        header = f"{'STATUS':<26} {'LIFECYCLE':<20} {'RUN':<28} {'TASK':<10} {'WORKER':<14} {'REPORT':<7} {'PROTOCOL':<30} ALERTS"
+        lines.append(header)
+        for task in tasks:
+            alerts = ",".join(alert.get("type", "") for alert in task.get("alerts", [])) or "-"
+            if task.get("suppressed_alerts"):
+                alerts = (alerts if alerts != "-" else "") + f"suppressed:{len(task.get('suppressed_alerts', []))}"
+            protocol = task.get("protocol", {})
+            if protocol:
+                protocol_text = (
+                    f"{protocol.get('last_signal', '-')}/"
+                    f"{protocol.get('last_worker', '-')}/"
+                    f"{protocol.get('last_ts', '-')}"
+                )
+                if protocol.get("finish_refused_missing_report"):
+                    protocol_text = "finish_refused_missing_report"
+            else:
+                protocol_text = "-"
+            status_text = str(task.get("status", ""))
+            if task.get("fixture"):
+                status_text = f"{status_text} [fixture]"
+            lines.append(
+                f"{truncate(status_text, 26):<26} "
+                f"{truncate(task.get('lifecycle_status', ''), 20):<20} "
+                f"{truncate(task.get('run', ''), 28):<28} "
+                f"{truncate(task.get('task', ''), 10):<10} "
+                f"{truncate(task.get('owner', ''), 14):<14} "
+                f"{task.get('report_bytes', 0):<7} "
+                f"{truncate(protocol_text, 30):<30} {alerts}"
+            )
+
+    runtime_snapshots = [
+        (task, task.get("runtime_snapshot"))
+        for task in tasks
+        if isinstance(task, dict) and isinstance(task.get("runtime_snapshot"), dict) and task.get("runtime_snapshot")
+    ]
+    if runtime_snapshots:
+        lines.append("")
+        lines.append("Runtime snapshots:")
+        for task, snapshot in runtime_snapshots[:20]:
+            lines.append(
+                f"  worker={snapshot.get('worker_id') or task.get('owner', '-')} "
+                f"ok={str(bool(snapshot.get('ok'))).lower()} "
+                f"status={snapshot.get('status', '-')} "
+                f"backend_type={snapshot.get('backend_type', '-')}"
+            )
+
+    if board.get("alerts"):
+        lines.append("")
+        lines.append("Alerts:")
+        for alert in board["alerts"][:20]:
+            lines.append(
+                f"  {alert.get('type', '-')}: run={alert.get('run', '-')} "
+                f"task={alert.get('task', '-')} {alert.get('message', '')}"
+            )
+    return "\n".join(lines)
+
+
+def current_alerts_payload(board: dict[str, Any]) -> dict[str, Any]:
+    alerts = board.get("alerts", [])
+    suppressed = board.get("suppressed_alerts", [])
+    if not isinstance(alerts, list):
+        alerts = []
+    if not isinstance(suppressed, list):
+        suppressed = []
+    return {
+        "schema_version": 1,
+        "updated_at": board.get("generated_at", utc_now()),
+        "active_alerts": len(alerts),
+        "fixture_alerts_suppressed": int(board.get("fixture_alerts_suppressed", 0) or 0),
+        "suppressed_fixtures": int(board.get("suppressed_fixtures", 0) or 0),
+        "alerts": alerts,
+        "suppressed_fixture_alerts": suppressed,
+    }
+
+
+def infer_alert_worker_id(root: Path, alert: dict[str, Any]) -> str:
+    worker_id = str(alert.get("worker_id") or "")
+    if worker_id:
+        return worker_id
+    run = str(alert.get("run") or "")
+    task = str(alert.get("task") or "")
+    if not run or not task:
+        return ""
+    owner = read_text(visible_runs_root(root) / run / "tasks" / task / "owner").strip()
+    return owner
+
+
+def filter_alert_rows(root: Path, rows: list[dict[str, Any]], worker_id: str) -> list[dict[str, Any]]:
+    filtered: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        inferred = infer_alert_worker_id(root, row)
+        if inferred != worker_id:
+            continue
+        item = dict(row)
+        if inferred and not item.get("worker_id"):
+            item["inferred_worker_id"] = inferred
+        filtered.append(item)
+    return filtered
+
+
+def format_scan_scope_line(scope: Any) -> str:
+    if not (isinstance(scope, dict) and scope.get("mode")):
+        return ""
+    return (
+        f"scan_scope: {scope.get('mode', '')} "
+        f"runs_scanned={scope.get('runs_scanned', 0)} "
+        f"runs_available={scope.get('runs_available', 0)} "
+        f"limit={scope.get('runs_limit', 0)} "
+        f"locks_out_of_scope={scope.get('locks_out_of_scope', 0)}"
+    )
+
+
+def render_current_alerts(payload: dict[str, Any], *, include_fixtures: bool = False) -> str:
+    lines = [
+        f"updated_at: {payload.get('updated_at', '')}",
+        f"active_alerts: {payload.get('active_alerts', 0)}",
+        f"fixture_alerts_suppressed: {payload.get('fixture_alerts_suppressed', 0)}",
+        f"suppressed_fixtures: {payload.get('suppressed_fixtures', 0)}",
+    ]
+    scope_line = format_scan_scope_line(payload.get("scan_scope"))
+    if scope_line:
+        lines.append(scope_line)
+    lines.extend([
+        "",
+        "Current Active Alerts:",
+    ])
+    alerts = payload.get("alerts", [])
+    if not isinstance(alerts, list) or not alerts:
+        lines.append("  none")
+    else:
+        for alert in alerts[:50]:
+            if not isinstance(alert, dict):
+                continue
+            worker_label = alert.get("worker_id") or alert.get("inferred_worker_id") or "-"
+            lines.append(
+                f"  {alert.get('ts', payload.get('updated_at', '-'))} worker={worker_label} {alert.get('type', '-')} "
+                f"run={alert.get('run', '-')} task={alert.get('task', '-')} {alert.get('message', '')}"
+            )
+    if include_fixtures:
+        lines.append("")
+        lines.append("Suppressed Fixture Alerts:")
+        suppressed = payload.get("suppressed_fixture_alerts", [])
+        if not isinstance(suppressed, list) or not suppressed:
+            lines.append("  none")
+        else:
+            for alert in suppressed[:50]:
+                if not isinstance(alert, dict):
+                    continue
+                worker_label = alert.get("worker_id") or alert.get("inferred_worker_id") or "-"
+                lines.append(
+                    f"  {alert.get('ts', payload.get('updated_at', '-'))} worker={worker_label} {alert.get('type', '-')} "
+                    f"run={alert.get('run', '-')} task={alert.get('task', '-')} {alert.get('message', '')}"
+                )
+    return "\n".join(lines)
+
+
+def _write_scan_outputs_locked(root: Path, board: dict[str, Any]) -> tuple[Path, Path, Path]:
+    out = watcher_root(root)
+    out.mkdir(parents=True, exist_ok=True)
+    board_path = out / "visible_board.json"
+    status_path = out / "visible_status.txt"
+    scan_path = out / "last_scan.json"
+    current_alerts_path = out / "current_alerts.json"
+    current_alerts_txt_path = out / "current_alerts.txt"
+    alerts = [
+        alert for alert in board.get("alerts", [])
+        if isinstance(alert, dict)
+    ]
+    board_sha256 = _semantic_sha256(board)
+    alert_sha256 = [
+        _semantic_sha256({"alerts": [alert]})
+        for alert in alerts
+    ]
+    previous = read_json(scan_path)
+    previous_alerts = previous.get("active_alert_sha256")
+    persisted_sha256 = _file_sha256(board_path)
+    previous_valid = (
+        bool(previous.get("semantic_board_sha256"))
+        and bool(previous.get("visible_board_sha256"))
+        and isinstance(previous_alerts, list)
+        and all(isinstance(item, str) for item in previous_alerts)
+        and bool(persisted_sha256)
+        and persisted_sha256 == previous.get("visible_board_sha256")
+    )
+    changed = (
+        not previous_valid
+        or previous.get("semantic_board_sha256") != board_sha256
+    )
+
+    if changed:
+        current_alerts = current_alerts_payload(board)
+        write_json(board_path, board)
+        persisted_sha256 = _file_sha256(board_path)
+        if not persisted_sha256:
+            raise WatcherError(f"failed to hash persisted watcher board: {board_path}")
+        write_text(status_path, render_status(board, root) + "\n")
+        write_json(current_alerts_path, current_alerts)
+        write_text(current_alerts_txt_path, render_current_alerts(current_alerts, include_fixtures=True) + "\n")
+        append_jsonl(out / "events.jsonl", {
+            "ts": board.get("generated_at", utc_now()),
+            "event": "watcher_scan",
+            "task_count": len(board.get("tasks", [])),
+            "lock_count": len(board.get("locks", [])),
+            "alert_count": board.get("alert_count", 0),
+            "active_alerts": board.get("active_alerts", board.get("alert_count", 0)),
+            "suppressed_fixtures": board.get("suppressed_fixtures", 0),
+            "fixture_alerts_suppressed": board.get("fixture_alerts_suppressed", 0),
+            "summary": board.get("summary", {}),
+        })
+        previous_alert_set = set(previous_alerts) if previous_valid else set()
+        for alert, fingerprint in zip(alerts, alert_sha256):
+            if fingerprint in previous_alert_set:
+                continue
+            append_jsonl(out / "alerts.jsonl", alert)
+            previous_alert_set.add(fingerprint)
+
+    write_json(scan_path, {
+        "generated_at": board.get("generated_at", ""),
+        "summary": board.get("summary", {}),
+        "task_count": len(board.get("tasks", [])),
+        "lock_count": len(board.get("locks", [])),
+        "alert_count": board.get("alert_count", 0),
+        "active_alerts": board.get("active_alerts", board.get("alert_count", 0)),
+        "suppressed_fixtures": board.get("suppressed_fixtures", 0),
+        "fixture_alerts_suppressed": board.get("fixture_alerts_suppressed", 0),
+        "semantic_board_sha256": board_sha256,
+        "visible_board_sha256": persisted_sha256,
+        "active_alert_sha256": alert_sha256,
+    })
+    return board_path, status_path, scan_path
+
+
+def write_scan_outputs(root: Path, board: dict[str, Any]) -> tuple[Path, Path, Path]:
+    with _watcher_write_lock(root):
+        return _write_scan_outputs_locked(root, board)
+
+
+def _scan_and_write_outputs(
+    root: Path,
+    *,
+    include_fixtures: bool = False,
+) -> tuple[dict[str, Any], tuple[Path, Path, Path]]:
+    with _watcher_write_lock(root):
+        board = scan_visible_runs(root, include_fixtures=include_fixtures)
+        return board, _write_scan_outputs_locked(root, board)
+
+
+def command_once(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    board, (board_path, status_path, scan_path) = _scan_and_write_outputs(
+        root,
+        include_fixtures=bool(getattr(args, "include_fixtures", False)),
+    )
+    print(render_status(board, root))
+    print("")
+    print(f"wrote: {rel(board_path, root)}")
+    print(f"wrote: {rel(status_path, root)}")
+    print(f"wrote: {rel(scan_path, root)}")
+    return 0
+
+
+def board_signature(board: dict[str, Any]) -> str:
+    tasks = [
+        [
+            item.get("run", ""),
+            item.get("task", ""),
+            item.get("status", ""),
+            item.get("lifecycle_status", ""),
+            item.get("report_bytes", 0),
+            sorted(alert.get("type", "") for alert in item.get("alerts", [])),
+        ]
+        for item in board.get("tasks", [])
+    ]
+    locks = [
+        [item.get("worker_id", ""), item.get("run", ""), item.get("task", ""), item.get("state", "")]
+        for item in board.get("locks", [])
+    ]
+    return json.dumps({"tasks": tasks, "locks": locks}, sort_keys=True)
+
+
+def command_watch(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    interval = max(1, int(args.interval))
+    deadline = time.time() + int(args.duration) if args.duration is not None else None
+    last_sig = ""
+    iterations = 0
+    while True:
+        board, _ = _scan_and_write_outputs(
+            root,
+            include_fixtures=bool(getattr(args, "include_fixtures", False)),
+        )
+        sig = board_signature(board)
+        if sig != last_sig:
+            summary = ", ".join(f"{key}={value}" for key, value in board.get("summary", {}).items()) or "tasks=0"
+            print(f"{board.get('generated_at')} changed summary: {summary} alerts={board.get('alert_count', 0)}")
+            last_sig = sig
+        iterations += 1
+        if deadline is not None and time.time() >= deadline:
+            break
+        if deadline is not None:
+            sleep_for = min(interval, max(0, deadline - time.time()))
+            if sleep_for <= 0:
+                break
+            time.sleep(sleep_for)
+        else:
+            time.sleep(interval)
+    print(f"watch_iterations: {iterations}")
+    return 0
+
+
+def command_status(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    backend = getattr(args, "runtime_backend", default_backend_name())
+    fixture = Path(args.fixture).resolve() if getattr(args, "fixture", None) else None
+    if getattr(args, "worker", None):
+        payload = build_worker_status_summary(root, str(args.worker), backend=backend, fixture_dir=fixture)
+        if args.json:
+            print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
+        else:
+            substrate = payload.get("substrate_status", {})
+            print(f"worker_id: {payload.get('worker_id')}")
+            print(f"runtime_backend: {payload.get('runtime_backend')}")
+            print(f"substrate_status: {substrate.get('readiness') or substrate.get('status') or 'unknown'}")
+            print("watcher_authority: false")
+        return 0 if payload.get("ok") else 1
+    if args.refresh:
+        board, _ = _scan_and_write_outputs(
+            root,
+            include_fixtures=bool(args.include_fixtures),
+        )
+    elif args.include_fixtures:
+        board = scan_visible_runs(root, include_fixtures=True)
+    else:
+        board = read_json(watcher_root(root) / "visible_board.json")
+        if not board:
+            raise WatcherError("visible_board.json not found; run `omx_visible_watcher once --root .` first")
+        board = apply_fixture_filter_to_board(board, root, include_fixtures=False)
+    if args.json:
+        print(json.dumps(board, indent=2, sort_keys=True, ensure_ascii=False))
+    else:
+        status_text = read_text(watcher_root(root) / "visible_status.txt")
+        if status_text and "suppressed_fixtures:" in status_text and not args.include_fixtures:
+            print(status_text.rstrip())
+        else:
+            print(render_status(board, root))
+    return 0
+
+
+def read_recent_jsonl(path: Path, limit: int) -> list[dict[str, Any]]:
+    if not path.is_file():
+        return []
+    rows: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError:
+            data = {"raw": line}
+        rows.append(data if isinstance(data, dict) else {"value": data})
+    return rows[-limit:]
+
+
+def count_jsonl_rows(path: Path) -> int:
+    if not path.is_file():
+        return 0
+    count = 0
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            if line.strip():
+                count += 1
+    return count
+
+
+def command_alerts(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    backend = getattr(args, "runtime_backend", default_backend_name())
+    fixture = Path(args.fixture).resolve() if getattr(args, "fixture", None) else None
+    recent_runs = getattr(args, "recent_runs", None)
+    if recent_runs is not None:
+        if args.history:
+            raise WatcherError("--recent-runs applies to the current fresh-scan alerts view, not --history")
+        if fixture:
+            raise WatcherError("--recent-runs cannot be combined with --fixture")
+        if recent_runs < 1:
+            raise WatcherError("--recent-runs must be a positive integer")
+        if not visible_runs_root(root).is_dir():
+            raise WatcherError(
+                "--recent-runs requires an existing visible-runs directory: "
+                f"{rel(visible_runs_root(root), root)}"
+            )
+    if not args.history:
+        payload: dict[str, Any] = {}
+        if fixture:
+            telemetry = read_json(fixture / "runtime-telemetry.json")
+            payload = {
+                "updated_at": utc_now(),
+                "active_alerts": int(telemetry.get("active_alerts", 0) or 0),
+                "alerts": telemetry.get("alerts", []) if isinstance(telemetry.get("alerts"), list) else [],
+                "source": "runtime-telemetry fixture",
+            }
+        elif recent_runs is not None:
+            board = scan_visible_runs(
+                root,
+                include_fixtures=bool(args.include_fixtures),
+                runs_limit=recent_runs,
+            )
+            payload = current_alerts_payload(board)
+            payload["scan_scope"] = board.get("scan_scope", {})
+            payload["source"] = f"fresh visible-runs scan (recent-runs {recent_runs})"
+        elif visible_runs_root(root).is_dir():
+            board, _ = _scan_and_write_outputs(
+                root,
+                include_fixtures=bool(args.include_fixtures),
+            )
+            payload = current_alerts_payload(board)
+            payload["source"] = "fresh visible-runs scan"
+        else:
+            payload = read_json(watcher_root(root) / "current_alerts.json")
+            if not payload:
+                board = read_json(watcher_root(root) / "visible_board.json")
+                if board:
+                    board = apply_fixture_filter_to_board(board, root, include_fixtures=False)
+                    payload = current_alerts_payload(board)
+        if not payload:
+            raise WatcherError("current_alerts.json not found; run `omx_visible_watcher once --root .` first")
+        if getattr(args, "worker", None):
+            substrate = build_worker_status_summary(root, str(args.worker), backend=backend, fixture_dir=fixture)
+            payload = {
+                **payload,
+                "worker_id": str(args.worker),
+                "alerts": filter_alert_rows(root, payload.get("alerts", []) if isinstance(payload.get("alerts"), list) else [], str(args.worker)),
+                "runtime_backend": backend,
+                "substrate_status": substrate.get("substrate_status", {}),
+                "inferred_worker_id": str(args.worker),
+                "telemetry_only": True,
+                "authority": False,
+                "mutates_locks": False,
+            }
+            payload["active_alerts"] = len(payload.get("alerts", []))
+        elif getattr(args, "all_workers", False):
+            substrate = build_all_workers_status_summary(root, backend=backend, fixture_dir=fixture)
+            workers: dict[str, list[dict[str, Any]]] = {}
+            for row in payload.get("alerts", []) if isinstance(payload.get("alerts"), list) else []:
+                if not isinstance(row, dict):
+                    continue
+                inferred = infer_alert_worker_id(root, row) or "_unscoped"
+                item = dict(row)
+                if inferred != "_unscoped" and not item.get("worker_id"):
+                    item["inferred_worker_id"] = inferred
+                workers.setdefault(inferred, []).append(item)
+            payload = {
+                **payload,
+                "all_workers": True,
+                "workers": workers,
+                "runtime_backend": backend,
+                "substrate_status": substrate,
+                "telemetry_only": True,
+                "authority": False,
+                "mutates_locks": False,
+            }
+        else:
+            payload = {
+                **payload,
+                "runtime_backend": backend,
+                "telemetry_only": True,
+                "authority": False,
+                "mutates_locks": False,
+            }
+        if args.json:
+            print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
+        else:
+            if getattr(args, "all_workers", False):
+                print(f"updated_at: {payload.get('updated_at', '')}")
+                print(f"active_alerts: {payload.get('active_alerts', 0)}")
+                scope_line = format_scan_scope_line(payload.get("scan_scope"))
+                if scope_line:
+                    print(scope_line)
+                print("Alerts by worker:")
+                workers = payload.get("workers", {})
+                if not workers:
+                    print("  none")
+                else:
+                    for worker_id, rows in sorted(workers.items()):
+                        print(f"  {worker_id}: {len(rows)}")
+                return 0
+            print(render_current_alerts(payload, include_fixtures=bool(args.include_fixtures)))
+        return 0
+
+    policy = load_fixture_policy(root)
+    rows = read_recent_jsonl(watcher_root(root) / "alerts.jsonl", int(args.limit))
+    def row_is_fixture(row: dict[str, Any]) -> bool:
+        if row.get("fixture"):
+            return True
+        run = str(row.get("run") or "")
+        task = str(row.get("task") or "")
+        for item in as_list(policy.get("explicit_fixtures")):
+            if isinstance(item, dict) and str(item.get("run") or "") == run and str(item.get("task") or "") == task:
+                return True
+        return bool(
+            contains_pattern(run, as_list(policy.get("fixture_run_patterns")))
+            or contains_pattern(task, as_list(policy.get("fixture_task_patterns")))
+        )
+    if not args.include_fixtures:
+        rows = [row for row in rows if not row_is_fixture(row)]
+    else:
+        for row in rows:
+            if row_is_fixture(row):
+                row["fixture"] = True
+    if getattr(args, "worker", None):
+        rows = filter_alert_rows(root, rows, str(args.worker))
+    elif getattr(args, "all_workers", False):
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            inferred = infer_alert_worker_id(root, row) or "_unscoped"
+            item = dict(row)
+            if inferred != "_unscoped" and not item.get("worker_id"):
+                item["inferred_worker_id"] = inferred
+            grouped.setdefault(inferred, []).append(item)
+        if args.json:
+            print(json.dumps({
+                "history": True,
+                "limit": int(args.limit),
+                "include_fixtures": bool(args.include_fixtures),
+                "workers": grouped,
+                "history_alerts_count": count_jsonl_rows(watcher_root(root) / "alerts.jsonl"),
+            }, indent=2, sort_keys=True, ensure_ascii=False))
+            return 0
+        print("Historical watcher alerts by worker:")
+        if not grouped:
+            print("  none")
+        else:
+            for worker_id, alerts in sorted(grouped.items()):
+                print(f"  {worker_id}: {len(alerts)}")
+        return 0
+    if args.json:
+        print(json.dumps({
+            "history": True,
+            "limit": int(args.limit),
+            "include_fixtures": bool(args.include_fixtures),
+            "alerts": rows,
+            "history_alerts_count": count_jsonl_rows(watcher_root(root) / "alerts.jsonl"),
+        }, indent=2, sort_keys=True, ensure_ascii=False))
+        return 0
+    if not rows:
+        print("No historical watcher alerts found.")
+        return 0
+    print(f"Historical watcher alerts, latest {len(rows)} rows:")
+    for row in rows:
+        print(
+            f"{row.get('ts', '-')} {row.get('type', '-')} "
+            f"run={row.get('run', '-')} task={row.get('task', '-')} "
+            f"{'[fixture] ' if row.get('fixture') else ''}{row.get('message', '')}"
+        )
+    return 0
+
+
+def command_daemon_plan(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    out = watcher_root(root) / "daemon_plan.md"
+    interval = max(1, int(args.interval))
+    content = f"""# Visible Watcher Daemon Plan
+
+This is a plan only. No daemon was started by this command.
+
+Before starting a daemon, run:
+
+```bash
+./bin/omx_visible_policy_check check --root .
+./bin/omx_visible_dispatch doctor --root .
+```
+
+Recommended foreground command for manual observation:
+
+```bash
+./bin/omx_visible_watcher watch --root . --interval {interval}
+```
+
+If a later phase explicitly enables a daemon, the command shape is:
+
+```bash
+./bin/omx_visible_watcher daemon --root . --interval {interval} --allow-daemon
+```
+
+The daemon:
+
+- scans `.omx/framework/team/visible-runs/`
+- writes only `_watcher/` telemetry files
+- does not call OpenCode POST endpoints
+- does not call tmux
+- does not release owner locks
+- does not write task markers or `report.md`
+
+PID file:
+
+```text
+.omx/framework/team/visible-runs/_watcher/watcher.pid
+```
+
+Log file:
+
+```text
+.omx/framework/team/visible-runs/_watcher/watcher.log
+```
+
+Health checks:
+
+```bash
+./bin/omx_visible_watcher daemon-status --root .
+./bin/omx_visible_watcher daemon-health --root .
+./bin/omx_visible_watcher status --root .
+./bin/omx_visible_watcher alerts --root .
+```
+
+Stop command for an explicitly authorized later stop:
+
+```bash
+./bin/omx_visible_watcher daemon-stop --root . --allow-stop
+```
+
+`daemon-stop` validates that `watcher.pid` belongs to this workspace's
+`omx_visible_watcher daemon` process before it sends a signal. It does not
+touch tmux panes, OpenCode workers, owner locks, task markers, or reports.
+
+Phase 3C-6 explicitly enables the daemon only after policy, doctor, preflight,
+and single-instance checks pass.
+"""
+    write_text(out, content)
+    print(f"wrote: {rel(out, root)}")
+    print("daemon_started: false")
+    return 0
+
+
+def proc_cmdline_args(pid: int) -> list[str]:
+    try:
+        raw = Path(f"/proc/{int(pid)}/cmdline").read_bytes()
+        return [item.decode("utf-8", errors="replace") for item in raw.split(b"\x00") if item]
+    except Exception:
+        return []
+
+
+def proc_cmdline(pid: int) -> str:
+    return " ".join(shlex.quote(item) for item in proc_cmdline_args(pid))
+
+
+def proc_cwd(pid: int) -> str:
+    try:
+        return os.readlink(f"/proc/{int(pid)}/cwd")
+    except Exception:
+        return ""
+
+
+def process_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return Path(f"/proc/{pid}").exists()
+
+
+def parse_option(argv: list[str], name: str) -> str:
+    for index, item in enumerate(argv):
+        if item == name and index + 1 < len(argv):
+            return argv[index + 1]
+        if item.startswith(name + "="):
+            return item.split("=", 1)[1]
+    return ""
+
+
+def parse_int_option(argv: list[str], name: str, default: int) -> int:
+    value = parse_option(argv, name)
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def looks_like_watcher_daemon(argv: list[str]) -> bool:
+    has_script = any("omx_visible_watcher" in Path(item).name or "omx_visible_watcher" in item for item in argv)
+    return has_script and "daemon" in argv
+
+
+def daemon_root_matches(root: Path, argv: list[str], cwd: str) -> bool:
+    raw_root = parse_option(argv, "--root") or "."
+    base = Path(cwd) if cwd else root
+    try:
+        resolved = (base / raw_root).resolve() if not Path(raw_root).is_absolute() else Path(raw_root).resolve()
+    except Exception:
+        return False
+    return resolved == root.resolve()
+
+
+def archive_file(path: Path, root: Path) -> Path | None:
+    if not path.exists():
+        return None
+    archive_dir = watcher_root(root) / "archive"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    archived = archive_dir / f"{path.name}.{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.bak"
+    os.replace(path, archived)
+    return archived
+
+
+def daemon_status_payload(root: Path) -> dict[str, Any]:
+    pid_path = watcher_root(root) / "watcher.pid"
+    log_path = watcher_root(root) / "watcher.log"
+    last_scan_path = watcher_root(root) / "last_scan.json"
+    meta_path = watcher_root(root) / "daemon_meta.json"
+    pid_text = read_text(pid_path).strip() if pid_path.is_file() else ""
+    pid = 0
+    pid_valid = True
+    try:
+        pid = int(pid_text)
+    except ValueError:
+        pid_valid = False if pid_text else True
+        pid = 0
+    argv = proc_cmdline_args(pid) if pid > 0 else []
+    cmdline = " ".join(shlex.quote(item) for item in argv)
+    cwd = proc_cwd(pid) if pid > 0 else ""
+    running = process_running(pid)
+    looks_like = looks_like_watcher_daemon(argv)
+    root_matches = daemon_root_matches(root, argv, cwd) if running and looks_like else False
+    if not pid_path.is_file():
+        status = "not_running"
+    elif not pid_valid or pid <= 0 or not running:
+        status = "stale_pid"
+    elif not looks_like or not root_matches:
+        status = "wrong_process"
+    else:
+        status = "running"
+    last_scan = read_json(last_scan_path)
+    meta = read_json(meta_path)
+    try:
+        default_interval = int(meta.get("interval", 5) or 5)
+    except (TypeError, ValueError):
+        default_interval = 5
+    interval = parse_int_option(argv, "--interval", default_interval)
+    return {
+        "generated_at": utc_now(),
+        "root": str(root),
+        "pid_file": rel(pid_path, root),
+        "pid": pid,
+        "pid_text": pid_text,
+        "pid_file_exists": pid_path.is_file(),
+        "pid_valid": pid_valid,
+        "running": running,
+        "process_cwd": cwd,
+        "cmdline": cmdline,
+        "cmdline_args": argv,
+        "looks_like_watcher": looks_like,
+        "root_matches": root_matches,
+        "interval": interval,
+        "log_file": rel(log_path, root),
+        "log_exists": log_path.is_file(),
+        "last_scan_path": rel(last_scan_path, root),
+        "last_scan": last_scan,
+        "daemon_meta_path": rel(meta_path, root),
+        "daemon_meta": meta,
+        "status": status,
+    }
+
+
+def command_daemon_status(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    payload = daemon_status_payload(root)
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
+        return 0
+    print(f"daemon_status: {payload['status']}")
+    print(f"pid_file: {payload['pid_file']}")
+    print(f"pid: {payload['pid'] or '-'}")
+    print(f"looks_like_watcher: {str(bool(payload['looks_like_watcher'])).lower()}")
+    print(f"root_matches: {str(bool(payload['root_matches'])).lower()}")
+    print(f"interval: {payload.get('interval', '-')}")
+    print(f"log_file: {payload['log_file']}")
+    last_scan = payload.get("last_scan", {})
+    print(f"last_scan: {last_scan.get('generated_at', '-') if isinstance(last_scan, dict) else '-'}")
+    return 0
+
+
+def iso_to_ts(value: str) -> float | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
+def command_daemon_health(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    payload = daemon_status_payload(root)
+    errors: list[str] = []
+    warnings: list[str] = []
+    if payload["status"] == "not_running":
+        result = {
+            "generated_at": utc_now(),
+            "status": "not_running",
+            "ok": True,
+            "message": "watcher daemon is not running; this is not an error before explicit enablement",
+            "daemon_status": payload,
+            "errors": errors,
+            "warnings": warnings,
+        }
+    elif payload["status"] in {"stale_pid", "wrong_process"}:
+        errors.append(f"daemon status is {payload['status']}")
+        result = {
+            "generated_at": utc_now(),
+            "status": "unhealthy",
+            "ok": False,
+            "daemon_status": payload,
+            "errors": errors,
+            "warnings": warnings,
+        }
+    else:
+        if not payload.get("looks_like_watcher"):
+            errors.append("pid is running but cmdline does not look like omx_visible_watcher")
+        if not payload.get("root_matches"):
+            errors.append("pid is running but root does not match this project")
+        board_path = watcher_root(root) / "visible_board.json"
+        board = read_json(board_path)
+        if not board:
+            errors.append("visible_board.json is missing or invalid JSON")
+        last_scan = payload.get("last_scan", {})
+        generated = last_scan.get("generated_at", "") if isinstance(last_scan, dict) else ""
+        ts = iso_to_ts(generated)
+        age = None if ts is None else max(0, int(time.time() - ts))
+        if ts is None:
+            errors.append("last_scan.json missing generated_at")
+        interval = max(1, int(payload.get("interval") or 5))
+        max_age = int(args.max_age) if int(args.max_age) > 0 else interval * 2 + 2
+        stale = False
+        if age is not None and age > max_age:
+            stale = True
+            warnings.append(f"last_scan is stale: age_seconds={age} max_age={max_age}")
+        if not payload.get("log_exists"):
+            errors.append("watcher.log is missing")
+        result = {
+            "generated_at": utc_now(),
+            "status": "unhealthy" if errors else ("stale" if stale else "healthy"),
+            "ok": not errors and not stale,
+            "last_scan_age_seconds": age,
+            "max_age_seconds": max_age,
+            "daemon_status": payload,
+            "errors": errors,
+            "warnings": warnings,
+        }
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True, ensure_ascii=False))
+    else:
+        print(f"daemon_health: {result['status']}")
+        if result.get("message"):
+            print(result["message"])
+        if result.get("last_scan_age_seconds") is not None:
+            print(f"last_scan_age_seconds: {result['last_scan_age_seconds']}")
+        if warnings:
+            print("Warnings:")
+            for item in warnings:
+                print(f"  - {item}")
+        if errors:
+            print("Errors:")
+            for item in errors:
+                print(f"  - {item}")
+    return 0 if result["ok"] else 1
+
+
+def rotate_log_if_needed(log_path: Path) -> None:
+    if file_size(log_path) <= LOG_MAX_BYTES:
+        return
+    archived = log_path.with_name(f"watcher.log.{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.bak")
+    os.replace(log_path, archived)
+
+
+def daemon_log(log_path: Path, message: str) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    rotate_log_if_needed(log_path)
+    with log_path.open("a", encoding="utf-8") as log:
+        log.write(message.rstrip() + "\n")
+
+
+def run_startup_check(root: Path, label: str, command: list[str]) -> dict[str, Any]:
+    started_at = utc_now()
+    try:
+        result = subprocess.run(command, cwd=str(root), capture_output=True, text=True, timeout=120)
+    except Exception as exc:
+        return {
+            "label": label,
+            "command": command,
+            "started_at": started_at,
+            "returncode": 2,
+            "stdout": "",
+            "stderr": str(exc),
+            "ok": False,
+        }
+    return {
+        "label": label,
+        "command": command,
+        "started_at": started_at,
+        "returncode": result.returncode,
+        "stdout": result.stdout[-4000:],
+        "stderr": result.stderr[-4000:],
+        "ok": result.returncode == 0,
+    }
+
+
+def daemon_startup_checks(root: Path) -> list[dict[str, Any]]:
+    checks = [
+        ("policy_check", ["./bin/omx_visible_policy_check", "check", "--root", "."]),
+        ("dispatch_doctor", ["./bin/omx_visible_dispatch", "doctor", "--root", "."]),
+    ]
+    return [run_startup_check(root, label, command) for label, command in checks]
+
+
+def daemon_process(root: Path, interval: int, log_path: Path) -> int:
+    consecutive_errors = 0
+    iteration = 0
+    while True:
+        iteration += 1
+        try:
+            board, _ = _scan_and_write_outputs(root)
+            consecutive_errors = 0
+            counts = ",".join(f"{key}={value}" for key, value in board.get("summary", {}).items()) or "tasks=0"
+            daemon_log(
+                log_path,
+                f"{board.get('generated_at')} iteration={iteration} counts={counts} "
+                f"active_alerts={board.get('active_alerts', board.get('alert_count', 0))} "
+                f"alerts_count={board.get('alert_count', 0)} "
+                f"suppressed_fixtures={board.get('suppressed_fixtures', 0)} "
+                f"fixture_alerts_suppressed={board.get('fixture_alerts_suppressed', 0)}",
+            )
+        except Exception as exc:  # daemon telemetry must keep running through transient scan errors
+            consecutive_errors += 1
+            daemon_log(log_path, f"{utc_now()} iteration={iteration} error_count={consecutive_errors} error={exc!r}")
+            if consecutive_errors > DAEMON_ERROR_LIMIT:
+                write_json(watcher_root(root) / "daemon_error.json", {
+                    "ts": utc_now(),
+                    "iteration": iteration,
+                    "consecutive_errors": consecutive_errors,
+                    "error": repr(exc),
+                    "action": "daemon_exit",
+                })
+                return 1
+        time.sleep(max(1, interval))
+
+
+def command_daemon(args: argparse.Namespace) -> int:
+    if not args.allow_daemon:
+        raise WatcherError("daemon requires --allow-daemon")
+    root = root_path(args.root)
+    out = watcher_root(root)
+    out.mkdir(parents=True, exist_ok=True)
+    pid_path = out / "watcher.pid"
+    log_path = out / "watcher.log"
+    status = daemon_status_payload(root)
+    if status["status"] == "running":
+        raise WatcherError(f"watcher daemon already running with pid {status['pid']}")
+    if status["status"] == "wrong_process":
+        raise WatcherError(f"watcher.pid points at a non-watcher or different-root process: pid {status['pid']}")
+    if status["status"] == "stale_pid" and pid_path.exists():
+        archive_file(pid_path, root)
+
+    startup = daemon_startup_checks(root)
+    write_json(out / "daemon_startup_checks.json", {
+        "generated_at": utc_now(),
+        "root": str(root),
+        "checks": startup,
+        "ok": all(item.get("ok") for item in startup),
+    })
+    failed = [item for item in startup if not item.get("ok")]
+    if failed:
+        labels = ", ".join(str(item.get("label")) for item in failed)
+        raise WatcherError(f"daemon startup checks failed: {labels}")
+
+    if os.fork() == 0:
+        os.setsid()
+        if os.fork() == 0:
+            with open(os.devnull, "r", encoding="utf-8") as devnull_in, open(os.devnull, "a", encoding="utf-8") as devnull_out:
+                os.dup2(devnull_in.fileno(), 0)
+                os.dup2(devnull_out.fileno(), 1)
+                os.dup2(devnull_out.fileno(), 2)
+            pid_path.write_text(str(os.getpid()) + "\n", encoding="utf-8")
+            write_json(out / "daemon_meta.json", {
+                "created_at": utc_now(),
+                "pid": os.getpid(),
+                "root": str(root),
+                "interval": max(1, int(args.interval)),
+                "pid_file": rel(pid_path, root),
+                "log_file": rel(log_path, root),
+                "command": sys.argv,
+                "startup_checks_path": rel(out / "daemon_startup_checks.json", root),
+            })
+            rc = daemon_process(root, int(args.interval), log_path)
+            os._exit(rc)
+        os._exit(0)
+    os.wait()
+    for _ in range(50):
+        if pid_path.is_file():
+            break
+        time.sleep(0.1)
+    print(f"daemon_started: true")
+    print(f"pid_file: {rel(pid_path, root)}")
+    print(f"pid: {read_text(pid_path).strip() or '-'}")
+    print(f"log_file: {rel(log_path, root)}")
+    return 0
+
+
+def command_stop_plan(args: argparse.Namespace) -> int:
+    root = root_path(args.root)
+    out = watcher_root(root) / "stop_plan.md"
+    pid_path = watcher_root(root) / "watcher.pid"
+    pid_text = read_text(pid_path).strip() if pid_path.is_file() else ""
+    content = f"""# Visible Watcher Stop Plan
+
+This command does not stop anything.
+
+Current pid file:
+
+```text
+{rel(pid_path, root)}
+```
+
+Recorded pid:
+
+```text
+{pid_text or "(none)"}
+```
+
+If this phase or a later phase authorizes stopping a daemon, use:
+
+```bash
+./bin/omx_visible_watcher daemon-stop --root . --allow-stop
+```
+
+The stop wrapper must:
+
+1. Confirm the pid still belongs to `omx_visible_watcher`.
+2. Confirm the daemon is the one created by this workspace.
+3. Stop only that watcher process.
+4. Do not stop or signal any tmux pane, OpenCode worker, or OMX runtime.
+
+This plan command never stops daemons or processes.
+"""
+    write_text(out, content)
+    print(f"wrote: {rel(out, root)}")
+    print("stopped_processes: 0")
+    return 0
+
+
+def command_daemon_stop(args: argparse.Namespace) -> int:
+    if not args.allow_stop:
+        raise WatcherError("daemon-stop requires --allow-stop")
+    root = root_path(args.root)
+    status = daemon_status_payload(root)
+    if status["status"] == "not_running":
+        raise WatcherError("watcher.pid does not exist; no daemon to stop")
+    if status["status"] == "stale_pid":
+        archived = archive_file(watcher_root(root) / "watcher.pid", root)
+        print("daemon_stop: stale_pid_archived")
+        if archived:
+            print(f"archived_pid_file: {rel(archived, root)}")
+        return 0
+    if status["status"] != "running":
+        raise WatcherError(f"refusing to stop because daemon status is {status['status']}")
+    pid = int(status["pid"])
+    os.kill(pid, signal.SIGTERM)
+    stopped = False
+    for _ in range(50):
+        if not process_running(pid):
+            stopped = True
+            break
+        time.sleep(0.1)
+    if not stopped:
+        raise WatcherError(f"sent SIGTERM to watcher daemon pid {pid}, but it is still running")
+    archived = archive_file(watcher_root(root) / "watcher.pid", root)
+    print("daemon_stop: stopped")
+    print(f"pid: {pid}")
+    if archived:
+        print(f"archived_pid_file: {rel(archived, root)}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="omx_visible_watcher",
+        description=(
+            "Read-only watcher for .omx/framework/team/visible-runs. "
+            "Writes only _watcher observation artifacts and never calls tmux or OpenCode APIs."
+        ),
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    once = sub.add_parser("once", help="scan visible-runs once and write watcher snapshots")
+    once.add_argument("--root", default=".")
+    once.add_argument("--include-fixtures", action="store_true", help="include fixture alerts in this scan output")
+    once.set_defaults(func=command_once)
+
+    watch = sub.add_parser("watch", help="scan in the foreground at an interval")
+    watch.add_argument("--root", default=".")
+    watch.add_argument("--interval", type=int, default=3)
+    watch.add_argument("--duration", type=int)
+    watch.add_argument("--include-fixtures", action="store_true", help="include fixture alerts in foreground watch output")
+    watch.set_defaults(func=command_watch)
+
+    status = sub.add_parser("status", help="read the latest watcher snapshot")
+    status.add_argument("--root", default=".")
+    status.add_argument("--json", action="store_true")
+    status.add_argument("--worker")
+    status.add_argument("--runtime-backend", default=default_backend_name(), choices=[item["name"] for item in available_backends()])
+    status.add_argument("--fixture", help="fixture directory for RuntimeAdapter status")
+    status.add_argument("--refresh", action="store_true", help="run one scan before printing")
+    status.add_argument("--include-fixtures", action="store_true", help="show fixture alerts instead of default suppression")
+    status.set_defaults(func=command_status)
+
+    alerts = sub.add_parser("alerts", help="show current active watcher alerts; use --history for alerts.jsonl")
+    alerts.add_argument("--root", default=".")
+    alerts.add_argument("--json", action="store_true")
+    alerts.add_argument("--limit", type=int, default=20)
+    alerts.add_argument("--worker")
+    alerts.add_argument("--all-workers", action="store_true")
+    alerts.add_argument("--runtime-backend", default=default_backend_name(), choices=[item["name"] for item in available_backends()])
+    alerts.add_argument("--fixture", help="fixture directory for RuntimeAdapter alert metadata")
+    alerts.add_argument("--include-fixtures", action="store_true", help="show current suppressed fixture alerts, or include fixture rows with --history")
+    alerts.add_argument("--recent-runs", type=int, help="bound the fresh scan to the N newest run directories; skips watcher telemetry refresh and reports scan_scope instead")
+    alerts.add_argument("--history", action="store_true", help="show append-only historical alerts.jsonl rows instead of current active alerts")
+    alerts.set_defaults(func=command_alerts)
+
+    daemon_plan = sub.add_parser("daemon-plan", help="write a daemon plan without starting it")
+    daemon_plan.add_argument("--root", default=".")
+    daemon_plan.add_argument("--interval", type=int, default=5)
+    daemon_plan.set_defaults(func=command_daemon_plan)
+
+    daemon_status = sub.add_parser("daemon-status", help="read watcher.pid and report daemon status without starting/stopping it")
+    daemon_status.add_argument("--root", default=".")
+    daemon_status.add_argument("--json", action="store_true")
+    daemon_status.set_defaults(func=command_daemon_status)
+
+    daemon_health = sub.add_parser("daemon-health", help="check daemon freshness if running; not_running is OK before enablement")
+    daemon_health.add_argument("--root", default=".")
+    daemon_health.add_argument("--json", action="store_true")
+    daemon_health.add_argument("--max-age", type=int, default=0, help="freshness threshold in seconds; default is two daemon intervals plus two seconds")
+    daemon_health.set_defaults(func=command_daemon_health)
+
+    daemon = sub.add_parser("daemon", help="start a watcher daemon only with --allow-daemon")
+    daemon.add_argument("--root", default=".")
+    daemon.add_argument("--interval", type=int, default=5)
+    daemon.add_argument("--allow-daemon", action="store_true")
+    daemon.set_defaults(func=command_daemon)
+
+    stop_plan = sub.add_parser("stop-plan", help="write a stop plan without stopping anything")
+    stop_plan.add_argument("--root", default=".")
+    stop_plan.set_defaults(func=command_stop_plan)
+
+    daemon_stop_plan = sub.add_parser("daemon-stop-plan", help="alias for stop-plan; writes guidance without stopping anything")
+    daemon_stop_plan.add_argument("--root", default=".")
+    daemon_stop_plan.set_defaults(func=command_stop_plan)
+
+    daemon_stop = sub.add_parser("daemon-stop", help="stop only this workspace's watcher daemon, and only with --allow-stop")
+    daemon_stop.add_argument("--root", default=".")
+    daemon_stop.add_argument("--allow-stop", action="store_true")
+    daemon_stop.set_defaults(func=command_daemon_stop)
+
+    for command_parser in sub.choices.values():
+        command_parser.set_defaults(root=None)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return int(args.func(args))
+    except WatcherError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    except RuntimeAdapterError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("ERROR: interrupted", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+"""Draft-delivery check CLI for Issue #861.
+
+Submitting the canonical draft through this command is itself the
+delivery action that triggers the pre-delivery check: one invocation
+reads the draft JSON once (hash and parse share those bytes), verifies
+its evidence references through the existing handoff-evidence index,
+and prints the feedback synchronously. The worker reads the feedback,
+fixes gaps, then writes the formal report and uses the unchanged
+finish protocol separately. This CLI never calls finish, never writes
+or modifies the formal report, and never creates terminal markers, so
+a completed check never blocks or rewrites a delivery.
+
+The draft is the existing closed handoff-evidence JSON object; its
+``handoff_id`` (or the explicit ``--task`` argument) is the per-task
+state identity within the caller-owned state directory. The default
+run is offline. The one live Jev question runs only through the
+explicit host-authorization pair ``--jev-live --jev-evidence-root``,
+passed by the fence/owner/session-verified plugin from a
+leader-authorized task contract: the CLI additionally reads the fixed
+task record next to the draft, verifies it against the acceptance
+fence's bare-hex canonical-JSON contract hash (the exact create_task
+formula, full task contract, no prefix), and requires the fence-bound
+contract to select the live option with an evidence root canonically
+equal to the passed ``--jev-evidence-root`` — so a rewritten task
+contract, a hash-correct contract that did not select live, or a
+mismatched root argument cannot authorize sending. The draft's ``root`` must resolve
+to the authorized root exactly or the live check refuses — an
+intentional local rejection before anything is sent, with no index
+produced — and a refused or unavailable live check falls back to the
+offline index (a refused root consumes no attempt; a locally
+unbuildable live state keeps the attempt consumed with an explicit
+unavailable outcome). No environment variable, key presence, or draft
+text can enable live sending. Local draft or state errors exit 1;
+check completion, reuse, an already running check, or a busy state
+lock all exit 0 so the advisory step never fails an outer task.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+LIB = ROOT / "lib"
+for package_root in (LIB, SRC):
+    if package_root.is_dir() and str(package_root) not in sys.path:
+        sys.path.insert(0, str(package_root))
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="omx_draft_delivery",
+        description=(
+            "Submit the canonical draft for its pre-delivery check: the "
+            "submission itself runs the existing handoff-evidence check "
+            "and prints advisory feedback. Offline by default; live Jev "
+            "sending requires the host-authorized --jev-live with "
+            "--jev-evidence-root pair."
+        ),
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+    submit = sub.add_parser(
+        "submit",
+        help="run the check for one draft (the draft-delivery action)",
+    )
+    submit.add_argument(
+        "--draft",
+        required=True,
+        help="canonical draft JSON (the handoff-evidence input object)",
+    )
+    submit.add_argument(
+        "--state-dir",
+        required=True,
+        help="caller-owned stable output directory for the per-task state",
+    )
+    submit.add_argument(
+        "--task",
+        required=False,
+        help=(
+            "explicit draft identity naming the state files; defaults to "
+            "the draft's own handoff_id"
+        ),
+    )
+    submit.add_argument(
+        "--jev-live",
+        dest="jev_live",
+        action="store_true",
+        help=(
+            "host-explicit authorization to send the one bounded live "
+            "Jev question; requires --jev-evidence-root"
+        ),
+    )
+    submit.add_argument(
+        "--jev-evidence-root",
+        dest="jev_evidence_root",
+        default="",
+        help=(
+            "authorized absolute evidence root from the leader-selected "
+            "task contract; the CLI verifies the task record against the "
+            "fence-bound contract hash and the draft's root must resolve "
+            "to it exactly (canonical symlink resolution) or the live "
+            "check refuses to send"
+        ),
+    )
+    return parser
+
+
+def _read_task_record(task_dir: Path, name: str) -> dict:
+    from visible_agent_orchestrator.draft_delivery import DraftDeliveryError
+
+    path = task_dir / name
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise DraftDeliveryError(
+            "live check requires the dispatch-bound task record next to "
+            f"the draft ({name}: {exc})"
+        ) from exc
+    if not isinstance(record, dict):
+        raise DraftDeliveryError(
+            f"live check requires a JSON object in {name}"
+        )
+    return record
+
+
+def _verify_live_task_authorization(
+    task_dir: Path,
+    expected_task: str | None,
+    evidence_root: str,
+) -> None:
+    """Verify the live selection is the fence-bound task contract.
+
+    The task record next to the draft is the fixed task path. The
+    acceptance fence binds the full task contract by the same formula
+    ``omx_visible_dispatch`` create_task uses at L6088-6101: bare-hex
+    sha256 over the canonical JSON of the complete ``task_contract``
+    (``operation_capability`` included, no ``sha256:`` prefix). Only
+    after that hash matches is the contract's own closed
+    ``draft_check`` selection consulted: it must select ``jev_live``
+    with an ``evidence_root`` that canonically equals the passed
+    ``--jev-evidence-root`` — a hash-correct contract that did not
+    select live, or a mismatched root argument, refuses closed. This
+    is a selection-binding check, not a defense against arbitrary
+    writers with the same Unix permissions.
+    """
+
+    from visible_agent_orchestrator.draft_check import (
+        DraftCheckError,
+        validate_draft_check_contract,
+    )
+    from visible_agent_orchestrator.draft_delivery import DraftDeliveryError
+    from visible_agent_orchestrator.operation_authorization import (
+        _canonical_json_hash,
+    )
+
+    task_record = _read_task_record(task_dir, "task.json")
+    fence = _read_task_record(task_dir, "acceptance_fence.json")
+    task_id = str(fence.get("task_id") or "")
+    if not task_id or task_id != str(task_record.get("id") or ""):
+        raise DraftDeliveryError(
+            "live check refused: the task record and the acceptance fence "
+            "disagree on the task id"
+        )
+    if expected_task and expected_task != task_id:
+        raise DraftDeliveryError(
+            "live check refused: the explicit task identity does not "
+            "match the fence-bound task id"
+        )
+    task_contract = task_record.get("task_contract")
+    if not isinstance(task_contract, dict):
+        raise DraftDeliveryError(
+            "live check refused: the task record carries no task "
+            "contract object"
+        )
+    fence_hash = str(fence.get("contract_hash") or "")
+    computed_hash = _canonical_json_hash(task_contract).removeprefix(
+        "sha256:"
+    )
+    if computed_hash != fence_hash:
+        raise DraftDeliveryError(
+            "live check refused: the task contract is not the one bound "
+            "into the acceptance fence; a rewritten contract cannot "
+            "authorize sending"
+        )
+    try:
+        selected = validate_draft_check_contract(task_contract)
+    except DraftCheckError as exc:
+        raise DraftDeliveryError(f"live check refused: {exc}") from exc
+    if not (isinstance(selected, dict) and selected.get("jev_live") is True):
+        raise DraftDeliveryError(
+            "live check refused: the fence-bound task contract does not "
+            "select the live Jev option"
+        )
+    authorized_root = str(selected.get("evidence_root") or "")
+    passed_root = str(evidence_root or "").strip()
+    if not passed_root or os.path.realpath(passed_root) != os.path.realpath(
+        authorized_root
+    ):
+        raise DraftDeliveryError(
+            "live check refused: --jev-evidence-root does not canonically "
+            "match the evidence root authorized by the fence-bound task "
+            "contract"
+        )
+
+
+def main(argv: list[str] | None = None) -> int:
+    from visible_agent_orchestrator.draft_delivery import (
+        DraftDeliveryError,
+        run_draft_delivery,
+    )
+
+    args = build_parser().parse_args(argv)
+    try:
+        if args.jev_live:
+            _verify_live_task_authorization(
+                Path(args.draft).resolve().parent,
+                expected_task=args.task,
+                evidence_root=args.jev_evidence_root or "",
+            )
+        result = run_draft_delivery(
+            args.draft,
+            args.state_dir,
+            task_id=args.task,
+            jev_live=args.jev_live,
+            evidence_root=args.jev_evidence_root or None,
+        )
+    except DraftDeliveryError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    print(result["feedback_markdown"])
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

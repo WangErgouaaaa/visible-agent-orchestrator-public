@@ -1,0 +1,59 @@
+from __future__ import annotations
+
+from visible_agent_orchestrator.terminal_protocol_baseline import (
+    build_legacy_terminal_baseline,
+    creation_record_path,
+    legacy_baseline_path,
+)
+from visible_agent_orchestrator.terminal_protocol_classifier import (
+    classify_terminal_protocol,
+)
+from visible_agent_orchestrator.terminal_protocol_constants import (
+    CREATION_IDENTITY_FIELDS,
+    CREATION_RECORD_KIND,
+    CREATION_RECORD_SUFFIX,
+    CURRENT_BINDING_FIELDS,
+    FENCE_RECORD_KIND,
+    IDENTITY_FIELDS,
+    LEGACY_ACTIVATION_BATCH_FILENAME,
+    LEGACY_BASELINE_FILENAME,
+    LEGACY_BASELINE_KIND,
+    LEGACY_BASELINE_SCHEMA_VERSION,
+    MODERN_RECORDS,
+    OPERATOR_RECOVERY_CLAIM_KIND,
+    PROTOCOL_ALIASES,
+    REQUIRED_MODERN_RECORDS,
+    TASK_PROTOCOL_VERSION,
+    TERMINAL_OUTPUT_CLAIM_KIND,
+    TERMINAL_PROTOCOL_CLASSIFICATION_INVALID,
+    TERMINAL_PROTOCOL_CLASSIFICATION_LEGACY,
+    TERMINAL_PROTOCOL_CLASSIFICATION_MODERN,
+    TERMINAL_PROTOCOL_VERSION,
+)
+
+__all__ = [
+    "CREATION_IDENTITY_FIELDS",
+    "CREATION_RECORD_KIND",
+    "CREATION_RECORD_SUFFIX",
+    "CURRENT_BINDING_FIELDS",
+    "FENCE_RECORD_KIND",
+    "IDENTITY_FIELDS",
+    "LEGACY_ACTIVATION_BATCH_FILENAME",
+    "LEGACY_BASELINE_FILENAME",
+    "LEGACY_BASELINE_KIND",
+    "LEGACY_BASELINE_SCHEMA_VERSION",
+    "MODERN_RECORDS",
+    "OPERATOR_RECOVERY_CLAIM_KIND",
+    "PROTOCOL_ALIASES",
+    "REQUIRED_MODERN_RECORDS",
+    "TASK_PROTOCOL_VERSION",
+    "TERMINAL_OUTPUT_CLAIM_KIND",
+    "TERMINAL_PROTOCOL_CLASSIFICATION_INVALID",
+    "TERMINAL_PROTOCOL_CLASSIFICATION_LEGACY",
+    "TERMINAL_PROTOCOL_CLASSIFICATION_MODERN",
+    "TERMINAL_PROTOCOL_VERSION",
+    "build_legacy_terminal_baseline",
+    "classify_terminal_protocol",
+    "creation_record_path",
+    "legacy_baseline_path",
+]

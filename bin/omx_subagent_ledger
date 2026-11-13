@@ -1,0 +1,430 @@
+#!/usr/bin/env python3
+"""Append advisory task-local OpenCode native subagent ledger rows."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+from typing import Any
+
+
+_THIS_FILE = Path(__file__).resolve()
+_CANDIDATE_IMPORT_ROOTS = []
+
+_env_lib = os.environ.get("OMX_VISIBLE_AGENT_ORCHESTRATOR_LIB")
+if _env_lib:
+    _CANDIDATE_IMPORT_ROOTS.append(Path(_env_lib).expanduser().resolve())
+
+_CANDIDATE_IMPORT_ROOTS.append((_THIS_FILE.parent.parent / "src").resolve())
+_CANDIDATE_IMPORT_ROOTS.append((_THIS_FILE.parent.parent / "lib").resolve())
+
+for _path in _CANDIDATE_IMPORT_ROOTS:
+    if _path.exists() and str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
+
+from visible_agent_orchestrator.subagent_ledger import (  # noqa: E402
+    SubagentLedgerError,
+    append_subagent_ledger_entry,
+)
+from visible_agent_orchestrator.subagent_projection import (  # noqa: E402
+    VALID_BACKGROUND_EXPIRY_STATUSES,
+    VALID_HEPHAESTUS_DRAFT_ADOPTIONS,
+    VALID_LATEST_USEFUL_MOMENTS,
+    VALID_MERGE_READINESS,
+    VALID_MERGE_STATUSES,
+    VALID_MOMUS_CONTEXT_ISOLATION_STATUSES,
+    VALID_PARENT_ACTIONS_ON_DEGRADATION,
+    VALID_REQUIRED_OR_OPTIONAL,
+    VALID_RETRIEVAL_STATES,
+    VALID_RETRY_SCOPES,
+    VALID_SEMANTIC_STATUSES,
+    VALID_SOURCE_LABELS,
+    VALID_SUBAGENT_STATUSES,
+    VALID_VALUE_CLASSIFICATIONS,
+)
+
+
+def _task_dir(root: Path, value: str) -> Path:
+    path = Path(value)
+    return path.resolve(strict=False) if path.is_absolute() else (root / path).resolve(strict=False)
+
+
+def _valid_values_help(values: set[str]) -> str:
+    return "valid values: " + ", ".join(sorted(value for value in values if value))
+
+
+def _add_enum_argument(
+    parser: argparse.ArgumentParser,
+    option: str,
+    values: set[str],
+    **kwargs: Any,
+) -> None:
+    parser.add_argument(option, help=_valid_values_help(values), **kwargs)
+
+
+def _emit(payload: dict, *, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
+        return
+    print("subagent_ledger: OK")
+    print(f"writes_task_local: {str(bool(payload.get('writes_task_local'))).lower()}")
+    print(f"control_writes: {str(bool(payload.get('control_writes'))).lower()}")
+    print(f"ledger_path: {payload.get('ledger_path') or '-'}")
+    entry = payload.get("entry", {})
+    if isinstance(entry, dict):
+        print(f"subagent_id: {entry.get('subagent_id') or '-'}")
+        print(f"agent: {entry.get('agent') or '-'}")
+        print(f"status: {entry.get('status') or '-'}")
+
+
+def artifact_summary_value(args: argparse.Namespace) -> dict | str:
+    legacy_json = str(args.artifact_summary or "").strip()
+    explicit_json = str(getattr(args, "artifact_summary_json", "") or "").strip()
+    if legacy_json and explicit_json:
+        raise SubagentLedgerError(
+            "artifact_summary_json_options_are_mutually_exclusive"
+        )
+    raw_json = explicit_json or legacy_json
+    if raw_json:
+        try:
+            value = json.loads(raw_json)
+        except json.JSONDecodeError as exc:
+            raise SubagentLedgerError(
+                "artifact_summary_must_be_json_object; use --artifact-summary-json "
+                "for structured JSON or --artifact-summary-text for plain text"
+            ) from exc
+        if not isinstance(value, dict):
+            raise SubagentLedgerError("artifact_summary_must_be_json_object")
+        return value
+    return str(args.artifact_summary_text or "").strip()
+
+
+def command_append(args: argparse.Namespace) -> int:
+    root = Path(args.root).resolve()
+    artifact_summary = artifact_summary_value(args)
+    payload = append_subagent_ledger_entry(
+        root,
+        _task_dir(root, args.task_dir),
+        worker_id=args.worker,
+        subagent_id=args.subagent_id,
+        agent=args.agent,
+        lane=args.lane,
+        purpose=args.purpose,
+        status=args.status,
+        artifact=args.artifact,
+        artifact_path=args.artifact_path,
+        artifact_summary=artifact_summary,
+        timestamp=args.timestamp,
+        semantic_status=args.semantic_status,
+        retry_scope=args.retry_scope,
+        required_or_optional=args.required_or_optional,
+        latest_useful_moment=args.latest_useful_moment,
+        retrieval_state=args.retrieval_state,
+        merge_readiness=args.merge_readiness,
+        subdomain_id=args.subdomain_id,
+        spawned_by_worker=args.spawned_by_worker,
+        expected_unique_value=args.expected_unique_value,
+        unique_value_realized=args.unique_value_realized,
+        value_classification=args.value_classification,
+        merge_status=args.merge_status,
+        downstream_consumer=args.downstream_consumer,
+        on_critical_path=args.on_critical_path,
+        direct_path_converged_first=args.direct_path_converged_first,
+        cancel_reason=args.cancel_reason,
+        visible_role=args.visible_role,
+        evidence_domain=args.evidence_domain,
+        allowed_sources=args.allowed_sources,
+        forbidden_sources=args.forbidden_sources,
+        source_label=args.source_label,
+        adopted_findings=args.adopted_findings,
+        rejected_findings=args.rejected_findings,
+        critical_rejected_findings=args.critical_rejected_findings,
+        rejected_finding_reason=args.rejected_finding_reason,
+        rejected_finding_direct_evidence_status=args.rejected_finding_direct_evidence_status,
+        rejected_finding_downstream_action=args.rejected_finding_downstream_action,
+        subagent_degraded=args.subagent_degraded,
+        degradation_reason=args.degradation_reason,
+        confidence_effect=args.confidence_effect,
+        parent_action_on_degradation=args.parent_action_on_degradation,
+        librarian_freshness_source=args.librarian_freshness_source,
+        librarian_freshness_checked_at=args.librarian_freshness_checked_at,
+        librarian_freshness_basis=args.librarian_freshness_basis,
+        hephaestus_draft_adoption=args.hephaestus_draft_adoption,
+        hephaestus_adoption_diff_or_summary=args.hephaestus_adoption_diff_or_summary,
+        momus_context_isolation_status=args.momus_context_isolation_status,
+        background_expiry_status=args.background_expiry_status,
+        late_result_handling=args.late_result_handling,
+        canonical_retrieval_handle=args.canonical_retrieval_handle,
+        fallback_session_id=args.fallback_session_id,
+        requested_launcher_contract=args.requested_launcher_contract,
+        actual_launcher_used=args.actual_launcher_used,
+        missing_or_unexpressed_fields=args.missing_or_unexpressed_fields,
+        mitigation_steps_taken=args.mitigation_steps_taken,
+        audit_status=args.audit_status,
+        review_round=args.review_round,
+        attempt=args.attempt,
+        context_manifest_sha256=args.context_manifest_sha256,
+        trace_id=args.trace_id,
+        prompt_tokens=args.prompt_tokens,
+        completion_tokens=args.completion_tokens,
+        total_tokens=args.total_tokens,
+        token_cost_source=args.token_cost_source,
+        duration_ms=args.duration_ms,
+        duration_ms_source=args.duration_ms_source,
+        reviewer_sequence=args.reviewer_sequence,
+        write_task_local=bool(args.write_task_local),
+    )
+    _emit(payload, as_json=bool(args.json))
+    return 0
+
+
+def command_retrieved(args: argparse.Namespace) -> int:
+    artifact_summary = artifact_summary_value(args)
+    if not (str(args.artifact or "").strip() or str(args.artifact_path or "").strip() or artifact_summary):
+        raise SubagentLedgerError("missing_retrieved_artifact_evidence")
+    root = Path(args.root).resolve()
+    payload = append_subagent_ledger_entry(
+        root,
+        _task_dir(root, args.task_dir),
+        worker_id=args.worker,
+        subagent_id=args.subagent_id,
+        agent=args.agent,
+        lane=args.lane,
+        purpose=args.purpose,
+        status="completed",
+        artifact=args.artifact,
+        artifact_path=args.artifact_path,
+        artifact_summary=artifact_summary,
+        timestamp=args.timestamp,
+        semantic_status=args.semantic_status,
+        retry_scope=args.retry_scope,
+        required_or_optional=args.required_or_optional,
+        latest_useful_moment=args.latest_useful_moment,
+        retrieval_state="retrieval_ready",
+        merge_readiness=args.merge_readiness,
+        subdomain_id=args.subdomain_id,
+        spawned_by_worker=args.spawned_by_worker,
+        expected_unique_value=args.expected_unique_value,
+        unique_value_realized=args.unique_value_realized,
+        value_classification=args.value_classification,
+        merge_status=args.merge_status,
+        downstream_consumer=args.downstream_consumer,
+        on_critical_path=args.on_critical_path,
+        direct_path_converged_first=args.direct_path_converged_first,
+        visible_role=args.visible_role,
+        evidence_domain=args.evidence_domain,
+        allowed_sources=args.allowed_sources,
+        forbidden_sources=args.forbidden_sources,
+        source_label=args.source_label,
+        adopted_findings=args.adopted_findings,
+        rejected_findings=args.rejected_findings,
+        critical_rejected_findings=args.critical_rejected_findings,
+        rejected_finding_reason=args.rejected_finding_reason,
+        rejected_finding_direct_evidence_status=args.rejected_finding_direct_evidence_status,
+        rejected_finding_downstream_action=args.rejected_finding_downstream_action,
+        subagent_degraded=args.subagent_degraded,
+        degradation_reason=args.degradation_reason,
+        confidence_effect=args.confidence_effect,
+        parent_action_on_degradation=args.parent_action_on_degradation,
+        librarian_freshness_source=args.librarian_freshness_source,
+        librarian_freshness_checked_at=args.librarian_freshness_checked_at,
+        librarian_freshness_basis=args.librarian_freshness_basis,
+        hephaestus_draft_adoption=args.hephaestus_draft_adoption,
+        hephaestus_adoption_diff_or_summary=args.hephaestus_adoption_diff_or_summary,
+        momus_context_isolation_status=args.momus_context_isolation_status,
+        background_expiry_status=args.background_expiry_status,
+        late_result_handling=args.late_result_handling,
+        canonical_retrieval_handle=args.canonical_retrieval_handle,
+        fallback_session_id=args.fallback_session_id,
+        requested_launcher_contract=args.requested_launcher_contract,
+        actual_launcher_used=args.actual_launcher_used,
+        missing_or_unexpressed_fields=args.missing_or_unexpressed_fields,
+        mitigation_steps_taken=args.mitigation_steps_taken,
+        audit_status=args.audit_status,
+        prompt_tokens=args.prompt_tokens,
+        completion_tokens=args.completion_tokens,
+        total_tokens=args.total_tokens,
+        token_cost_source=args.token_cost_source,
+        duration_ms=args.duration_ms,
+        duration_ms_source=args.duration_ms_source,
+        write_task_local=bool(args.write_task_local),
+    )
+    _emit(payload, as_json=bool(args.json))
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    append = sub.add_parser("append", help="build or append one advisory subagent ledger row")
+    append.add_argument("--root", required=True)
+    append.add_argument("--task-dir", required=True)
+    append.add_argument("--worker", required=True)
+    append.add_argument("--subagent-id", required=True)
+    append.add_argument("--agent", required=True)
+    append.add_argument("--lane", required=True)
+    append.add_argument("--purpose", required=True)
+    _add_enum_argument(append, "--status", VALID_SUBAGENT_STATUSES, required=True)
+    append.add_argument("--artifact", default="")
+    append.add_argument("--artifact-path", default="")
+    append.add_argument(
+        "--artifact-summary-json",
+        default="",
+        help='structured JSON object, for example \'{"finding_count":2}\'',
+    )
+    append.add_argument(
+        "--artifact-summary",
+        default="",
+        help="deprecated compatibility alias for --artifact-summary-json",
+    )
+    append.add_argument(
+        "--artifact-summary-text",
+        default="",
+        help="plain human-readable text summary",
+    )
+    append.add_argument("--timestamp", default="")
+    _add_enum_argument(append, "--semantic-status", VALID_SEMANTIC_STATUSES, default="")
+    _add_enum_argument(append, "--retry-scope", VALID_RETRY_SCOPES, default="")
+    _add_enum_argument(append, "--required-or-optional", VALID_REQUIRED_OR_OPTIONAL, default="")
+    _add_enum_argument(append, "--latest-useful-moment", VALID_LATEST_USEFUL_MOMENTS, default="")
+    _add_enum_argument(append, "--retrieval-state", VALID_RETRIEVAL_STATES, default="")
+    _add_enum_argument(append, "--merge-readiness", VALID_MERGE_READINESS, default="")
+    append.add_argument("--subdomain-id", default="")
+    append.add_argument("--spawned-by-worker", default="")
+    append.add_argument("--expected-unique-value", default="")
+    append.add_argument("--unique-value-realized", default="")
+    _add_enum_argument(append, "--value-classification", VALID_VALUE_CLASSIFICATIONS, default="")
+    _add_enum_argument(append, "--merge-status", VALID_MERGE_STATUSES, default="")
+    append.add_argument("--downstream-consumer", default="")
+    append.add_argument("--on-critical-path", default="")
+    append.add_argument("--direct-path-converged-first", default="")
+    append.add_argument("--cancel-reason", default="")
+    append.add_argument("--trace-id", default="")
+    append.add_argument("--review-round", default="1")
+    append.add_argument("--attempt", default="1")
+    append.add_argument("--context-manifest-sha256", default="")
+    add_phase35_args(append)
+    append.add_argument(
+        "--reviewer-sequence",
+        default="",
+        help="comma-separated required reviewer roles; blocks downstream launches after a failed predecessor",
+    )
+    append.add_argument("--write-task-local", action="store_true", help="append to task-local subagent_ledger.jsonl")
+    append.add_argument("--json", action="store_true")
+    append.set_defaults(func=command_append)
+
+    retrieved = sub.add_parser(
+        "retrieved",
+        help="append an advisory row for background output that has been retrieved and is ready for parent use",
+    )
+    retrieved.add_argument("--root", required=True)
+    retrieved.add_argument("--task-dir", required=True)
+    retrieved.add_argument("--worker", required=True)
+    retrieved.add_argument("--subagent-id", required=True)
+    retrieved.add_argument("--agent", required=True)
+    retrieved.add_argument("--lane", required=True)
+    retrieved.add_argument("--purpose", required=True)
+    retrieved.add_argument("--artifact", default="")
+    retrieved.add_argument("--artifact-path", default="")
+    retrieved.add_argument(
+        "--artifact-summary-json",
+        default="",
+        help='structured JSON object, for example \'{"finding_count":2}\'',
+    )
+    retrieved.add_argument(
+        "--artifact-summary",
+        default="",
+        help="deprecated compatibility alias for --artifact-summary-json",
+    )
+    retrieved.add_argument(
+        "--artifact-summary-text",
+        default="",
+        help="plain human-readable text summary",
+    )
+    retrieved.add_argument("--timestamp", default="")
+    _add_enum_argument(retrieved, "--semantic-status", VALID_SEMANTIC_STATUSES, default="")
+    _add_enum_argument(retrieved, "--retry-scope", VALID_RETRY_SCOPES, default="")
+    _add_enum_argument(retrieved, "--required-or-optional", VALID_REQUIRED_OR_OPTIONAL, default="optional")
+    _add_enum_argument(retrieved, "--latest-useful-moment", VALID_LATEST_USEFUL_MOMENTS, default="advisory_only")
+    _add_enum_argument(retrieved, "--merge-readiness", VALID_MERGE_READINESS, default="not_merged")
+    retrieved.add_argument("--subdomain-id", default="")
+    retrieved.add_argument("--spawned-by-worker", default="")
+    retrieved.add_argument("--expected-unique-value", default="")
+    retrieved.add_argument("--unique-value-realized", default="")
+    _add_enum_argument(retrieved, "--value-classification", VALID_VALUE_CLASSIFICATIONS, default="")
+    _add_enum_argument(retrieved, "--merge-status", VALID_MERGE_STATUSES, default="retrieved_but_not_merged")
+    retrieved.add_argument("--downstream-consumer", default="")
+    retrieved.add_argument("--on-critical-path", default="")
+    retrieved.add_argument("--direct-path-converged-first", default="")
+    add_phase35_args(retrieved)
+    retrieved.add_argument("--write-task-local", action="store_true", help="append to task-local subagent_ledger.jsonl")
+    retrieved.add_argument("--json", action="store_true")
+    retrieved.set_defaults(func=command_retrieved)
+    return parser
+
+
+def add_phase35_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--visible-role", default="")
+    parser.add_argument("--evidence-domain", default="")
+    parser.add_argument("--allowed-source", action="append", dest="allowed_sources", default=[])
+    parser.add_argument("--forbidden-source", action="append", dest="forbidden_sources", default=[])
+    _add_enum_argument(parser, "--source-label", VALID_SOURCE_LABELS, default="")
+    parser.add_argument("--adopted-finding", action="append", dest="adopted_findings", default=[])
+    parser.add_argument("--rejected-finding", action="append", dest="rejected_findings", default=[])
+    parser.add_argument("--critical-rejected-finding", action="append", dest="critical_rejected_findings", default=[])
+    parser.add_argument("--rejected-finding-reason", default="")
+    parser.add_argument("--rejected-finding-direct-evidence-status", default="")
+    parser.add_argument("--rejected-finding-downstream-action", default="")
+    parser.add_argument("--subagent-degraded", default="")
+    parser.add_argument("--degradation-reason", default="")
+    parser.add_argument("--confidence-effect", default="")
+    _add_enum_argument(
+        parser,
+        "--parent-action-on-degradation",
+        VALID_PARENT_ACTIONS_ON_DEGRADATION,
+        default="",
+    )
+    parser.add_argument("--librarian-freshness-source", default="")
+    parser.add_argument("--librarian-freshness-checked-at", default="")
+    parser.add_argument("--librarian-freshness-basis", default="")
+    _add_enum_argument(parser, "--hephaestus-draft-adoption", VALID_HEPHAESTUS_DRAFT_ADOPTIONS, default="")
+    parser.add_argument("--hephaestus-adoption-diff-or-summary", default="")
+    _add_enum_argument(
+        parser,
+        "--momus-context-isolation-status",
+        VALID_MOMUS_CONTEXT_ISOLATION_STATUSES,
+        default="",
+    )
+    _add_enum_argument(parser, "--background-expiry-status", VALID_BACKGROUND_EXPIRY_STATUSES, default="")
+    parser.add_argument("--late-result-handling", default="")
+    parser.add_argument("--canonical-retrieval-handle", default="")
+    parser.add_argument("--fallback-session-id", default="")
+    parser.add_argument("--requested-launcher-contract", default="")
+    parser.add_argument("--actual-launcher-used", default="")
+    parser.add_argument("--missing-or-unexpressed-field", action="append", dest="missing_or_unexpressed_fields", default=[])
+    parser.add_argument("--mitigation-step-taken", action="append", dest="mitigation_steps_taken", default=[])
+    parser.add_argument("--audit-status", default="")
+    parser.add_argument("--prompt-tokens", default="")
+    parser.add_argument("--completion-tokens", default="")
+    parser.add_argument("--total-tokens", default="")
+    parser.add_argument("--token-cost-source", default="")
+    parser.add_argument("--duration-ms", default="")
+    parser.add_argument("--duration-ms-source", default="")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return int(args.func(args))
+    except SubagentLedgerError as exc:
+        print(f"subagent_ledger_error: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

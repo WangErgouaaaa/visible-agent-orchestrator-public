@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/visible-agent-orchestrator/live-enable.schema.json",
+  "title": "Worker backend live enable gate",
+  "type": "object",
+  "required": ["schema_version", "backends"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "backends": {
+      "type": "object",
+      "properties": {
+        "claude_code": { "$ref": "#/$defs/backend_gate" },
+        "cursor_agent": { "$ref": "#/$defs/backend_gate" },
+        "opencode_tui": { "$ref": "#/$defs/backend_gate" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "$defs": {
+    "backend_gate": {
+      "type": "object",
+      "required": [
+        "backend_kind",
+        "live_enabled",
+        "supports_live_submit_required",
+        "allow_user_owned_pane",
+        "require_preflight_ok",
+        "require_no_active_locks",
+        "require_business_index_unchanged",
+        "require_single_worker_only",
+        "allow_mixed_worker"
+      ],
+      "properties": {
+        "backend_kind": { "type": "string" },
+        "live_enabled": { "type": "boolean" },
+        "supports_live_submit_required": { "type": "boolean" },
+        "enabled_by": { "type": "string" },
+        "enabled_at": { "type": "string" },
+        "user_authorization_record": { "type": "string" },
+        "allowed_workspace_roots": { "type": "array", "items": { "type": "string" } },
+        "allowed_runtime_substrates": { "type": "array", "items": { "type": "string" } },
+        "allowed_worker_ids": { "type": "array", "items": { "type": "string" } },
+        "allow_user_owned_pane": { "type": "boolean" },
+        "require_preflight_ok": { "type": "boolean" },
+        "require_no_active_locks": { "type": "boolean" },
+        "require_business_index_unchanged": { "type": "boolean" },
+        "require_single_worker_only": { "type": "boolean" },
+        "allow_mixed_worker": { "type": "boolean" },
+        "notes": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": false
+    }
+  }
+}

@@ -1,0 +1,163 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://visible-agent-orchestrator.local/worker-backends/registration-evidence-package.schema.json",
+  "title": "Registration Evidence Package",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version",
+    "package_id",
+    "generated_at",
+    "generated_by",
+    "backend_kind",
+    "worker_id",
+    "worker_label",
+    "workspace_root",
+    "runtime_backend",
+    "runtime_binding_kind",
+    "pane_id",
+    "process_id",
+    "port",
+    "user_owned_pane",
+    "expected_business_index_files",
+    "authorization_record",
+    "authorization_validation",
+    "live_enable_config",
+    "config_path_evidence",
+    "live_enable_decision",
+    "preflight_evidence",
+    "dry_run_registration_plan",
+    "capability_evidence",
+    "workspace_evidence",
+    "runtime_binding_evidence",
+    "business_index_evidence",
+    "mixed_worker_evidence",
+    "forbidden_action_evidence",
+    "overall_package_ok",
+    "ready_for_live_enable",
+    "ready_for_registration",
+    "ready_for_single_worker_smoke",
+    "live_submit_allowed",
+    "registration_allowed",
+    "would_write_registry",
+    "would_write_state",
+    "blocked_reasons",
+    "warnings",
+    "safe_next_actions",
+    "forbidden_next_actions",
+    "required_next_evidence",
+    "unresolved_issues"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "package_id": { "type": "string", "minLength": 1 },
+    "generated_at": { "type": "string", "minLength": 1 },
+    "generated_by": { "type": "string", "minLength": 1 },
+    "backend_kind": { "enum": ["claude_code", "cursor_agent", "opencode_tui"] },
+    "worker_id": { "type": "string" },
+    "worker_label": { "type": "string" },
+    "workspace_root": { "type": "string" },
+    "runtime_backend": { "type": "string" },
+    "runtime_binding_kind": { "type": "string" },
+    "pane_id": { "type": "string" },
+    "process_id": { "type": "string" },
+    "port": { "type": "string" },
+    "user_owned_pane": { "type": "boolean" },
+    "expected_business_index_files": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "authorization_record": { "type": "object" },
+    "authorization_validation": { "type": "object" },
+    "live_enable_config": { "type": "object" },
+    "config_path_evidence": {
+      "type": "object",
+      "required": [
+        "config_path",
+        "config_source",
+        "config_found",
+        "config_missing",
+        "fallback_used",
+        "fail_closed_due_to_missing_config"
+      ],
+      "properties": {
+        "config_path": { "type": "string" },
+        "config_source": { "type": "string" },
+        "config_found": { "type": "boolean" },
+        "config_missing": { "type": "boolean" },
+        "fallback_used": { "type": "boolean" },
+        "fail_closed_due_to_missing_config": { "type": "boolean" },
+        "candidates": {
+          "type": "array",
+          "items": { "type": "object" }
+        },
+        "warnings": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "additionalProperties": true
+    },
+    "live_enable_decision": { "type": "object" },
+    "preflight_evidence": { "type": "object" },
+    "dry_run_registration_plan": { "type": "object" },
+    "capability_evidence": { "type": "object" },
+    "workspace_evidence": { "type": "object" },
+    "runtime_binding_evidence": { "type": "object" },
+    "business_index_evidence": { "type": "object" },
+    "mixed_worker_evidence": { "type": "object" },
+    "forbidden_action_evidence": { "type": "object" },
+    "overall_package_ok": { "type": "boolean" },
+    "ready_for_live_enable": { "type": "boolean" },
+    "ready_for_registration": { "type": "boolean" },
+    "ready_for_single_worker_smoke": { "type": "boolean" },
+    "live_submit_allowed": { "type": "boolean" },
+    "registration_allowed": { "type": "boolean" },
+    "would_write_registry": { "type": "boolean" },
+    "would_write_state": { "type": "boolean" },
+    "blocked_reasons": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "warnings": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "safe_next_actions": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "forbidden_next_actions": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "required_next_evidence": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "unresolved_issues": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "backend_kind": { "enum": ["claude_code", "cursor_agent"] }
+        }
+      },
+      "then": {
+        "properties": {
+          "ready_for_live_enable": { "const": false },
+          "ready_for_registration": { "const": false },
+          "ready_for_single_worker_smoke": { "const": false },
+          "live_submit_allowed": { "const": false },
+          "registration_allowed": { "const": false },
+          "would_write_registry": { "const": false },
+          "would_write_state": { "const": false }
+        }
+      }
+    }
+  ]
+}

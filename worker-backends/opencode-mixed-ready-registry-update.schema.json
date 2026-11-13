@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/omx/opencode-mixed-ready-registry-update.schema.json",
+  "title": "OpenCodeMixedReadyRegistryUpdate",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "update_kind",
+    "worker_id",
+    "registry_path",
+    "evidence_path",
+    "evidence_validation",
+    "changed_fields",
+    "business_ready_after",
+    "allow_business_repo_writes_after",
+    "mixed_ready_scope",
+    "allowed_mixed_task_kinds",
+    "would_write_registry",
+    "would_execute_live",
+    "blocked_reasons",
+    "warnings",
+    "evidence"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "update_kind": { "const": "opencode-mixed-ready-registry-update" },
+    "backend_kind": { "const": "opencode_tui" },
+    "worker_id": { "type": "string", "minLength": 1 },
+    "registry_path": { "type": "string", "minLength": 1 },
+    "evidence_path": { "type": "string", "minLength": 1 },
+    "evidence_validation": { "type": "object" },
+    "changed_fields": { "type": "array", "items": { "type": "string" } },
+    "business_ready_after": { "const": false },
+    "allow_business_repo_writes_after": { "const": false },
+    "mixed_ready_scope": { "const": "sandbox_noop_only" },
+    "allowed_mixed_task_kinds": {
+      "type": "array",
+      "prefixItems": [
+        { "const": "mixed_noop_sandbox" },
+        { "const": "mixed_terminal_protocol_smoke" }
+      ],
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "would_write_registry": { "type": "boolean" },
+    "would_execute_live": { "const": false },
+    "would_run_one": { "const": false },
+    "blocked_reasons": { "type": "array", "items": { "type": "string" } },
+    "warnings": { "type": "array", "items": { "type": "string" } },
+    "evidence": { "type": "array" }
+  }
+}

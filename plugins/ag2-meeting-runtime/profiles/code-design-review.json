@@ -1,0 +1,11 @@
+{
+  "name": "code-design-review",
+  "preset": "code-design-review",
+  "max_rounds": 4,
+  "allow_dry_run_proposal": false,
+  "allowed_workers": [],
+  "audit_level": "strict",
+  "timeout_seconds": 120,
+  "max_cost_usd": 0.08,
+  "empty_response_retries": 1
+}

@@ -1,0 +1,1389 @@
+#!/usr/bin/env python3
+"""Generate no-live meeting artifacts for advisory orchestration planning."""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import hashlib
+import json
+import os
+import sys
+import uuid
+from pathlib import Path
+
+_THIS_FILE = Path(__file__).resolve()
+for _p in ((_THIS_FILE.parent.parent / "src").resolve(), (_THIS_FILE.parent.parent / "lib").resolve()):
+    if _p.exists() and str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
+
+from visible_agent_orchestrator.meeting import (
+    Ag2OptionalImportGate,
+    BUILTIN_SELECTOR_POLICIES,
+    BUILTIN_TERMINATION_CONDITIONS,
+    MEETING_PRESET_NAMES,
+    MeetingParticipant,
+    MeetingRunner,
+    MeetingSpec,
+    MockAg2RuntimeAdapter,
+    RealAg2RuntimeAdapter,
+    WorkerReportReference,
+    attach_proposed_action,
+    build_ag2_host_local_config_contract,
+    build_ag2_host_local_adapter_plan,
+    build_ag2_human_approval_artifact,
+    build_ag2_effective_runtime_boundary_contract,
+    build_ag2_meeting_layer_contract_summary,
+    build_ag2_real_runtime_dependency_decision,
+    build_ag2_real_runtime_release_gate,
+    build_ag2_real_runtime_policy_artifact,
+    build_ag2_real_runtime_preflight,
+    build_ag2_release_readiness,
+    build_ag2_runtime_import_policy,
+    build_control_plane_dry_run_proposed_action_payload,
+    build_control_plane_dry_run_from_result_payload,
+    resolve_builtin_termination_condition,
+    resolve_meeting_preset,
+    load_ag2_host_local_runtime_config,
+    validate_ag2_effective_approval_payload,
+    validate_ag2_host_local_config_reference,
+    validate_ag2_human_approval_payload,
+    validate_ag2_live_smoke_evidence_payload,
+    validate_ag2_release_proof_bundle_payload,
+    write_meeting_artifacts,
+    build_leader_mediated_worker_group_review,
+    build_shared_worker_transcript,
+    write_leader_mediated_worker_group_review_artifacts,
+    write_shared_worker_transcript_artifacts,
+)
+from visible_agent_orchestrator.runtime_paths import workspace_root
+from visible_agent_orchestrator.subagent_ledger import (
+    SubagentLedgerError,
+    resolve_visible_task_scope,
+)
+
+
+def parse_participant(value: str) -> MeetingParticipant:
+    parts = value.split(":", 2)
+    if len(parts) != 3 or not all(part.strip() for part in parts):
+        raise argparse.ArgumentTypeError("--participant must use name:role:goal")
+    name, role, goal = (part.strip() for part in parts)
+    return MeetingParticipant(name=name, role=role, goal=goal)
+
+
+def command_run(args: argparse.Namespace) -> int:
+    root = workspace_root(args.root)
+    thread_id = args.thread_id or f"meeting-{uuid.uuid4().hex[:12]}"
+    spec = MeetingSpec(task=args.task, participants=list(args.participant), max_rounds=args.max_rounds, policy=args.policy)
+    termination_condition = (
+        resolve_builtin_termination_condition(args.termination_condition) if args.termination_condition else None
+    )
+    result = MeetingRunner(termination_condition=termination_condition).run(spec)
+    try:
+        proposed_action = build_optional_control_plane_dry_run_proposal(args)
+        ag2_human_approval_validation = load_optional_validation_evidence(args.ag2_approval_evidence_json)
+        ag2_host_local_config_reference_validation = load_optional_validation_evidence(
+            args.ag2_host_local_config_reference_evidence_json
+        )
+        if proposed_action is not None:
+            result = attach_proposed_action(result, proposed_action)
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        print(f"omx_meeting_plan: error: {exc}", file=sys.stderr)
+        return 2
+    artifact_root = root / ".omx" / "framework" / "team" / "meeting-prototypes"
+    paths = write_meeting_artifacts(
+        artifact_root,
+        thread_id,
+        result,
+        ag2_human_approval_validation=ag2_human_approval_validation,
+        ag2_host_local_config_reference_validation=ag2_host_local_config_reference_validation,
+    )
+    payload = {
+        "ok": True,
+        "thread_id": thread_id,
+        "would_execute_live": False,
+        "policy": args.policy,
+        "termination_condition": args.termination_condition,
+        "artifacts": {
+            "result_json": str(paths.result_json),
+            "synthesis_json": str(paths.synthesis_json),
+            "audit_json": str(paths.audit_json),
+            "transcript_md": str(paths.transcript_md),
+        },
+        "result": result.to_dict(),
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        print(f"thread_id: {thread_id}")
+        print("would_execute_live: false")
+        print(f"result_json: {paths.result_json}")
+        print(f"synthesis_json: {paths.synthesis_json}")
+        print(f"audit_json: {paths.audit_json}")
+        print(f"transcript_md: {paths.transcript_md}")
+    return 0
+
+
+def command_ag2_run(args: argparse.Namespace) -> int:
+    root = workspace_root(args.root)
+    thread_id = args.thread_id or f"ag2-meeting-{uuid.uuid4().hex[:12]}"
+    runtime_config = None
+    try:
+        if args.runtime == "real" and args.real_runtime_mode == "live" and not args.allow_real_model_call:
+            raise ValueError("--allow-real-model-call is required for live AG2 runtime mode")
+        preset = resolve_meeting_preset(args.preset)
+        max_rounds = args.max_rounds if args.max_rounds is not None else None
+        spec = preset.to_spec(task=args.task, max_rounds=max_rounds)
+        termination_condition = resolve_builtin_termination_condition(preset.termination_condition)
+        if args.runtime == "mock":
+            adapter_result = MockAg2RuntimeAdapter(termination_condition=termination_condition).run(spec)
+        else:
+            approval_validation = load_effective_approval_validation(args.ag2_effective_approval_json)
+            runtime_config = load_ag2_host_local_runtime_config(
+                args.ag2_runtime_config_json,
+                repo_root=_repo_root(),
+                runtime_root=workspace_root(args.root),
+            )
+            adapter_result = RealAg2RuntimeAdapter(
+                approval_validation=approval_validation,
+                runtime_config=runtime_config,
+                runtime_mode=args.real_runtime_mode,
+                allow_model_call=args.allow_real_model_call,
+                termination_condition=termination_condition,
+            ).run(spec)
+        proposed_action = build_optional_control_plane_dry_run_proposal(args)
+        result = adapter_result.result
+        if proposed_action is not None:
+            result = attach_proposed_action(result, proposed_action)
+    except ValueError as exc:
+        print(f"omx_meeting_plan: error: {exc}", file=sys.stderr)
+        return 2
+
+    artifact_root = root / ".omx" / "framework" / "team" / "meeting-prototypes"
+    paths = write_meeting_artifacts(artifact_root, thread_id, result)
+    board_provenance_path = paths.result_json.parent / "meeting-board-provenance.json"
+    board_provenance_path.write_text(
+        json.dumps(_ag2_board_provenance(args, adapter_result), indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    live_smoke_evidence = None
+    live_smoke_evidence_validation = None
+    if args.runtime == "real" and args.real_runtime_mode == "live":
+        if runtime_config is None:
+            print("omx_meeting_plan: error: live runtime config was not loaded", file=sys.stderr)
+            return 2
+        live_smoke_evidence = build_live_smoke_evidence_payload(
+            adapter_result=adapter_result,
+            runtime_config=runtime_config,
+        )
+        live_smoke_evidence_validation = validate_ag2_live_smoke_evidence_payload(live_smoke_evidence)
+    payload = {
+        "ok": True,
+        "command": "ag2-run",
+        "thread_id": thread_id,
+        "runtime": args.runtime,
+        "real_runtime_mode": args.real_runtime_mode if args.runtime == "real" else "",
+        "preset": preset.name,
+        "would_execute_live": adapter_result.would_execute_live,
+        "adapter": adapter_result.to_payload(),
+        "preset_contract": preset.to_payload(),
+        "artifacts": {
+            "result_json": str(paths.result_json),
+            "synthesis_json": str(paths.synthesis_json),
+            "audit_json": str(paths.audit_json),
+            "transcript_md": str(paths.transcript_md),
+            "board_provenance_json": str(board_provenance_path),
+        },
+        "result": result.to_dict(),
+    }
+    if live_smoke_evidence is not None:
+        payload["live_smoke_evidence"] = live_smoke_evidence
+        payload["live_smoke_evidence_validation"] = live_smoke_evidence_validation
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        print("command: ag2-run")
+        print(f"thread_id: {thread_id}")
+        print(f"runtime: {args.runtime}")
+        if args.runtime == "real":
+            print(f"real_runtime_mode: {args.real_runtime_mode}")
+        print(f"preset: {preset.name}")
+        print(f"would_execute_live: {str(adapter_result.would_execute_live).lower()}")
+        print(f"result_json: {paths.result_json}")
+        print(f"synthesis_json: {paths.synthesis_json}")
+        print(f"audit_json: {paths.audit_json}")
+        print(f"transcript_md: {paths.transcript_md}")
+        print(f"board_provenance_json: {board_provenance_path}")
+    return 0
+
+
+def _ag2_board_provenance(args: argparse.Namespace, adapter_result) -> dict[str, object]:
+    worker_id = _visible_worker_id_from_env()
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "artifact_kind": "meeting_board_provenance",
+        "runtime": args.runtime,
+        "real_runtime_mode": args.real_runtime_mode if args.runtime == "real" else "",
+        "adapter_kind": adapter_result.adapter_kind,
+        "would_execute_live": adapter_result.would_execute_live,
+    }
+    if worker_id:
+        payload["worker_id"] = worker_id
+    payload.update(_visible_task_scope_from_env())
+    return payload
+
+
+def _visible_worker_id_from_env() -> str:
+    return os.environ.get("OMX_VISIBLE_WORKER_ID", "").strip()
+
+
+def _visible_task_scope_from_env() -> dict[str, str]:
+    result: dict[str, str] = {}
+    for name in ("OMX_VISIBLE_RUN_ID", "OMX_VISIBLE_RUN", "VISIBLE_RUN_ID", "VISIBLE_RUN"):
+        value = os.environ.get(name, "").strip()
+        if value:
+            result["run"] = value
+            break
+    for name in ("OMX_VISIBLE_TASK_ID", "OMX_VISIBLE_TASK", "VISIBLE_TASK_ID", "VISIBLE_TASK"):
+        value = os.environ.get(name, "").strip()
+        if value:
+            result["task_id"] = value
+            break
+    return result
+
+
+def build_optional_control_plane_dry_run_proposal(args: argparse.Namespace) -> dict[str, object] | None:
+    workers = list(args.propose_control_plane_dry_run_worker or [])
+    title = args.propose_control_plane_dry_run_title
+    body = args.propose_control_plane_dry_run_body
+    requested = bool(workers or title or body)
+    if not requested:
+        return None
+    if not workers:
+        raise ValueError("proposed action workers are required")
+    if not title:
+        raise ValueError("proposed action title is required")
+    if not body:
+        raise ValueError("proposed action body is required")
+    return build_control_plane_dry_run_proposed_action_payload(
+        workers=workers,
+        title=title,
+        body=body,
+        timeout=args.propose_control_plane_dry_run_timeout,
+    )
+
+
+def load_optional_validation_evidence(path_value: str) -> dict[str, object] | None:
+    if not path_value:
+        return None
+    payload = json.loads(Path(path_value).resolve().read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("AG2 validation evidence JSON must contain an object")
+    evidence = payload.get("validation", payload)
+    if not isinstance(evidence, dict):
+        raise ValueError("AG2 validation evidence JSON validation field must contain an object")
+    return evidence
+
+
+def load_effective_approval_validation(path_value: str) -> dict[str, object]:
+    if not path_value:
+        raise ValueError("AG2 real runtime requires --ag2-effective-approval-json")
+    payload = json.loads(Path(path_value).resolve().read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("AG2 effective approval JSON must contain an object")
+    evidence = payload.get("validation", payload)
+    if not isinstance(evidence, dict):
+        raise ValueError("AG2 effective approval JSON validation field must contain an object")
+    if evidence.get("validation_kind") == "ag2_effective_approval_payload_validation":
+        normalized_payload = evidence.get("normalized_payload")
+        if not isinstance(normalized_payload, dict):
+            raise ValueError(
+                "AG2 effective approval validation normalized_payload must contain an object"
+            )
+        validation = validate_ag2_effective_approval_payload(normalized_payload)
+        if not validation.get("valid") or not validation.get("approval_effective"):
+            raise ValueError("AG2 effective approval validation is not effective")
+        return validation
+    return validate_ag2_effective_approval_payload(evidence)
+
+
+def load_live_smoke_evidence_validation(path_value: str) -> dict[str, object] | None:
+    if not path_value:
+        return None
+    payload = json.loads(Path(path_value).resolve().read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("AG2 live smoke evidence JSON must contain an object")
+    evidence = payload.get("validation", payload)
+    if not isinstance(evidence, dict):
+        raise ValueError("AG2 live smoke evidence JSON validation field must contain an object")
+    if evidence.get("validation_kind") == "ag2_live_smoke_evidence_validation":
+        normalized_payload = evidence.get("normalized_payload")
+        if not isinstance(normalized_payload, dict):
+            raise ValueError(
+                "AG2 live smoke evidence validation normalized_payload must contain an object"
+            )
+        validation = validate_ag2_live_smoke_evidence_payload(normalized_payload)
+        if not validation.get("valid") or not validation.get("release_eligible"):
+            raise ValueError("AG2 live smoke evidence validation is not release eligible")
+        return validation
+    return validate_ag2_live_smoke_evidence_payload(evidence)
+
+
+def load_release_proof_bundle_validation(path_value: str) -> dict[str, object] | None:
+    if not path_value:
+        return None
+    payload = json.loads(Path(path_value).resolve().read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("AG2 release proof bundle JSON must contain an object")
+    proof = payload.get("validation", payload)
+    if not isinstance(proof, dict):
+        raise ValueError("AG2 release proof bundle JSON validation field must contain an object")
+    if proof.get("validation_kind") == "ag2_release_proof_bundle_validation":
+        normalized_payload = proof.get("normalized_payload")
+        if not isinstance(normalized_payload, dict):
+            raise ValueError(
+                "AG2 release proof bundle validation normalized_payload must contain an object"
+            )
+        validation = validate_ag2_release_proof_bundle_payload(normalized_payload)
+        if not validation.get("valid") or not validation.get("release_eligible"):
+            raise ValueError("AG2 release proof bundle validation is not release eligible")
+        return validation
+    return validate_ag2_release_proof_bundle_payload(proof)
+
+
+
+
+def load_required_json_object(path_value: str, *, label: str) -> dict[str, object]:
+    payload = json.loads(Path(path_value).resolve().read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"{label} must be a JSON object")
+    return payload
+
+
+def load_jsonl_objects(path: Path) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for index, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        if not isinstance(row, dict):
+            raise ValueError(f"{path.name} line {index} must be a JSON object")
+        rows.append(row)
+    return rows
+
+
+
+
+
+
+def build_live_smoke_evidence_payload(*, adapter_result, runtime_config) -> dict[str, object]:
+    endpoint_kind = (
+        "local_http_dry_run"
+        if runtime_config.base_url.startswith(("http://127.0.0.1", "http://localhost"))
+        else "external_provider"
+    )
+    result = adapter_result.result
+    return {
+        "schema_version": 1,
+        "evidence_kind": "ag2_live_model_smoke_evidence",
+        "smoke_state": "passed",
+        "provider_endpoint_kind": endpoint_kind,
+        "runtime_mode": "live",
+        "meeting_artifacts_only": True,
+        "report_or_marker_writes": False,
+        "worker_lock_writes": False,
+        "live_worker_dispatch": False,
+        "v4_pro_used": False,
+        "secret_values_recorded": False,
+        "provider_values_recorded": False,
+        "redaction_proof": "metadata excludes model endpoint credential env and secret values",
+        "cost_timeout_proof": (
+            f"timeout_seconds={runtime_config.timeout_seconds} "
+            f"max_cost_usd={runtime_config.max_cost_usd:g}"
+        ),
+        "artifact_paths": [
+            "meeting-result.json",
+            "meeting-synthesis.json",
+            "meeting-audit.json",
+            "transcript.md",
+        ],
+        "result_summary": {
+            "message_count": len(result.messages),
+            "termination_reason": result.termination_reason,
+            "verdict": result.verdict,
+        },
+    }
+
+
+def _repo_root() -> Path:
+    return _THIS_FILE.parent.parent.resolve()
+
+
+def _meeting_safety_source_files() -> list[Path]:
+    repo_root = _repo_root()
+    meeting_root = repo_root / "src" / "visible_agent_orchestrator" / "meeting"
+    files = sorted(meeting_root.glob("*.py")) + [_THIS_FILE]
+    wrapper = _THIS_FILE.parent / "omx_ag2_meeting"
+    if wrapper.exists():
+        files.append(wrapper)
+    return files
+
+
+def _relative_path(path: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(_repo_root()))
+    except ValueError:
+        return str(path.resolve())
+
+
+def _parse_python_source(path: Path) -> tuple[ast.Module | None, list[dict[str, object]]]:
+    try:
+        source = path.read_text(encoding="utf-8")
+        return ast.parse(source, filename=str(path)), []
+    except (OSError, SyntaxError) as exc:
+        return None, [{"path": _relative_path(path), "line": 0, "detail": str(exc)}]
+
+
+def _check_no_ag2_or_autogen_imports(files: list[Path]) -> dict[str, object]:
+    violations: list[dict[str, object]] = []
+    for path in files:
+        tree, parse_errors = _parse_python_source(path)
+        violations.extend(parse_errors)
+        if tree is None:
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    root_name = alias.name.split(".", 1)[0]
+                    if root_name in {"ag2", "autogen"}:
+                        violations.append(
+                            {"path": _relative_path(path), "line": node.lineno, "detail": f"imports {alias.name}"}
+                        )
+            elif isinstance(node, ast.ImportFrom):
+                root_name = (node.module or "").split(".", 1)[0]
+                if root_name in {"ag2", "autogen"}:
+                    violations.append(
+                        {"path": _relative_path(path), "line": node.lineno, "detail": f"imports from {node.module}"}
+                    )
+    return {"ok": not violations, "violations": violations}
+
+
+def _check_no_dynamic_execution_surfaces(files: list[Path]) -> dict[str, object]:
+    violations: list[dict[str, object]] = []
+    for path in files:
+        tree, parse_errors = _parse_python_source(path)
+        violations.extend(parse_errors)
+        if tree is None:
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in {
+                "eval",
+                "exec",
+                "__import__",
+            }:
+                violations.append(
+                    {
+                        "path": _relative_path(path),
+                        "line": node.lineno,
+                        "detail": f"dynamic call {node.func.id}",
+                    }
+                )
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name.split(".", 1)[0] == "importlib":
+                        violations.append(
+                            {
+                                "path": _relative_path(path),
+                                "line": node.lineno,
+                                "detail": f"imports {alias.name}",
+                            }
+                        )
+            elif isinstance(node, ast.ImportFrom):
+                if (node.module or "").split(".", 1)[0] == "importlib":
+                    violations.append(
+                        {
+                            "path": _relative_path(path),
+                            "line": node.lineno,
+                            "detail": f"imports from {node.module}",
+                        }
+                    )
+    return {"ok": not violations, "violations": violations}
+
+
+def _check_no_effect_true_flags(files: list[Path]) -> dict[str, object]:
+    effect_names = set(build_ag2_meeting_layer_contract_summary()["effect_flags"])
+    violations: list[dict[str, object]] = []
+
+    def target_name(target: ast.AST) -> str:
+        if isinstance(target, ast.Name):
+            return target.id
+        if isinstance(target, ast.Attribute):
+            return target.attr
+        if isinstance(target, ast.Subscript) and isinstance(target.slice, ast.Constant):
+            return str(target.slice.value)
+        return ""
+
+    def is_true(value: ast.AST) -> bool:
+        return isinstance(value, ast.Constant) and value.value is True
+
+    for path in files:
+        tree, parse_errors = _parse_python_source(path)
+        violations.extend(parse_errors)
+        if tree is None:
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and is_true(node.value):
+                for target in node.targets:
+                    name = target_name(target)
+                    if name in effect_names:
+                        violations.append(
+                            {"path": _relative_path(path), "line": node.lineno, "detail": f"{name} set true"}
+                        )
+            elif isinstance(node, ast.AnnAssign) and node.value is not None and is_true(node.value):
+                name = target_name(node.target)
+                if name in effect_names:
+                    violations.append(
+                        {"path": _relative_path(path), "line": node.lineno, "detail": f"{name} set true"}
+                    )
+            elif isinstance(node, ast.keyword) and node.arg in effect_names and is_true(node.value):
+                violations.append(
+                    {"path": _relative_path(path), "line": node.lineno, "detail": f"{node.arg} set true"}
+                )
+            elif isinstance(node, ast.Dict):
+                for key, value in zip(node.keys, node.values):
+                    if isinstance(key, ast.Constant) and str(key.value) in effect_names and is_true(value):
+                        violations.append(
+                            {
+                                "path": _relative_path(path),
+                                "line": node.lineno,
+                                "detail": f"{key.value} set true",
+                            }
+                        )
+    return {"ok": not violations, "violations": violations}
+
+
+def _check_multi_agent_questions_markdown_only(root: Path) -> dict[str, object]:
+    question_root = root / "multi-agent_questions"
+    if not question_root.exists():
+        return {"ok": True, "violations": []}
+    violations = [
+        {"path": path.relative_to(root).as_posix(), "line": 0, "detail": "non-markdown file"}
+        for path in sorted(question_root.iterdir())
+        if path.is_file() and path.suffix != ".md"
+    ]
+    return {"ok": not violations, "violations": violations}
+
+
+def _check_ag2_two_layer_prompt_boundaries() -> dict[str, object]:
+    repo_root = _repo_root()
+    requirements = {
+        repo_root / "plugins" / "visible-agent-orchestrator-skill-v0" / "prompt-snippets" / "leader-dispatch-snippet.md": [
+            "Leader-Mediated Worker Group Chat",
+            "Do not send host-local AG2 approval/runtime JSON",
+            "visible control plane",
+        ],
+        repo_root / "plugins" / "visible-agent-orchestrator-skill-v0" / "prompt-snippets" / "worker-contract-snippet.md": [
+            "Worker-Internal Group Chat",
+            "must not dispatch other visible workers",
+            "host-local approval/runtime JSON",
+        ],
+        repo_root / ".agents" / "skills" / "ag2-meeting" / "SKILL.md": [
+            "Worker-Internal Group Chat",
+            "must not treat this skill as a visible-worker dispatcher",
+            "must not receive host-local approval/runtime JSON paths",
+        ],
+        repo_root / "plugins" / "ag2-meeting-runtime" / "skills" / "ag2-meeting" / "SKILL.md": [
+            "Worker-Internal Group Chat",
+            "must not treat this skill as a visible-worker dispatcher",
+            "must not receive host-local approval/runtime JSON paths",
+        ],
+    }
+    violations: list[dict[str, object]] = []
+    for path, required_tokens in requirements.items():
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            violations.append({"path": _relative_path(path), "line": 0, "detail": str(exc)})
+            continue
+        for token in required_tokens:
+            if token not in text:
+                violations.append(
+                    {
+                        "path": _relative_path(path),
+                        "line": 0,
+                        "detail": f"missing required boundary text: {token}",
+                    }
+                )
+    return {
+        "ok": not violations,
+        "source_files": [_relative_path(path) for path in requirements],
+        "violations": violations,
+    }
+
+
+
+
+def build_meeting_safety_check_payload(root: Path | None = None) -> dict[str, object]:
+    check_root = root if root is not None else _repo_root()
+    files = _meeting_safety_source_files()
+    checks = {
+        "ag2_two_layer_prompt_boundaries": _check_ag2_two_layer_prompt_boundaries(),
+        "no_ag2_or_autogen_imports": _check_no_ag2_or_autogen_imports(files),
+        "no_dynamic_execution_surfaces": _check_no_dynamic_execution_surfaces(files),
+        "no_effect_true_flags": _check_no_effect_true_flags(files),
+        "multi_agent_questions_markdown_only": _check_multi_agent_questions_markdown_only(check_root),
+    }
+    return {
+        "ok": all(bool(check["ok"]) for check in checks.values()),
+        "source_files": [_relative_path(path) for path in files],
+        "checks": checks,
+    }
+
+
+def command_bridge_dry_run(args: argparse.Namespace) -> int:
+    root = workspace_root(args.root)
+    result_json = Path(args.result_json).resolve()
+    try:
+        result_payload = json.loads(result_json.read_text(encoding="utf-8"))
+        if not isinstance(result_payload, dict):
+            raise ValueError("meeting result artifact must contain a JSON object")
+        bridge = build_control_plane_dry_run_from_result_payload(
+            root=root,
+            result_payload=result_payload,
+            action_index=args.action_index,
+        )
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        print(f"omx_meeting_plan: error: {exc}", file=sys.stderr)
+        return 2
+
+    payload = {
+        "ok": True,
+        "would_execute_live": False,
+        "dry_run": True,
+        "result_json": str(result_json),
+        "action_index": args.action_index if args.action_index is not None else 0,
+        "bridge": bridge.to_dict(),
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        print("would_execute_live: false")
+        print("dry_run: true")
+        print(f"result_json: {result_json}")
+    return 0
+
+
+def parse_worker_report_reference(value: str) -> WorkerReportReference:
+    parts = value.split(":", 5)
+    if len(parts) != 6 or not all(part.strip() for part in parts[:5]):
+        raise argparse.ArgumentTypeError(
+            "--report-ref must use round:worker_id:role:run_id:task_id:/path/to/report.md"
+        )
+    round_value, worker_id, role, run_id, task_id, report_path = parts
+    try:
+        round_index = int(round_value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("--report-ref round must be an integer") from exc
+    if round_index < 1:
+        raise argparse.ArgumentTypeError("--report-ref round must be >= 1")
+    return WorkerReportReference(
+        round_index=round_index,
+        worker_id=worker_id.strip(),
+        role=role.strip(),
+        run_id=run_id.strip(),
+        task_id=task_id.strip(),
+        report_path=Path(report_path).resolve(),
+    )
+
+
+def command_build_transcript(args: argparse.Namespace) -> int:
+    root = workspace_root(args.root)
+    thread_id = args.thread_id or f"worker-transcript-{uuid.uuid4().hex[:12]}"
+    try:
+        transcript = build_shared_worker_transcript(
+            task=args.task,
+            report_refs=list(args.report_ref),
+            max_report_chars=args.max_report_chars,
+        )
+        artifact_root = root / ".omx" / "framework" / "team" / "meeting-prototypes"
+        paths = write_shared_worker_transcript_artifacts(artifact_root, thread_id, transcript)
+    except (OSError, ValueError) as exc:
+        print(f"omx_meeting_plan: error: {exc}", file=sys.stderr)
+        return 2
+
+    payload = {
+        "ok": True,
+        "command": "build-transcript",
+        "root": str(root),
+        "thread_id": thread_id,
+        "would_execute_live": False,
+        "dispatches_visible_workers": False,
+        "artifacts": {
+            "shared_transcript_json": str(paths["json"]),
+            "shared_transcript_md": str(paths["markdown"]),
+        },
+        "transcript": transcript,
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        print("command: build-transcript")
+        print("would_execute_live: false")
+        print("dispatches_visible_workers: false")
+        print(f"shared_transcript_json: {paths['json']}")
+        print(f"shared_transcript_md: {paths['markdown']}")
+    return 0
+
+
+def command_worker_group_review(args: argparse.Namespace) -> int:
+    root = workspace_root(args.root)
+    thread_id = args.thread_id or f"worker-group-review-{uuid.uuid4().hex[:12]}"
+    try:
+        review = build_leader_mediated_worker_group_review(
+            task=args.task,
+            report_refs=list(args.report_ref),
+            round_limit=args.round_limit,
+            max_report_chars=args.max_report_chars,
+        )
+        artifact_root = root / ".omx" / "framework" / "team" / "meeting-prototypes"
+        paths = write_leader_mediated_worker_group_review_artifacts(artifact_root, thread_id, review)
+    except (OSError, ValueError) as exc:
+        print(f"omx_meeting_plan: error: {exc}", file=sys.stderr)
+        return 2
+
+    payload = {
+        "ok": True,
+        "command": "worker-group-review",
+        "root": str(root),
+        "thread_id": thread_id,
+        "would_execute_live": False,
+        "dispatches_visible_workers": False,
+        "decision": review["decision"],
+        "artifacts": {
+            "worker_group_review_json": str(paths["review_json"]),
+            "worker_group_review_md": str(paths["review_md"]),
+            "next_round_prompt_md": str(paths["next_round_prompt_md"]),
+            "shared_transcript_json": str(paths["shared_transcript_json"]),
+            "shared_transcript_md": str(paths["shared_transcript_md"]),
+        },
+        "review": review,
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        print("command: worker-group-review")
+        print("would_execute_live: false")
+        print("dispatches_visible_workers: false")
+        print(f"decision: {review['decision']['state']}")
+        print(f"reason: {review['decision']['reason']}")
+        print(f"worker_group_review_json: {paths['review_json']}")
+        print(f"next_round_prompt_md: {paths['next_round_prompt_md']}")
+    return 0
+
+
+def command_ag2_status(args: argparse.Namespace) -> int:
+    root = workspace_root(args.root)
+    gate = Ag2OptionalImportGate()
+    runtime_import_policy = build_ag2_runtime_import_policy(gate)
+    payload = {
+        "ok": True,
+        "command": "ag2-status",
+        "root": str(root),
+        "would_execute_live": False,
+        "contract_summary": build_ag2_meeting_layer_contract_summary(),
+        "gate": gate.to_payload(),
+        "runtime_import_policy": runtime_import_policy,
+        "adapter_plan": build_ag2_host_local_adapter_plan(),
+        "approval_artifact": build_ag2_human_approval_artifact(),
+        "config_contract": build_ag2_host_local_config_contract(),
+        "runtime_policy_artifact": build_ag2_real_runtime_policy_artifact(),
+        "effective_runtime_boundary": build_ag2_effective_runtime_boundary_contract(),
+        "dependency_decision": build_ag2_real_runtime_dependency_decision(),
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        print("command: ag2-status")
+        print("would_execute_live: false")
+        print(f"contract_state: {payload['contract_summary']['contract_state']}")
+        print(f"runtime_import_allowed: {str(runtime_import_policy['runtime_import_allowed']).lower()}")
+        print(f"adapter_enabled: {str(payload['adapter_plan']['adapter_enabled']).lower()}")
+        print(f"synced_to_repo: {str(payload['config_contract']['synced_to_repo']).lower()}")
+    return 0
+
+
+def command_ag2_release_readiness(args: argparse.Namespace) -> int:
+    root = workspace_root(args.root)
+    try:
+        live_smoke_evidence = load_live_smoke_evidence_validation(args.ag2_live_smoke_evidence_json)
+        release_proof_bundle = load_release_proof_bundle_validation(args.ag2_release_proof_bundle_json)
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        payload = {
+            "ok": False,
+            "command": "ag2-release-readiness",
+            "root": str(root),
+            "would_execute_live": False,
+            "error": str(exc),
+        }
+        if args.json:
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
+        else:
+            print("command: ag2-release-readiness")
+            print("would_execute_live: false")
+            print(f"error: {exc}")
+        return 2
+    release_readiness = build_ag2_release_readiness()
+    release_readiness["real_runtime_release_gate"] = build_ag2_real_runtime_release_gate(
+        live_smoke_evidence=live_smoke_evidence,
+        release_proof_bundle=release_proof_bundle,
+    )
+    payload = {
+        "ok": True,
+        "command": "ag2-release-readiness",
+        "root": str(root),
+        "would_execute_live": False,
+        "release_readiness": release_readiness,
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        print("command: ag2-release-readiness")
+        print("would_execute_live: false")
+        print(f"release_state: {release_readiness['release_state']}")
+        print(f"go_no_go: {release_readiness['go_no_go']}")
+        print(f"packaging_decision: {release_readiness['packaging_decision']}")
+        print("supported_modes:")
+        for mode in release_readiness["supported_modes"]:
+            print(f"  - {mode}")
+        print("unsupported_modes:")
+        for mode in release_readiness["unsupported_modes"]:
+            print(f"  - {mode}")
+    return 0
+
+
+def command_ag2_runtime_preflight(args: argparse.Namespace) -> int:
+    root = workspace_root(args.root)
+    try:
+        preflight = build_ag2_real_runtime_preflight(
+            ag2_human_approval_validation=load_optional_validation_evidence(args.ag2_approval_evidence_json),
+            ag2_host_local_config_reference_validation=load_optional_validation_evidence(
+                args.ag2_host_local_config_reference_evidence_json
+            ),
+        )
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        payload = {
+            "ok": False,
+            "command": "ag2-runtime-preflight",
+            "root": str(root),
+            "would_execute_live": False,
+            "error": str(exc),
+        }
+        if args.json:
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
+        else:
+            print("command: ag2-runtime-preflight")
+            print("would_execute_live: false")
+            print(f"error: {exc}")
+        return 2
+
+    ready = bool(preflight["ready_for_real_runtime"])
+    payload = {
+        "ok": ready,
+        "command": "ag2-runtime-preflight",
+        "root": str(root),
+        "would_execute_live": False,
+        "preflight": preflight,
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        print("command: ag2-runtime-preflight")
+        print("would_execute_live: false")
+        print(f"preflight_state: {preflight['preflight_state']}")
+        print(f"ready_for_real_runtime: {str(ready).lower()}")
+        print("missing_gates:")
+        for missing_gate in preflight["missing_gates"]:
+            print(f"  - {missing_gate}")
+    return 0 if ready else 2
+
+
+def command_ag2_import_gate(args: argparse.Namespace) -> int:
+    root = workspace_root(args.root)
+    gate = Ag2OptionalImportGate()
+    runtime_import_policy = build_ag2_runtime_import_policy(gate)
+    payload = {
+        "ok": True,
+        "command": "ag2-import-gate",
+        "root": str(root),
+        "would_execute_live": False,
+        "gate": gate.to_payload(),
+        "runtime_import_policy": runtime_import_policy,
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        print("command: ag2-import-gate")
+        print("would_execute_live: false")
+        print(f"import_allowed: {str(gate.import_allowed).lower()}")
+        print(f"runtime_import_allowed: {str(runtime_import_policy['runtime_import_allowed']).lower()}")
+        print(
+            f"approval_artifact_required: {str(runtime_import_policy['approval_artifact_required']).lower()}"
+        )
+        print(f"decision_state: {gate.decision_state}")
+        print("missing_gates:")
+        for missing_gate in gate.missing_gates:
+            print(f"  - {missing_gate}")
+    return 0
+
+
+def command_ag2_adapter_plan(args: argparse.Namespace) -> int:
+    root = workspace_root(args.root)
+    adapter_plan = build_ag2_host_local_adapter_plan()
+    payload = {
+        "ok": True,
+        "command": "ag2-adapter-plan",
+        "root": str(root),
+        "would_execute_live": False,
+        "adapter_plan": adapter_plan,
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        print("command: ag2-adapter-plan")
+        print("would_execute_live: false")
+        print(f"plan_state: {adapter_plan['plan_state']}")
+        print(f"host_local_only: {str(adapter_plan['host_local_only']).lower()}")
+        print(f"adapter_enabled: {str(adapter_plan['adapter_enabled']).lower()}")
+        print(f"supports_live_submit: {str(adapter_plan['supports_live_submit']).lower()}")
+    return 0
+
+
+def command_ag2_approval_status(args: argparse.Namespace) -> int:
+    root = workspace_root(args.root)
+    approval_artifact = build_ag2_human_approval_artifact()
+    payload = {
+        "ok": True,
+        "command": "ag2-approval-status",
+        "root": str(root),
+        "would_execute_live": False,
+        "approval_artifact": approval_artifact,
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        print("command: ag2-approval-status")
+        print("would_execute_live: false")
+        print(f"approval_state: {approval_artifact['approval_state']}")
+        print(f"advisory_only: {str(approval_artifact['advisory_only']).lower()}")
+        print(f"runtime_import_allowed: {str(approval_artifact['runtime_import_allowed']).lower()}")
+        print(f"adapter_eligibility_granted: {str(approval_artifact['adapter_eligibility_granted']).lower()}")
+    return 0
+
+
+def command_ag2_approval_validate(args: argparse.Namespace) -> int:
+    root = workspace_root(args.root)
+    payload_json = Path(args.payload_json).resolve()
+    try:
+        payload = json.loads(payload_json.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        validation = {
+            "schema_version": 1,
+            "validation_kind": "ag2_human_approval_payload_validation",
+            "valid": False,
+            "normalized_payload": None,
+            "errors": [str(exc)],
+            "warnings": [],
+            "effective_runtime_import_allowed": False,
+            "effective_adapter_eligibility_granted": False,
+            "would_install_dependency": False,
+            "would_import_ag2": False,
+            "would_execute_live": False,
+            "provider_or_model_config_required": False,
+        }
+    else:
+        validation = validate_ag2_human_approval_payload(payload)
+    ok = bool(validation["valid"])
+    output = {
+        "ok": ok,
+        "command": "ag2-approval-validate",
+        "root": str(root),
+        "payload_json": str(payload_json),
+        "would_execute_live": False,
+        "validation": validation,
+    }
+    if args.json:
+        print(json.dumps(output, indent=2, ensure_ascii=False))
+    else:
+        print("command: ag2-approval-validate")
+        print("would_execute_live: false")
+        print(f"valid: {str(ok).lower()}")
+        for error in validation["errors"]:
+            print(f"error: {error}")
+    return 0 if ok else 2
+
+
+def command_ag2_host_local_config_status(args: argparse.Namespace) -> int:
+    root = workspace_root(args.root)
+    config_contract = build_ag2_host_local_config_contract()
+    payload = {
+        "ok": True,
+        "command": "ag2-host-local-config-status",
+        "root": str(root),
+        "would_execute_live": False,
+        "config_contract": config_contract,
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        print("command: ag2-host-local-config-status")
+        print("would_execute_live: false")
+        print(f"contract_state: {config_contract['contract_state']}")
+        print(f"synced_to_repo: {str(config_contract['synced_to_repo']).lower()}")
+        print(f"config_values_recorded: {str(config_contract['config_values_recorded']).lower()}")
+        print(f"adapter_eligibility_granted: {str(config_contract['adapter_eligibility_granted']).lower()}")
+    return 0
+
+
+def command_ag2_host_local_config_validate(args: argparse.Namespace) -> int:
+    root = workspace_root(args.root)
+    repo_root = _THIS_FILE.parent.parent.resolve()
+    validation = validate_ag2_host_local_config_reference(
+        args.config_reference_path,
+        repo_root=repo_root,
+        runtime_root=workspace_root(args.root),
+    )
+    ok = bool(validation["valid"])
+    output = {
+        "ok": ok,
+        "command": "ag2-host-local-config-validate",
+        "root": str(root),
+        "would_execute_live": False,
+        "validation": validation,
+    }
+    if args.json:
+        print(json.dumps(output, indent=2, ensure_ascii=False))
+    else:
+        print("command: ag2-host-local-config-validate")
+        print("would_execute_live: false")
+        print(f"valid: {str(ok).lower()}")
+        print(f"path_classification: {validation['path_classification']}")
+        for error in validation["errors"]:
+            print(f"error: {error}")
+    return 0 if ok else 2
+
+
+def command_safety_check(args: argparse.Namespace) -> int:
+    root = workspace_root(args.root)
+    payload = {
+        "command": "safety-check",
+        "root": str(root),
+        "would_execute_live": False,
+        **build_meeting_safety_check_payload(root),
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        print("command: safety-check")
+        print("would_execute_live: false")
+        print(f"ok: {str(payload['ok']).lower()}")
+        for check_name, check_payload in payload["checks"].items():
+            print(f"{check_name}: {str(check_payload['ok']).lower()}")
+    return 0 if payload["ok"] else 2
+
+
+def build_run_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+Run `omx_meeting_plan <command> --help` for command-specific options.
+""",
+    )
+    parser.add_argument("--root", default=None)
+    parser.add_argument("--thread-id", default="")
+    parser.add_argument("--task", required=True)
+    parser.add_argument("--participant", action="append", type=parse_participant, required=True)
+    parser.add_argument("--max-rounds", type=int, default=3)
+    parser.add_argument("--policy", choices=sorted(BUILTIN_SELECTOR_POLICIES), default="round_robin")
+    parser.add_argument(
+        "--termination-condition",
+        choices=sorted(BUILTIN_TERMINATION_CONDITIONS),
+        default="",
+        help="optional built-in no-live termination condition name",
+    )
+    parser.add_argument(
+        "--propose-control-plane-dry-run-worker",
+        action="append",
+        default=[],
+        help="append a visible worker id to a deterministic no-live control_plane_dry_run proposed action",
+    )
+    parser.add_argument("--propose-control-plane-dry-run-title", default="")
+    parser.add_argument("--propose-control-plane-dry-run-body", default="")
+    parser.add_argument("--propose-control-plane-dry-run-timeout", type=int, default=300)
+    parser.add_argument(
+        "--ag2-approval-evidence-json",
+        default="",
+        help="optional AG2 approval validation evidence JSON produced by ag2-approval-validate",
+    )
+    parser.add_argument(
+        "--ag2-host-local-config-reference-evidence-json",
+        default="",
+        help="optional AG2 host-local config reference validation evidence JSON produced by ag2-host-local-config-validate",
+    )
+    parser.add_argument("--json", action="store_true")
+    return parser
+
+
+def build_bridge_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Convert a meeting-result artifact to a no-live control-plane dry run.")
+    parser.add_argument("--root", default=None)
+    parser.add_argument("--result-json", required=True)
+    parser.add_argument("--action-index", type=int, default=None)
+    parser.add_argument("--json", action="store_true")
+    return parser
+
+
+def build_shared_transcript_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Build a no-live shared transcript from visible worker report artifacts."
+    )
+    parser.add_argument("--root", default=None)
+    parser.add_argument("--thread-id", default="")
+    parser.add_argument("--task", required=True)
+    parser.add_argument(
+        "--report-ref",
+        action="append",
+        type=parse_worker_report_reference,
+        required=True,
+        help="round:worker_id:role:run_id:task_id:/path/to/report.md",
+    )
+    parser.add_argument("--max-report-chars", type=int, default=1200)
+    parser.add_argument("--json", action="store_true")
+    return parser
+
+
+def build_worker_group_review_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Build a no-live leader-mediated visible worker group review artifact."
+    )
+    parser.add_argument("--root", default=None)
+    parser.add_argument("--thread-id", default="")
+    parser.add_argument("--task", required=True)
+    parser.add_argument(
+        "--report-ref",
+        action="append",
+        type=parse_worker_report_reference,
+        required=True,
+        help="round:worker_id:role:run_id:task_id:/path/to/report.md",
+    )
+    parser.add_argument("--round-limit", type=int, default=2)
+    parser.add_argument("--max-report-chars", type=int, default=1200)
+    parser.add_argument("--json", action="store_true")
+    return parser
+
+
+def build_ag2_import_gate_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Print the local no-live AG2 optional import gate policy.")
+    parser.add_argument("--root", default=None)
+    parser.add_argument("--json", action="store_true")
+    return parser
+
+
+def build_ag2_status_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Print the frozen no-live AG2 meeting-layer contract status.")
+    parser.add_argument("--root", default=None)
+    parser.add_argument("--json", action="store_true")
+    return parser
+
+
+def build_ag2_release_readiness_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Print the no-live AG2 meeting-layer release readiness gate.")
+    parser.add_argument("--root", default=None)
+    parser.add_argument(
+        "--ag2-live-smoke-evidence-json",
+        default="",
+        help="optional redacted AG2 live-smoke evidence JSON for real-runtime release gate evaluation",
+    )
+    parser.add_argument(
+        "--ag2-release-proof-bundle-json",
+        default="",
+        help="optional final proof bundle JSON required with live-smoke evidence for real-runtime release promotion",
+    )
+    parser.add_argument("--json", action="store_true")
+    return parser
+
+
+def build_ag2_runtime_preflight_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Run a no-live AG2 real-runtime readiness preflight.")
+    parser.add_argument("--root", default=None)
+    parser.add_argument(
+        "--ag2-approval-evidence-json",
+        default="",
+        help="optional AG2 approval validation evidence JSON produced by ag2-approval-validate",
+    )
+    parser.add_argument(
+        "--ag2-host-local-config-reference-evidence-json",
+        default="",
+        help="optional AG2 host-local config reference validation evidence produced by ag2-host-local-config-validate",
+    )
+    parser.add_argument("--json", action="store_true")
+    return parser
+
+
+def build_ag2_run_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Run an AG2-style meeting through the project-local meeting adapter seam.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+Phase 42 recommended entries:
+  mock group chat:
+    bin/omx_meeting_plan ag2-run --runtime mock --preset idea-review --max-rounds 3 --task "Review idea"
+
+  gated live group chat:
+    bin/omx_meeting_plan ag2-run --runtime real --real-runtime-mode live --allow-real-model-call \\
+      --ag2-effective-approval-json /host/local/approval.json \\
+      --ag2-runtime-config-json /host/local/runtime-config.json \\
+      --preset idea-review --max-rounds 3 --task "Review idea"
+
+  idea-review max_rounds <= 3. Live mode requires explicit approval and host-local config only.
+""",
+    )
+    parser.add_argument("--root", default=None)
+    parser.add_argument("--thread-id", default="")
+    parser.add_argument("--task", required=True)
+    parser.add_argument("--runtime", choices=["mock", "real"], required=True)
+    parser.add_argument(
+        "--real-runtime-mode",
+        choices=["fake", "live"],
+        default="fake",
+        help="real runtime model-client mode; live additionally requires --allow-real-model-call",
+    )
+    parser.add_argument(
+        "--ag2-effective-approval-json",
+        default="",
+        help="host-local effective approval JSON required for --runtime real",
+    )
+    parser.add_argument(
+        "--ag2-runtime-config-json",
+        default="",
+        help="host-local runtime config JSON required for --runtime real",
+    )
+    parser.add_argument(
+        "--allow-real-model-call",
+        action="store_true",
+        help="explicitly allow the live OpenAI-compatible model call for --runtime real --real-runtime-mode live",
+    )
+    parser.add_argument("--preset", choices=MEETING_PRESET_NAMES, required=True)
+    parser.add_argument("--max-rounds", type=int, default=None)
+    parser.add_argument(
+        "--propose-control-plane-dry-run-worker",
+        action="append",
+        default=[],
+        help="append a visible worker id to a deterministic no-live control_plane_dry_run proposed action",
+    )
+    parser.add_argument("--propose-control-plane-dry-run-title", default="")
+    parser.add_argument("--propose-control-plane-dry-run-body", default="")
+    parser.add_argument("--propose-control-plane-dry-run-timeout", type=int, default=300)
+    parser.add_argument("--json", action="store_true")
+    return parser
+
+
+def build_ag2_adapter_plan_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Print the local no-live AG2 host-local adapter plan.")
+    parser.add_argument("--root", default=None)
+    parser.add_argument("--json", action="store_true")
+    return parser
+
+
+def build_ag2_approval_status_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Print the local no-live AG2 human approval artifact status.")
+    parser.add_argument("--root", default=None)
+    parser.add_argument("--json", action="store_true")
+    return parser
+
+
+def build_ag2_approval_validate_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Validate a no-live AG2 human approval payload.")
+    parser.add_argument("--root", default=None)
+    parser.add_argument("--payload-json", required=True)
+    parser.add_argument("--json", action="store_true")
+    return parser
+
+
+def build_ag2_host_local_config_status_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Print the local no-live AG2 host-local config contract status.")
+    parser.add_argument("--root", default=None)
+    parser.add_argument("--json", action="store_true")
+    return parser
+
+
+def build_ag2_host_local_config_validate_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Validate a no-live AG2 host-local config reference path.")
+    parser.add_argument("--root", default=None)
+    parser.add_argument("--config-reference-path", required=True)
+    parser.add_argument("--json", action="store_true")
+    return parser
+
+
+def build_safety_check_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Run static no-live safety checks for the meeting layer.")
+    parser.add_argument("--root", default=None)
+    parser.add_argument("--json", action="store_true")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "ag2-run":
+        parser = build_ag2_run_parser()
+        return command_ag2_run(parser.parse_args(argv[1:]))
+    if argv and argv[0] == "safety-check":
+        parser = build_safety_check_parser()
+        return command_safety_check(parser.parse_args(argv[1:]))
+    if argv and argv[0] == "ag2-status":
+        parser = build_ag2_status_parser()
+        return command_ag2_status(parser.parse_args(argv[1:]))
+    if argv and argv[0] == "ag2-release-readiness":
+        parser = build_ag2_release_readiness_parser()
+        return command_ag2_release_readiness(parser.parse_args(argv[1:]))
+    if argv and argv[0] == "ag2-runtime-preflight":
+        parser = build_ag2_runtime_preflight_parser()
+        return command_ag2_runtime_preflight(parser.parse_args(argv[1:]))
+    if argv and argv[0] == "ag2-host-local-config-validate":
+        parser = build_ag2_host_local_config_validate_parser()
+        return command_ag2_host_local_config_validate(parser.parse_args(argv[1:]))
+    if argv and argv[0] == "ag2-host-local-config-status":
+        parser = build_ag2_host_local_config_status_parser()
+        return command_ag2_host_local_config_status(parser.parse_args(argv[1:]))
+    if argv and argv[0] == "ag2-approval-validate":
+        parser = build_ag2_approval_validate_parser()
+        return command_ag2_approval_validate(parser.parse_args(argv[1:]))
+    if argv and argv[0] == "ag2-approval-status":
+        parser = build_ag2_approval_status_parser()
+        return command_ag2_approval_status(parser.parse_args(argv[1:]))
+    if argv and argv[0] == "ag2-adapter-plan":
+        parser = build_ag2_adapter_plan_parser()
+        return command_ag2_adapter_plan(parser.parse_args(argv[1:]))
+    if argv and argv[0] == "ag2-import-gate":
+        parser = build_ag2_import_gate_parser()
+        return command_ag2_import_gate(parser.parse_args(argv[1:]))
+    if argv and argv[0] == "bridge-dry-run":
+        parser = build_bridge_parser()
+        return command_bridge_dry_run(parser.parse_args(argv[1:]))
+    if argv and argv[0] == "build-transcript":
+        parser = build_shared_transcript_parser()
+        return command_build_transcript(parser.parse_args(argv[1:]))
+    if argv and argv[0] == "worker-group-review":
+        parser = build_worker_group_review_parser()
+        return command_worker_group_review(parser.parse_args(argv[1:]))
+    if argv and argv[0] == "run":
+        argv = argv[1:]
+    parser = build_run_parser()
+    if argv and not argv[0].startswith("-"):
+        parser.error(f"unknown command: {argv[0]}")
+    args = parser.parse_args(argv)
+    return command_run(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,386 @@
+#!/usr/bin/env python3
+"""Validate canonical visible-agent-orchestrator source without activating it."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+PLUGIN_PACKAGE_NAME = "visible-agent-orchestrator-skill-v0"
+SKILL_NAME = "visible-agent-orchestrator"
+REQUIRED_FILES = [
+    "README.md",
+    "SKILL.md",
+    "plugin-manifest.json",
+    ".codex-plugin/plugin.json",
+    "prompt-snippets/leader-dispatch-snippet.md",
+    "prompt-snippets/worker-contract-snippet.md",
+    "prompt-snippets/reviewer-snippet.md",
+    "contracts/multiworker-task-contract.schema.json",
+    "contracts/operation-capability.schema.json",
+    "contracts/writer.contract.template.json",
+    "contracts/reviewer.contract.template.json",
+    "contracts/tester.contract.template.json",
+    "contracts/summarizer.contract.template.json",
+    "role-templates/writer.md",
+    "role-templates/reviewer.md",
+    "role-templates/tester.md",
+    "role-templates/summarizer.md",
+    "docs/RUNBOOK.md",
+    "docs/POLICY_CHECKLIST.md",
+    "docs/INSTALL_REVIEW.md",
+    "docs/RMUX_TRANSITION_NOTES.md",
+    "docs/LIVE_RUNTIME_BOUNDARY.md",
+    "docs/FAILURE_RECOVERY.md",
+    "references/semantic-review-rollout.md",
+    "examples/tmux-reference-two-worker.contracts/README.md",
+    "examples/tmux-reference-two-worker.contracts/writer.contract.json",
+    "examples/tmux-reference-two-worker.contracts/reviewer.contract.json",
+    "examples/rmux-spike-fixture.contracts/README.md",
+    "examples/rmux-spike-fixture.contracts/rmux-reviewer.contract.json",
+    "examples/opencode-tui-plan-example.md",
+]
+REQUIRED_SKILL_PHRASES = [
+    "protocol truth > runtime truth",
+    "report.md",
+    ".done",
+    ".fail",
+    ".blocked",
+    "watcher telemetry only",
+    "one active task per worker",
+    "worker-scoped settle",
+    "write scopes mutually exclusive",
+    "no raw tmux input",
+    "no direct /tui/* curl",
+    "no direct /tui/*",
+    "no rmux default switch",
+    "rmux default=false",
+    "4x3",
+    "4x7",
+    "topology-metadata",
+    "worker_pool_busy",
+    "omx_visible_orchestrate run",
+]
+REQUIRED_GLOBAL_PHRASES = [
+    "watcher telemetry only",
+    "report.md + exactly one terminal marker",
+    "rmux default=false",
+    "canonical repository source",
+    "immutable generation",
+    "tmux 3.4 baseline",
+    "omx_visible_orchestrate",
+    "4x3",
+    "4x7",
+]
+DANGEROUS_TERMS = [
+    "tmux send-keys",
+    "tmux paste-buffer",
+    "curl /tui/",
+    "rmux start",
+    "rmux new",
+    "rmux create",
+    "rmux attach",
+    "rmux send",
+    "rmux kill",
+    "rmux split",
+    "rmux run",
+    "rmux exec",
+    "rmux spawn",
+]
+SAFE_CONTEXT_WORDS = (
+    "forbidden",
+    "do not",
+    "does not",
+    "must not",
+    "no ",
+    "not ",
+    "never",
+    "out of scope",
+    "禁止",
+    "不得",
+)
+
+
+class PluginCheckError(Exception):
+    """Operator-facing validation failure."""
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def read_text(path: Path) -> str:
+    return path.read_text(encoding="utf-8")
+
+
+def list_plugin_files(plugin: Path) -> list[str]:
+    return sorted(path.relative_to(plugin).as_posix() for path in plugin.rglob("*") if path.is_file())
+
+
+def load_json(path: Path) -> Any:
+    try:
+        return json.loads(read_text(path))
+    except json.JSONDecodeError as exc:
+        raise PluginCheckError(f"invalid JSON: {path}: {exc}") from exc
+
+
+def parse_skill_front_matter(text: str) -> tuple[dict[str, str], list[str]]:
+    errors: list[str] = []
+    if not text.startswith("---\n"):
+        return {}, ["SKILL.md missing YAML front matter opening"]
+    end = text.find("\n---\n", 4)
+    if end == -1:
+        return {}, ["SKILL.md missing YAML front matter closing"]
+    front = text[4:end]
+    data: dict[str, str] = {}
+    for line in front.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if ":" not in line:
+            errors.append(f"SKILL.md invalid front matter line: {line}")
+            continue
+        key, value = line.split(":", 1)
+        data[key.strip()] = value.strip()
+    return data, errors
+
+
+def validate_skill_front_matter(front_matter: dict[str, str]) -> list[str]:
+    errors: list[str] = []
+    name = front_matter.get("name", "")
+    description = front_matter.get("description", "")
+    lowered = description.lower()
+    if not name:
+        errors.append("SKILL.md front matter missing name")
+    elif name != SKILL_NAME:
+        errors.append(f"SKILL.md front matter name must be {SKILL_NAME}")
+    if not description:
+        errors.append("SKILL.md front matter missing description")
+    elif len(description) < 80:
+        errors.append("SKILL.md front matter description must be at least 80 characters")
+    if description:
+        if "visible cli agents" not in lowered and "visible workers" not in lowered:
+            errors.append("SKILL.md description must mention visible CLI agents or visible workers")
+        if "runtimeadapter" not in lowered and "runtime" not in lowered:
+            errors.append("SKILL.md description must mention RuntimeAdapter or runtime")
+        if "tmux-reference" not in lowered:
+            errors.append("SKILL.md description must mention tmux-reference")
+        if "rmux" not in lowered:
+            errors.append("SKILL.md description must mention rmux")
+        if "use for coding" in lowered:
+            errors.append("SKILL.md description is too broad")
+    return errors
+
+
+def dangerous_lines(plugin: Path) -> list[str]:
+    findings: list[str] = []
+    for rel in list_plugin_files(plugin):
+        if not rel.endswith((".md", ".json")):
+            continue
+        for lineno, line in enumerate(read_text(plugin / rel).splitlines(), 1):
+            lowered = line.lower()
+            for term in DANGEROUS_TERMS:
+                if term in lowered and not any(word in lowered for word in SAFE_CONTEXT_WORDS):
+                    findings.append(f"{rel}:{lineno}: {line.strip()}")
+    return findings
+
+
+def validate_plugin(plugin: Path) -> dict[str, Any]:
+    plugin = plugin.resolve()
+    errors: list[str] = []
+    skill_front_matter: dict[str, str] = {}
+    manifest_summary: dict[str, Any] = {}
+    if not plugin.is_dir():
+        errors.append(f"plugin directory missing: {plugin}")
+    missing = [rel for rel in REQUIRED_FILES if not (plugin / rel).is_file()]
+    errors.extend(f"missing required file: {rel}" for rel in missing)
+
+    files_checked = list_plugin_files(plugin) if plugin.is_dir() else []
+    skill_path = plugin / "SKILL.md"
+    if skill_path.is_file():
+        skill = read_text(skill_path)
+        skill_front_matter, front_errors = parse_skill_front_matter(skill)
+        errors.extend(front_errors)
+        if skill_front_matter:
+            errors.extend(validate_skill_front_matter(skill_front_matter))
+        # Required contract phrases may live in the short main entry or in
+        # the scenario references it routes to (#935); the packaged skill as
+        # a whole must still contain every one of them.
+        skill_surface = skill + "\n" + "\n".join(
+            read_text(plugin / rel)
+            for rel in files_checked
+            if rel.startswith("references/") and rel.endswith(".md")
+        )
+        for phrase in REQUIRED_SKILL_PHRASES:
+            if phrase not in skill_surface:
+                errors.append(f"SKILL.md missing required phrase: {phrase}")
+
+    manifest_path = plugin / "plugin-manifest.json"
+    if manifest_path.is_file():
+        manifest = load_json(manifest_path)
+        manifest_summary = {
+            "name": manifest.get("name"),
+            "version": manifest.get("version"),
+            "status": manifest.get("status"),
+            "global_install": manifest.get("global_install"),
+            "rmux_default": manifest.get("rmux_default"),
+            "requires_manual_install_review": manifest.get("requires_manual_install_review"),
+            "default_runtime_backend": manifest.get("default_runtime_backend"),
+            "entrypoint": manifest.get("entrypoint"),
+        }
+        if manifest.get("name") != SKILL_NAME:
+            errors.append(f"plugin-manifest.json name must be {SKILL_NAME}")
+        if manifest.get("global_install") is not False:
+            errors.append("plugin-manifest.json must set global_install=false")
+        if manifest.get("status") != "canonical-source":
+            errors.append(
+                "plugin-manifest.json must set status=canonical-source"
+            )
+        if manifest.get("installation") != "immutable-generation-only":
+            errors.append(
+                "plugin-manifest.json must set "
+                "installation=immutable-generation-only"
+            )
+        if manifest.get("rmux_default") is not False:
+            errors.append("plugin-manifest.json must set rmux_default=false")
+        if manifest.get("requires_manual_install_review") is not True:
+            errors.append("plugin-manifest.json must set requires_manual_install_review=true")
+        if manifest.get("default_runtime_backend") != "tmux-reference":
+            errors.append("plugin-manifest.json must set default_runtime_backend=tmux-reference")
+        if manifest.get("entrypoint") != "SKILL.md":
+            errors.append("plugin-manifest.json must set entrypoint=SKILL.md")
+        if manifest.get("globally_installed") is not False:
+            errors.append("plugin-manifest.json must set globally_installed=false")
+    if not missing and plugin.is_dir():
+        codex_manifest = load_json(plugin / ".codex-plugin" / "plugin.json")
+        schema = load_json(plugin / "contracts" / "multiworker-task-contract.schema.json")
+        for rel in [
+            "contracts/writer.contract.template.json",
+            "contracts/reviewer.contract.template.json",
+            "contracts/tester.contract.template.json",
+            "contracts/summarizer.contract.template.json",
+            "examples/tmux-reference-two-worker.contracts/writer.contract.json",
+            "examples/tmux-reference-two-worker.contracts/reviewer.contract.json",
+            "examples/rmux-spike-fixture.contracts/rmux-reviewer.contract.json",
+        ]:
+            load_json(plugin / rel)
+
+        if codex_manifest.get("name") != PLUGIN_PACKAGE_NAME:
+            errors.append(f".codex-plugin/plugin.json name must remain {PLUGIN_PACKAGE_NAME}")
+
+        properties = set((schema.get("properties") or {}).keys())
+        for field in ["worker_role", "result_fields", "runtime_backend", "dispatch_adapter", "settle_policy"]:
+            if field not in properties:
+                errors.append(f"schema missing property: {field}")
+
+        combined = "\n".join(read_text(plugin / rel) for rel in files_checked if rel.endswith((".md", ".json")))
+        for phrase in REQUIRED_GLOBAL_PHRASES:
+            if phrase not in combined:
+                errors.append(f"plugin docs missing required phrase: {phrase}")
+        for finding in dangerous_lines(plugin):
+            errors.append(f"dangerous live command outside forbidden context: {finding}")
+
+    return {
+        "ok": not errors,
+        "plugin_name": PLUGIN_PACKAGE_NAME,
+        "skill_front_matter": skill_front_matter,
+        "manifest": manifest_summary,
+        "plugin": str(plugin),
+        "files_checked": files_checked,
+        "errors": errors,
+    }
+
+
+def command_validate(args: argparse.Namespace) -> int:
+    result = validate_plugin(args.plugin)
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        print(f"ok: {str(result['ok']).lower()}")
+        for error in result["errors"]:
+            print(f"error: {error}")
+    return 0 if result["ok"] else 2
+
+
+def command_list_files(args: argparse.Namespace) -> int:
+    for rel in list_plugin_files(args.plugin.resolve()):
+        print(rel)
+    return 0
+
+
+def command_render_install_review(args: argparse.Namespace) -> int:
+    result = validate_plugin(args.plugin)
+    front_matter = result.get("skill_front_matter") or {}
+    manifest = result.get("manifest") or {}
+    lines = [
+        "# visible-agent-orchestrator Install Review",
+        "",
+        f"Generated: {utc_now()}",
+        "",
+        f"Plugin: {result['plugin']}",
+        "Status: canonical repository source / not activated",
+        "Recommendation: review before immutable generation activation",
+        "",
+        f"Skill name: {front_matter.get('name', '-')}",
+        f"Skill description: {front_matter.get('description', '-')}",
+        f"Manifest global_install: {str(manifest.get('global_install')).lower()}",
+        f"Manifest requires_manual_install_review: {str(manifest.get('requires_manual_install_review')).lower()}",
+        "",
+        "Safety summary:",
+        "",
+        "- rmux default=false",
+        "- watcher telemetry only",
+        "- report.md + exactly one terminal marker remains completion truth",
+        "- no generation activation was performed by this command",
+        "- no live runtime mutation was performed by this command",
+        "",
+        f"Validation ok: {str(result['ok']).lower()}",
+    ]
+    if result["errors"]:
+        lines.append("")
+        lines.append("Errors:")
+        lines.extend(f"- {error}" for error in result["errors"])
+    args.out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(str(args.out))
+    return 0 if result["ok"] else 2
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    validate = subparsers.add_parser(
+        "validate",
+        help="validate canonical plugin source",
+    )
+    validate.add_argument("--plugin", type=Path, required=True)
+    validate.add_argument("--json", action="store_true")
+    validate.set_defaults(func=command_validate)
+
+    render = subparsers.add_parser("render-install-review", help="render a review summary without installing")
+    render.add_argument("--plugin", type=Path, required=True)
+    render.add_argument("--out", type=Path, required=True)
+    render.set_defaults(func=command_render_install_review)
+
+    listed = subparsers.add_parser("list-files", help="list plugin files")
+    listed.add_argument("--plugin", type=Path, required=True)
+    listed.set_defaults(func=command_list_files)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return int(args.func(args))
+    except PluginCheckError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

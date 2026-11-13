@@ -1,0 +1,137 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://visible-agent-orchestrator.local/schemas/leader-decision.schema.json",
+  "title": "Leader Decision Audit Sidecar",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version",
+    "artifact_kind",
+    "advisory_only",
+    "decision_id",
+    "created_at",
+    "run_id",
+    "task_id",
+    "gate_inputs",
+    "required_lanes",
+    "unresolved_structural_conflicts",
+    "known_gaps",
+    "selected_action",
+    "reason"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "artifact_kind": {
+      "const": "leader_decision"
+    },
+    "advisory_only": {
+      "const": true
+    },
+    "decision_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "created_at": {
+      "type": "string",
+      "minLength": 1
+    },
+    "run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "task_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "control_plane_thread_id": {
+      "type": "string"
+    },
+    "gate_inputs": {
+      "type": "object",
+      "required": ["protocol"],
+      "properties": {
+        "protocol": {
+          "const": "evaluated"
+        },
+        "semantic": {
+          "type": "string"
+        },
+        "risk": {
+          "type": "string"
+        },
+        "arbiter": {
+          "type": "string"
+        },
+        "planner_coverage": {
+          "type": "string"
+        }
+      }
+    },
+    "required_lanes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "lane_id",
+          "worker_id",
+          "report_present",
+          "report_non_empty",
+          "terminal_markers",
+          "terminal_marker_count",
+          "protocol_status"
+        ],
+        "properties": {
+          "lane_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "worker_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "report_present": {
+            "type": "boolean"
+          },
+          "report_non_empty": {
+            "type": "boolean"
+          },
+          "terminal_markers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "terminal_marker_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "protocol_status": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "unresolved_structural_conflicts": {
+      "type": "array"
+    },
+    "known_gaps": {
+      "type": "array"
+    },
+    "selected_action": {
+      "enum": [
+        "accept",
+        "rerun_lane",
+        "rerun_planner",
+        "block",
+        "human_review_required"
+      ]
+    },
+    "reason": {
+      "type": "string",
+      "minLength": 1
+    }
+  }
+}
