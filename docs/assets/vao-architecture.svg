@@ -1,0 +1,116 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 560" role="img" aria-labelledby="vaoArchTitle vaoArchDesc">
+  <title id="vaoArchTitle">Visible Agent Orchestrator at a glance</title>
+  <desc id="vaoArchDesc">The organizer writes a task contract and dispatches it through the VAO control plane, which binds a registered worker to one live tmux pane, enforces owner locks and fencing, and collects signals, a report and exactly one terminal marker; the organizer reads that evidence and accepts the work or assigns repairs.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/>
+    </marker>
+  </defs>
+  <style>
+    .sans { font-family: ui-sans-serif, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif; }
+    .mono { font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace; }
+  </style>
+
+  <rect x="1" y="1" width="938" height="558" rx="18" fill="#f8fafc" stroke="#e2e8f0" stroke-width="2"/>
+
+  <text class="sans" x="48" y="58" font-size="30" font-weight="700" fill="#0f172a">Visible Agent Orchestrator</text>
+  <text class="sans" x="48" y="86" font-size="15" fill="#475569">An outer control plane for AI coding agents you keep in plain sight</text>
+
+  <!-- Organizer card -->
+  <rect x="28" y="124" width="200" height="346" rx="14" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+  <circle cx="128" cy="170" r="26" fill="#0f172a"/>
+  <text class="sans" x="128" y="176" font-size="13" font-weight="700" fill="#ffffff" text-anchor="middle">You</text>
+  <text class="sans" x="128" y="220" font-size="13.5" font-weight="700" fill="#0f172a" text-anchor="middle">the organizer</text>
+  <text class="sans" x="128" y="238" font-size="12.5" fill="#64748b" text-anchor="middle">(the leader)</text>
+  <line x1="44" y1="254" x2="212" y2="254" stroke="#e2e8f0" stroke-width="1.5"/>
+  <rect x="44" y="272" width="6" height="6" rx="1.5" fill="#4f46e5"/>
+  <text class="sans" x="58" y="280" font-size="12.5" fill="#334155">define the task</text>
+  <rect x="44" y="302" width="6" height="6" rx="1.5" fill="#4f46e5"/>
+  <text class="sans" x="58" y="310" font-size="12.5" fill="#334155">scope allowed writes</text>
+  <rect x="44" y="332" width="6" height="6" rx="1.5" fill="#4f46e5"/>
+  <text class="sans" x="58" y="340" font-size="12.5" fill="#334155">dispatch to a worker</text>
+  <rect x="44" y="362" width="6" height="6" rx="1.5" fill="#4f46e5"/>
+  <text class="sans" x="58" y="370" font-size="12.5" fill="#334155">accept or repair</text>
+
+  <!-- Control plane card -->
+  <rect x="258" y="124" width="396" height="346" rx="16" fill="#eef2ff" stroke="#c7d2fe" stroke-width="1.5"/>
+  <path d="M 258 140 Q 258 124 274 124 L 638 124 Q 654 124 654 140 L 654 186 L 258 186 Z" fill="#4f46e5"/>
+  <text class="sans" x="456" y="151" font-size="17" font-weight="700" fill="#ffffff" text-anchor="middle">VAO control plane</text>
+  <text class="sans" x="456" y="171" font-size="12" fill="#e0e7ff" text-anchor="middle">authority lives here — not inside any worker</text>
+
+  <rect x="280" y="206" width="168" height="108" rx="12" fill="#ffffff" stroke="#c7d2fe" stroke-width="1.5"/>
+  <text class="sans" x="294" y="234" font-size="13.5" font-weight="700" fill="#3730a3">Task contracts</text>
+  <text class="sans" x="294" y="258" font-size="12.3" fill="#334155">explicit scope and</text>
+  <text class="sans" x="294" y="278" font-size="12.3" fill="#334155">required checks</text>
+
+  <rect x="464" y="206" width="168" height="108" rx="12" fill="#ffffff" stroke="#c7d2fe" stroke-width="1.5"/>
+  <text class="sans" x="478" y="234" font-size="13.5" font-weight="700" fill="#3730a3">Worker binding</text>
+  <text class="sans" x="478" y="258" font-size="12.3" fill="#334155">one registered worker,</text>
+  <text class="sans" x="478" y="278" font-size="12.3" fill="#334155">one live tmux pane</text>
+
+  <rect x="280" y="326" width="168" height="108" rx="12" fill="#ffffff" stroke="#c7d2fe" stroke-width="1.5"/>
+  <text class="sans" x="294" y="354" font-size="13.5" font-weight="700" fill="#3730a3">Locks &amp; fencing</text>
+  <text class="sans" x="294" y="378" font-size="12.3" fill="#334155">one owner per task;</text>
+  <text class="sans" x="294" y="398" font-size="12.3" fill="#334155">stale runs refused</text>
+
+  <rect x="464" y="326" width="168" height="108" rx="12" fill="#ffffff" stroke="#c7d2fe" stroke-width="1.5"/>
+  <text class="sans" x="478" y="354" font-size="13.5" font-weight="700" fill="#3730a3">Receipts &amp; markers</text>
+  <text class="sans" x="478" y="378" font-size="12.3" fill="#334155">signals and report,</text>
+  <text class="sans" x="478" y="398" font-size="12.3" fill="#334155">one terminal marker</text>
+
+  <text class="sans" x="456" y="456" font-size="12" font-style="italic" fill="#475569" text-anchor="middle">one pane · one owner · one marker</text>
+
+  <!-- Terminal card -->
+  <rect x="680" y="124" width="232" height="346" rx="14" fill="#0f172a"/>
+  <circle cx="700" cy="148" r="5" fill="#22c55e"/>
+  <circle cx="718" cy="148" r="5" fill="#f59e0b"/>
+  <circle cx="736" cy="148" r="5" fill="#ef4444"/>
+  <text class="mono" x="796" y="153" font-size="13" fill="#94a3b8" text-anchor="middle">tmux</text>
+
+  <rect x="696" y="170" width="200" height="94" rx="10" fill="#1e293b"/>
+  <text class="mono" x="708" y="192" font-size="13" font-weight="700" fill="#7dd3fc">worker-a</text>
+  <text class="mono" x="708" y="214" font-size="12.5" fill="#cbd5e1">&gt; task received</text>
+  <text class="mono" x="708" y="234" font-size="12.5" fill="#cbd5e1">&gt; running checks</text>
+
+  <rect x="696" y="272" width="200" height="94" rx="10" fill="#1e293b"/>
+  <text class="mono" x="708" y="294" font-size="13" font-weight="700" fill="#7dd3fc">worker-b</text>
+  <text class="mono" x="708" y="316" font-size="12.5" fill="#cbd5e1">&gt; task received</text>
+  <text class="mono" x="708" y="336" font-size="12.5" fill="#cbd5e1">&gt; reviewing diff</text>
+
+  <rect x="696" y="374" width="200" height="94" rx="10" fill="#1e293b"/>
+  <text class="mono" x="708" y="396" font-size="13" font-weight="700" fill="#7dd3fc">worker-c</text>
+  <text class="mono" x="708" y="418" font-size="12.5" fill="#cbd5e1">&gt; task received</text>
+  <text class="mono" x="708" y="438" font-size="12.5" fill="#cbd5e1">&gt; gathering evidence</text>
+
+  <!-- Arrows with numbered badges -->
+  <line x1="232" y1="214" x2="250" y2="214" stroke="#64748b" stroke-width="2.5" marker-end="url(#arrow)"/>
+  <circle cx="245" cy="190" r="11" fill="#4f46e5"/>
+  <text class="sans" x="245" y="194.5" font-size="12" font-weight="700" fill="#ffffff" text-anchor="middle">1</text>
+
+  <line x1="654" y1="214" x2="672" y2="214" stroke="#64748b" stroke-width="2.5" marker-end="url(#arrow)"/>
+  <circle cx="667" cy="190" r="11" fill="#4f46e5"/>
+  <text class="sans" x="667" y="194.5" font-size="12" font-weight="700" fill="#ffffff" text-anchor="middle">2</text>
+
+  <line x1="676" y1="346" x2="658" y2="346" stroke="#64748b" stroke-width="2.5" marker-end="url(#arrow)"/>
+  <circle cx="667" cy="370" r="11" fill="#0f766e"/>
+  <text class="sans" x="667" y="374.5" font-size="12" font-weight="700" fill="#ffffff" text-anchor="middle">3</text>
+
+  <line x1="256" y1="346" x2="238" y2="346" stroke="#64748b" stroke-width="2.5" marker-end="url(#arrow)"/>
+  <circle cx="245" cy="370" r="11" fill="#0f766e"/>
+  <text class="sans" x="245" y="374.5" font-size="12" font-weight="700" fill="#ffffff" text-anchor="middle">4</text>
+
+  <!-- Legend -->
+  <rect x="28" y="492" width="884" height="52" rx="12" fill="#ffffff" stroke="#e2e8f0" stroke-width="1.5"/>
+  <circle cx="64" cy="518" r="9" fill="#4f46e5"/>
+  <text class="sans" x="64" y="522.5" font-size="11.5" font-weight="700" fill="#ffffff" text-anchor="middle">1</text>
+  <text class="sans" x="80" y="523" font-size="12.5" fill="#334155">dispatch task</text>
+  <circle cx="264" cy="518" r="9" fill="#4f46e5"/>
+  <text class="sans" x="264" y="522.5" font-size="11.5" font-weight="700" fill="#ffffff" text-anchor="middle">2</text>
+  <text class="sans" x="280" y="523" font-size="12.5" fill="#334155">deliver to the bound pane</text>
+  <circle cx="524" cy="518" r="9" fill="#0f766e"/>
+  <text class="sans" x="524" y="522.5" font-size="11.5" font-weight="700" fill="#ffffff" text-anchor="middle">3</text>
+  <text class="sans" x="540" y="523" font-size="12.5" fill="#334155">signals · report · marker</text>
+  <circle cx="742" cy="518" r="9" fill="#0f766e"/>
+  <text class="sans" x="742" y="522.5" font-size="11.5" font-weight="700" fill="#ffffff" text-anchor="middle">4</text>
+  <text class="sans" x="758" y="523" font-size="12.5" fill="#334155">evidence for acceptance</text>
+</svg>
